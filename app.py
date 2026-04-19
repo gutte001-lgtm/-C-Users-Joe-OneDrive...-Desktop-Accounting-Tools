@@ -1,7 +1,7 @@
-import os, sqlite3, traceback
+import os, sqlite3, traceback, secrets, urllib.parse
 from datetime import datetime, timezone
 from functools import wraps
-from flask import Flask, jsonify, request, g, send_from_directory, session
+from flask import Flask, jsonify, request, g, send_from_directory, session, redirect
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
@@ -134,6 +134,7 @@ QB_REDIRECT_URI  = os.getenv("QB_REDIRECT_URI", "http://127.0.0.1:5000/qb/callba
 QB_REALM_ID      = os.getenv("QB_REALM_ID", "")
 QB_ENVIRONMENT   = os.getenv("QB_ENVIRONMENT", "sandbox")
 QB_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QB_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
 QB_API_BASE      = (
     "https://sandbox-quickbooks.api.intuit.com/v3/company"
     if QB_ENVIRONMENT == "sandbox"
@@ -179,22 +180,40 @@ def qb_get(path):
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}")
 
+@app.route("/api/qb/connect")
+@login_required
+def qb_connect():
+    state = secrets.token_urlsafe(16)
+    session["qb_state"] = state
+    params = {
+        "client_id": QB_CLIENT_ID,
+        "scope": "com.intuit.quickbooks.accounting",
+        "redirect_uri": QB_REDIRECT_URI,
+        "response_type": "code",
+        "state": state,
+    }
+    return redirect(QB_AUTH_URL + "?" + urllib.parse.urlencode(params))
+
 @app.route("/qb/callback")
 def qb_callback():
     code = request.args.get("code")
     realm = request.args.get("realmId")
+    state = request.args.get("state")
     if not code:
-        return err("Missing code")
+        return redirect("/?qb=error")
+    if state and state != session.get("qb_state"):
+        return redirect("/?qb=error")
     resp = requests.post(QB_TOKEN_URL,
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": QB_REDIRECT_URI},
         auth=(QB_CLIENT_ID, QB_CLIENT_SECRET))
     if not resp.ok:
-        return err("Token exchange failed", 500)
+        return redirect("/?qb=error")
     d = resp.json()
     save_tokens(d["access_token"], d["refresh_token"], d["expires_in"])
     if realm:
         os.environ["QB_REALM_ID"] = realm
-    return jsonify({"status": "connected", "realm_id": realm})
+    session.pop("qb_state", None)
+    return redirect("/?qb=connected")
 
 @app.route("/api/qb/status", methods=["GET", "OPTIONS"])
 @login_required

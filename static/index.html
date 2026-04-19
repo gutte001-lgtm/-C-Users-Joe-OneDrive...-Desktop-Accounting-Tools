@@ -132,6 +132,12 @@ function CloseApp(){
   const [filterCat,setFilterCat]=useState(null);
   const [syncing,setSyncing]=useState(false);
   const [loading,setLoading]=useState(true);
+  const [qbToast,setQbToast]=useState(()=>{
+    const p=new URLSearchParams(window.location.search);
+    if(p.get("qb")==="connected"){window.history.replaceState({},"","/");return "connected";}
+    if(p.get("qb")==="error"){window.history.replaceState({},"","/");return "error";}
+    return null;
+  });
 
   const isAdmin=currentUser?.role==="admin";
 
@@ -481,7 +487,10 @@ function CloseApp(){
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
 
-    const stabs=["users","categories","tasks"];
+    const [qbStatus,setQbStatus]=useState(null);
+    useEffect(()=>{api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>{});},[]);
+
+    const stabs=["users","categories","tasks","quickbooks"];
     return(<div>
       <div style={{display:"flex",gap:0,marginBottom:24,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
         {stabs.map(t=><button key={t} onClick={()=>setSettingsTab(t)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:settingsTab===t?"#1e2d3d":"transparent",color:settingsTab===t?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:settingsTab===t?600:400,textTransform:"capitalize"}}>{t}</button>)}
@@ -606,6 +615,24 @@ function CloseApp(){
         </div>
       </Modal>}
 
+      {/* QUICKBOOKS */}
+      {settingsTab==="quickbooks"&&<div style={S.card}>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>QuickBooks Online</div>
+        <div style={{fontSize:12,color:"#475569",marginBottom:20}}>Connect your QuickBooks Online account to sync account balances automatically.</div>
+        <div style={{display:"flex",alignItems:"center",gap:16,padding:"16px 20px",background:"#0d1117",borderRadius:10,border:"1px solid #1e2d3d",marginBottom:16}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#e2e8f0",marginBottom:3}}>Connection Status</div>
+            {qbStatus===null&&<div style={{fontSize:12,color:"#64748b"}}>Checking…</div>}
+            {qbStatus?.connected&&<div style={{fontSize:12,color:"#4fd9a0"}}>✓ Connected · token expires in {Math.round((qbStatus.token_expires_in||0)/60)} min</div>}
+            {qbStatus&&!qbStatus.connected&&<div style={{fontSize:12,color:"#f87171"}}>Not connected</div>}
+          </div>
+          <a href="/api/qb/connect" style={{padding:"8px 18px",background:"#2CA01C",color:"#fff",borderRadius:8,fontSize:13,fontWeight:600,textDecoration:"none",display:"inline-block"}}>
+            {qbStatus?.connected?"Reconnect QuickBooks":"Connect QuickBooks"}
+          </a>
+        </div>
+        {qbStatus?.connected&&<button onClick={syncQB} disabled={syncing} style={{padding:"7px 16px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync Balances Now"}</button>}
+      </div>}
+
       {showAddTask&&<Modal title="Add Task" onClose={()=>setShowAddTask(false)}>
         <div className="form-group"><label className="form-label">Task Name</label><input className="form-input" value={newTask.name} onChange={e=>setNewTask(p=>({...p,name:e.target.value}))}/></div>
         <div className="form-group"><label className="form-label">Category</label>
@@ -641,6 +668,10 @@ function CloseApp(){
   ];
 
   return(<div style={S.app}>
+    {qbToast&&<div style={{position:"fixed",top:20,right:20,zIndex:999,padding:"12px 20px",borderRadius:10,fontSize:13,fontWeight:600,background:qbToast==="connected"?"#4fd9a018":"#f8717118",border:`1px solid ${qbToast==="connected"?"#4fd9a040":"#f8717140"}`,color:qbToast==="connected"?"#4fd9a0":"#f87171"}}>
+      {qbToast==="connected"?"✓ QuickBooks connected successfully!":"✗ QuickBooks connection failed. Try again."}
+      <button onClick={()=>setQbToast(null)} style={{marginLeft:12,background:"none",border:"none",color:"inherit",cursor:"pointer",fontSize:16}}>×</button>
+    </div>}
     <div style={S.sidebar}>
       <div style={{padding:"0 20px 20px",borderBottom:"1px solid #1e2d3d",marginBottom:8}}>
         <div style={{fontSize:17,fontWeight:800,color:"#fff",letterSpacing:-0.5}}>CloseTool<span style={{fontSize:10,background:"#4f8ef722",color:"#4f8ef7",border:"1px solid #4f8ef740",padding:"1px 6px",borderRadius:4,fontFamily:"'DM Mono',monospace",marginLeft:6}}>QB</span></div>
