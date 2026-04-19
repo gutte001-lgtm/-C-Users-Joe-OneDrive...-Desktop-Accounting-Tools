@@ -9,6 +9,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 load_dotenv()
 
+# Compatibility shim: Flask 3.1+ passes 'partitioned' to set_cookie but
+# older Werkzeug builds (including Python 3.14 bundled) don't support it.
+from werkzeug.wrappers import Response as _R
+_orig_set_cookie = _R.set_cookie
+def _compat_set_cookie(self, *a, **kw):
+    kw.pop("partitioned", None)
+    return _orig_set_cookie(self, *a, **kw)
+_R.set_cookie = _compat_set_cookie
+
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(BASE_DIR, "closeapp.db")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
