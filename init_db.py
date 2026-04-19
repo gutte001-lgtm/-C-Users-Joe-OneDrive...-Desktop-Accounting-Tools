@@ -18,9 +18,10 @@ CREATE TABLE IF NOT EXISTS users (
     name        TEXT    NOT NULL,
     initials    TEXT    NOT NULL,
     email       TEXT    UNIQUE NOT NULL,
+    username    TEXT    UNIQUE,
     role        TEXT    NOT NULL DEFAULT 'preparer',   -- admin | preparer | reviewer
     color       TEXT    NOT NULL DEFAULT '#4f8ef7',
-    password_hash TEXT,          -- placeholder for future Flask-Login
+    password_hash TEXT,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS users (
 -- ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS periods (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    label       TEXT    NOT NULL,   -- e.g. "March 2025"
+    label       TEXT    NOT NULL,   -- e.g. "April 2026"
     start_date  DATE    NOT NULL,
     end_date    DATE    NOT NULL,
     is_active   INTEGER NOT NULL DEFAULT 0,
@@ -104,11 +105,11 @@ END;
 """
 
 SEED_USERS = [
-    (1, "Joe G.",    "JG", "joe@company.com",   "admin",    "#4f8ef7"),
-    (2, "Sarah M.",  "SM", "sarah@company.com",  "preparer", "#f7894f"),
-    (3, "Chris L.",  "CL", "chris@company.com",  "preparer", "#4fd9a0"),
-    (4, "Dana R.",   "DR", "dana@company.com",   "preparer", "#c084fc"),
-    (5, "Alex T.",   "AT", "alex@company.com",   "reviewer", "#f472b6"),
+    (1, "Joe G.",    "JG", "joe@company.com",   "joe",   "admin",    "#4f8ef7"),
+    (2, "Sarah M.",  "SM", "sarah@company.com",  "sarah", "preparer", "#f7894f"),
+    (3, "Chris L.",  "CL", "chris@company.com",  "chris", "preparer", "#4fd9a0"),
+    (4, "Dana R.",   "DR", "dana@company.com",   "dana",  "preparer", "#c084fc"),
+    (5, "Alex T.",   "AT", "alex@company.com",   "alex",  "reviewer", "#f472b6"),
 ]
 
 SEED_CATEGORIES = [
@@ -124,42 +125,59 @@ SEED_CATEGORIES = [
     (10,"Reporting",   10),
 ]
 
-SEED_PERIOD = (1, "March 2025", "2025-03-01", "2025-03-31", 1)
+# 2026 fiscal year — 4-4-5 calendar (53-week year; Q1 is 5-4-5)
+# Weeks run Monday–Sunday
+SEED_PERIODS = [
+    (1,  "January 2026",   "2025-12-29", "2026-02-01", 0),  # 5 weeks
+    (2,  "February 2026",  "2026-02-02", "2026-03-01", 0),  # 4 weeks
+    (3,  "March 2026",     "2026-03-02", "2026-04-05", 0),  # 5 weeks
+    (4,  "April 2026",     "2026-04-06", "2026-05-03", 1),  # 4 weeks — ACTIVE
+    (5,  "May 2026",       "2026-05-04", "2026-05-31", 0),  # 4 weeks
+    (6,  "June 2026",      "2026-06-01", "2026-07-05", 0),  # 5 weeks
+    (7,  "July 2026",      "2026-07-06", "2026-08-02", 0),  # 4 weeks
+    (8,  "August 2026",    "2026-08-03", "2026-08-30", 0),  # 4 weeks
+    (9,  "September 2026", "2026-08-31", "2026-10-04", 0),  # 5 weeks
+    (10, "October 2026",   "2026-10-05", "2026-11-01", 0),  # 4 weeks
+    (11, "November 2026",  "2026-11-02", "2026-11-29", 0),  # 4 weeks
+    (12, "December 2026",  "2026-11-30", "2027-01-03", 0),  # 5 weeks
+]
 
+# Seed tasks for the active period: April 2026 (period_id=4)
+# Close tasks are due in the first week of May 2026
 SEED_TASKS = [
     # (period, category, name, assignee, reviewer, due, status, review_status)
-    (1,1,"Recognize revenue — SaaS subscriptions",2,5,"2025-04-03","complete","approved"),
-    (1,1,"Deferred revenue schedule reconciliation",2,5,"2025-04-03","complete","approved"),
-    (1,2,"AR aging review & bad debt estimate",3,1,"2025-04-04","in_progress","pending"),
-    (1,2,"Unbilled AR accrual",3,1,"2025-04-04","open","pending"),
-    (1,3,"Vendor invoice accruals",4,5,"2025-04-04","complete","needs_revision"),
-    (1,3,"Credit card reconciliation",4,5,"2025-04-05","open","pending"),
-    (1,4,"Payroll journal entry — March",2,1,"2025-04-03","complete","approved"),
-    (1,4,"Payroll tax liability reconciliation",2,1,"2025-04-04","in_progress","pending"),
-    (1,9,"Stock-based compensation expense",1,5,"2025-04-05","open","pending"),
-    (1,6,"Depreciation run & tie-out",3,1,"2025-04-04","complete","approved"),
-    (1,6,"Capitalized software review",1,5,"2025-04-05","open","pending"),
-    (1,5,"Prepaid insurance amortization",4,5,"2025-04-04","complete","approved"),
-    (1,5,"Prepaid software / SaaS amortization",4,5,"2025-04-04","in_progress","pending"),
-    (1,7,"Sales tax accrual — multi-state",1,5,"2025-04-06","open","pending"),
-    (1,8,"Bank reconciliation — operating account",3,1,"2025-04-03","complete","approved"),
-    (1,8,"Bank reconciliation — payroll account",3,1,"2025-04-03","complete","approved"),
-    (1,10,"Flux analysis — P&L vs prior month",1,5,"2025-04-07","open","pending"),
-    (1,10,"Board package — financial statements",1,5,"2025-04-08","open","pending"),
+    (4,1,"Recognize revenue — SaaS subscriptions",2,5,"2026-05-04","complete","approved"),
+    (4,1,"Deferred revenue schedule reconciliation",2,5,"2026-05-04","complete","approved"),
+    (4,2,"AR aging review & bad debt estimate",3,1,"2026-05-05","in_progress","pending"),
+    (4,2,"Unbilled AR accrual",3,1,"2026-05-05","open","pending"),
+    (4,3,"Vendor invoice accruals",4,5,"2026-05-05","complete","needs_revision"),
+    (4,3,"Credit card reconciliation",4,5,"2026-05-06","open","pending"),
+    (4,4,"Payroll journal entry — April",2,1,"2026-05-04","complete","approved"),
+    (4,4,"Payroll tax liability reconciliation",2,1,"2026-05-05","in_progress","pending"),
+    (4,9,"Stock-based compensation expense",1,5,"2026-05-06","open","pending"),
+    (4,6,"Depreciation run & tie-out",3,1,"2026-05-05","complete","approved"),
+    (4,6,"Capitalized software review",1,5,"2026-05-06","open","pending"),
+    (4,5,"Prepaid insurance amortization",4,5,"2026-05-05","complete","approved"),
+    (4,5,"Prepaid software / SaaS amortization",4,5,"2026-05-05","in_progress","pending"),
+    (4,7,"Sales tax accrual — multi-state",1,5,"2026-05-07","open","pending"),
+    (4,8,"Bank reconciliation — operating account",3,1,"2026-05-04","complete","approved"),
+    (4,8,"Bank reconciliation — payroll account",3,1,"2026-05-04","complete","approved"),
+    (4,10,"Flux analysis — P&L vs prior month",1,5,"2026-05-08","open","pending"),
+    (4,10,"Board package — financial statements",1,5,"2026-05-11","open","pending"),
 ]
 
 SEED_RECONS = [
     # (period, acct_num, acct_name, assignee, qb_balance, expected, status)
-    (1,"1010","Operating Checking",3,284750.22,284750.22,"reconciled"),
-    (1,"1020","Payroll Checking",3,42100.00,42100.00,"reconciled"),
-    (1,"1100","Accounts Receivable",3,198340.55,195000.00,"needs_attention"),
-    (1,"1200","Prepaid Expenses",4,31200.00,31200.00,"reconciled"),
-    (1,"1500","Fixed Assets, Net",3,412800.00,412800.00,"reconciled"),
-    (1,"2000","Accounts Payable",4,87450.00,91200.00,"needs_attention"),
-    (1,"2100","Accrued Liabilities",1,44000.00,None,"open"),
-    (1,"2200","Deferred Revenue",2,225600.00,225600.00,"reconciled"),
-    (1,"2300","Payroll Liabilities",2,18700.00,None,"open"),
-    (1,"3000","Common Stock",1,1200000.00,1200000.00,"reconciled"),
+    (4,"1010","Operating Checking",3,284750.22,284750.22,"reconciled"),
+    (4,"1020","Payroll Checking",3,42100.00,42100.00,"reconciled"),
+    (4,"1100","Accounts Receivable",3,198340.55,195000.00,"needs_attention"),
+    (4,"1200","Prepaid Expenses",4,31200.00,31200.00,"reconciled"),
+    (4,"1500","Fixed Assets, Net",3,412800.00,412800.00,"reconciled"),
+    (4,"2000","Accounts Payable",4,87450.00,91200.00,"needs_attention"),
+    (4,"2100","Accrued Liabilities",1,44000.00,None,"open"),
+    (4,"2200","Deferred Revenue",2,225600.00,225600.00,"reconciled"),
+    (4,"2300","Payroll Liabilities",2,18700.00,None,"open"),
+    (4,"3000","Common Stock",1,1200000.00,1200000.00,"reconciled"),
 ]
 
 
@@ -172,15 +190,16 @@ def init():
     cur.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
         cur.executemany(
-            "INSERT OR IGNORE INTO users (id,name,initials,email,role,color) VALUES (?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO users (id,name,initials,email,username,role,color) VALUES (?,?,?,?,?,?,?)",
             SEED_USERS)
 
     cur.executemany(
         "INSERT OR IGNORE INTO categories (id,name,sort_order) VALUES (?,?,?)",
         SEED_CATEGORIES)
 
-    cur.execute("INSERT OR IGNORE INTO periods (id,label,start_date,end_date,is_active) VALUES (?,?,?,?,?)",
-                SEED_PERIOD)
+    cur.executemany(
+        "INSERT OR IGNORE INTO periods (id,label,start_date,end_date,is_active) VALUES (?,?,?,?,?)",
+        SEED_PERIODS)
 
     cur.execute("SELECT COUNT(*) FROM tasks")
     if cur.fetchone()[0] == 0:
