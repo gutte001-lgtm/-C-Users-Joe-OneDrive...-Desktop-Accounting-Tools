@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloseTool</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0d1117;color:#e2e8f0;font-family:'DM Sans','Segoe UI',sans-serif}
+    ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0d1117}::-webkit-scrollbar-thumb{background:#1e2d3d;border-radius:3px}
+    select{appearance:none;-webkit-appearance:none}select option{background:#111827}
+    input,textarea,select{font-family:inherit}
+    .modal-overlay{position:fixed;inset:0;background:#0009;z-index:200;display:flex;align-items:center;justify-content:center}
+    .modal-box{background:#111827;border:1px solid #1e2d3d;border-radius:16px;padding:28px;width:460px;max-height:85vh;overflow-y:auto}
+    .form-group{margin-bottom:14px}
+    .form-label{font-size:11px;color:#64748b;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;display:block}
+    .form-input{width:100%;background:#0d1117;border:1px solid #1e2d3d;border-radius:8px;color:#e2e8f0;padding:9px 12px;font-size:13px;outline:none;transition:border-color .15s}
+    .form-input:focus{border-color:#4f8ef7}
+    .form-select{width:100%;background:#0d1117;border:1px solid #1e2d3d;border-radius:8px;color:#e2e8f0;padding:9px 12px;font-size:13px;outline:none}
+    .btn{padding:8px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .15s}
+    .btn:hover{opacity:.85}
+    .btn-primary{background:#4f8ef7;color:#fff}
+    .btn-success{background:#4fd9a018;border:1px solid #4fd9a040;color:#4fd9a0}
+    .btn-danger{background:#f8717118;border:1px solid #f8717140;color:#f87171}
+    .btn-ghost{background:#1e2d3d;border:1px solid #334155;color:#94a3b8}
+    .tag{font-size:10px;padding:2px 7px;border-radius:4px;font-family:'DM Mono',monospace;font-weight:600}
+    .tag-admin{background:#4f8ef718;color:#4f8ef7;border:1px solid #4f8ef730}
+    .tag-user{background:#1e2d3d;color:#64748b;border:1px solid #334155}
+    tr:hover td{background:#1a2535 !important}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useRef} = React;
+
+async function api(path,opts={}){
+  const res=await fetch(path,{headers:{"Content-Type":"application/json"},credentials:"include",...opts});
+  if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||`HTTP ${res.status}`)}
+  return res.json();
+}
+function fmt(n){if(n==null)return"—";return"$"+parseFloat(n).toLocaleString("en-US",{minimumFractionDigits:2})}
+function fmtDate(d){if(!d)return"—";return new Date(d+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+
+const SC={complete:{label:"Complete",color:"#4fd9a0",bg:"rgba(79,217,160,.12)"},in_progress:{label:"In Progress",color:"#f7c948",bg:"rgba(247,201,72,.12)"},open:{label:"Open",color:"#94a3b8",bg:"rgba(148,163,184,.1)"}};
+const RC={approved:{label:"Approved",color:"#4fd9a0",icon:"✓"},pending:{label:"Pending Review",color:"#94a3b8",icon:"○"},needs_revision:{label:"Needs Revision",color:"#f87171",icon:"!"}};
+const XC={reconciled:{label:"Reconciled",color:"#4fd9a0"},needs_attention:{label:"Variance",color:"#f87171"},open:{label:"Open",color:"#94a3b8"}};
+
+function Avatar({user,size=28}){
+  if(!user)return null;
+  const color=user.color||user.assignee_color||"#64748b";
+  const init=user.initials||user.assignee_initials||"?";
+  return <span style={{width:size,height:size,borderRadius:"50%",background:color+"22",border:`1.5px solid ${color}55`,color,fontSize:size*.38,fontWeight:700,display:"inline-flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{init}</span>;
+}
+function Badge({status,type="status"}){
+  const cfg=type==="review"?RC[status]:type==="recon"?XC[status]:SC[status];
+  if(!cfg)return null;
+  return <span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:20,color:cfg.color,background:cfg.bg||cfg.color+"15",border:`1px solid ${cfg.color}30`,letterSpacing:.3,fontFamily:"'DM Mono',monospace",whiteSpace:"nowrap"}}>{type==="review"?cfg.icon+" ":""}{cfg.label}</span>;
+}
+function ProgressBar({pct,color}){
+  return <div style={{height:4,borderRadius:2,background:"#1e2d3d",overflow:"hidden",marginTop:6}}><div style={{height:"100%",width:Math.min(pct||0,100)+"%",background:color,borderRadius:2,transition:"width .6s ease"}}/></div>;
+}
+function Spinner(){return <div style={{color:"#64748b",padding:40,textAlign:"center",fontFamily:"'DM Mono',monospace"}}>Loading…</div>}
+function Modal({title,onClose,children}){
+  return <div className="modal-overlay" onClick={onClose}><div className="modal-box" onClick={e=>e.stopPropagation()}>
+    <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
+      <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{title}</div>
+      <button onClick={onClose} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+    </div>
+    {children}
+  </div></div>;
+}
+
+// ── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen({onLogin}){
+  const [username,setUsername]=useState("");
+  const [password,setPassword]=useState("");
+  const [error,setError]=useState("");
+  const [loading,setLoading]=useState(false);
+
+  async function handleLogin(e){
+    e.preventDefault();setError("");setLoading(true);
+    try{
+      const user=await api("/api/auth/login",{method:"POST",body:JSON.stringify({username,password})});
+      onLogin(user);
+    }catch(err){setError(err.message);}
+    setLoading(false);
+  }
+  return(
+    <div style={{minHeight:"100vh",background:"#0d1117",display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{width:380,background:"#111827",border:"1px solid #1e2d3d",borderRadius:20,padding:40}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <div style={{fontSize:24,fontWeight:800,color:"#fff",letterSpacing:-1}}>CloseTool <span style={{fontSize:11,background:"#4f8ef722",color:"#4f8ef7",border:"1px solid #4f8ef740",padding:"2px 8px",borderRadius:6,fontFamily:"'DM Mono',monospace",verticalAlign:"middle"}}>QB</span></div>
+          <div style={{fontSize:13,color:"#475569",marginTop:6}}>Month-End Close Management</div>
+        </div>
+        <form onSubmit={handleLogin}>
+          <div className="form-group">
+            <label className="form-label">Username</label>
+            <input className="form-input" value={username} onChange={e=>setUsername(e.target.value)} placeholder="Enter your username" autoFocus/>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Password</label>
+            <input className="form-input" type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Enter your password"/>
+          </div>
+          {error&&<div style={{color:"#f87171",fontSize:12,marginBottom:12,padding:"8px 12px",background:"#f8717118",borderRadius:6,border:"1px solid #f8717130"}}>{error}</div>}
+          <button type="submit" className="btn btn-primary" style={{width:"100%",padding:"11px",fontSize:14}} disabled={loading}>
+            {loading?"Signing in…":"Sign In"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function CloseApp(){
+  const [currentUser,setCurrentUser]=useState(null);
+  const [authChecked,setAuthChecked]=useState(false);
+  const [tab,setTab]=useState("dashboard");
+  const [period,setPeriod]=useState(null);
+  const [tasks,setTasks]=useState([]);
+  const [recons,setRecons]=useState([]);
+  const [dash,setDash]=useState(null);
+  const [users,setUsers]=useState([]);
+  const [cats,setCats]=useState([]);
+  const [selectedTask,setSelectedTask]=useState(null);
+  const [filterUser,setFilterUser]=useState(null);
+  const [filterCat,setFilterCat]=useState(null);
+  const [syncing,setSyncing]=useState(false);
+  const [loading,setLoading]=useState(true);
+
+  const isAdmin=currentUser?.role==="admin";
+
+  useEffect(()=>{
+    api("/api/auth/me").then(u=>{if(u.authenticated)setCurrentUser(u);setAuthChecked(true);}).catch(()=>setAuthChecked(true));
+  },[]);
+
+  const loadAll=useCallback(async()=>{
+    setLoading(true);
+    try{
+      const [p,u,c]=await Promise.all([api("/api/periods/active"),api("/api/users"),api("/api/categories")]);
+      setPeriod(p);setUsers(u);setCats(c);
+      const [t,r,d]=await Promise.all([api(`/api/tasks?period_id=${p.id}`),api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
+      setTasks(t);setRecons(r);setDash(d);
+    }catch(e){console.error(e);}
+    setLoading(false);
+  },[]);
+
+  useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
+
+  async function patchTask(id,patch){
+    try{
+      const updated=await api(`/api/tasks/${id}`,{method:"PATCH",body:JSON.stringify(patch)});
+      setTasks(prev=>prev.map(t=>t.id===id?{...t,...updated}:t));
+      if(selectedTask?.id===id)setSelectedTask(prev=>({...prev,...updated}));
+      const d=await api(`/api/dashboard?period_id=${period.id}`);setDash(d);
+    }catch(e){alert(e.message);}
+  }
+
+  async function patchRecon(id,patch){
+    try{const updated=await api(`/api/reconciliations/${id}`,{method:"PATCH",body:JSON.stringify(patch)});setRecons(prev=>prev.map(r=>r.id===id?{...r,...updated}:r));}
+    catch(e){alert(e.message);}
+  }
+
+  async function syncQB(){
+    setSyncing(true);
+    try{await api("/api/qb/sync",{method:"POST"});const r=await api(`/api/reconciliations?period_id=${period?.id}`);setRecons(r);}
+    catch(e){console.error(e);}
+    setSyncing(false);
+  }
+
+  async function handleLogout(){
+    await api("/api/auth/logout",{method:"POST"}).catch(()=>{});
+    setCurrentUser(null);setTab("dashboard");
+  }
+
+  const filteredTasks=tasks.filter(t=>(!filterUser||t.assignee_id===filterUser||t.reviewer_id===filterUser)&&(!filterCat||t.category_id===filterCat));
+  const groupedTasks=cats.reduce((acc,c)=>{const ct=filteredTasks.filter(t=>t.category_id===c.id);if(ct.length)acc[c.name]={cat:c,tasks:ct};return acc},{});
+
+  const S={
+    app:{minHeight:"100vh",background:"#0d1117",color:"#e2e8f0",display:"flex"},
+    sidebar:{width:230,background:"#111827",borderRight:"1px solid #1e2d3d",padding:"24px 0",display:"flex",flexDirection:"column",gap:4,flexShrink:0},
+    main:{flex:1,overflow:"auto",padding:"28px 32px"},
+    card:{background:"#111827",border:"1px solid #1e2d3d",borderRadius:12,padding:"18px 22px"},
+    kpiGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24},
+    th:{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase",padding:"8px 12px",borderBottom:"1px solid #1e2d3d",textAlign:"left",fontWeight:500},
+    td:{padding:"11px 12px",borderBottom:"1px solid #0d1117",fontSize:13.5,verticalAlign:"middle"},
+    filterBar:{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap",alignItems:"center"},
+    filterBtn:(a)=>({padding:"5px 12px",borderRadius:20,border:`1px solid ${a?"#4f8ef7":"#1e2d3d"}`,background:a?"#4f8ef718":"transparent",color:a?"#4f8ef7":"#64748b",fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}),
+    navBtn:(a)=>({padding:"9px 20px",display:"flex",alignItems:"center",gap:10,cursor:"pointer",border:"none",background:a?"#1e2d3d":"transparent",color:a?"#e2e8f0":"#64748b",fontSize:13.5,fontWeight:a?600:400,borderLeft:a?"2px solid #4f8ef7":"2px solid transparent",textAlign:"left",width:"100%",transition:"all .15s"}),
+    sel:(color)=>({background:color+"15",color,border:`1px solid ${color}40`,borderRadius:12,padding:"2px 8px",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"'DM Mono',monospace",appearance:"none"}),
+  };
+
+  if(!authChecked)return <div style={{minHeight:"100vh",background:"#0d1117",display:"flex",alignItems:"center",justifyContent:"center",color:"#475569",fontFamily:"'DM Mono',monospace"}}>Loading…</div>;
+  if(!currentUser)return <LoginScreen onLogin={setCurrentUser}/>;
+
+  // ── Dashboard ───────────────────────────────────────────────────────────────
+  function Dashboard(){
+    if(!dash)return <Spinner/>;
+    const kpis=[
+      {label:"Close Progress",value:dash.close_pct+"%",sub:`${dash.tasks_complete} of ${dash.tasks_total} tasks`,color:"#4f8ef7",pct:dash.close_pct},
+      {label:"Approved",value:dash.approval_pct+"%",sub:`${dash.tasks_approved} reviewed & signed`,color:"#4fd9a0",pct:dash.approval_pct},
+      {label:"Reconciliations",value:dash.recon_pct+"%",sub:`${dash.recon_done} of ${dash.recon_total} accounts`,color:"#c084fc",pct:dash.recon_pct},
+      {label:"Days to Close",value:"8",sub:"Target: 7 business days",color:"#f7c948",pct:80},
+    ];
+    return(<div>
+      <div style={S.kpiGrid}>{kpis.map(k=>(
+        <div key={k.label} style={S.card}>
+          <div style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase"}}>{k.label}</div>
+          <div style={{fontSize:32,fontWeight:800,color:k.color,lineHeight:1.1,margin:"6px 0 4px"}}>{k.value}</div>
+          <div style={{fontSize:11.5,color:"#64748b"}}>{k.sub}</div>
+          <ProgressBar pct={k.pct} color={k.color}/>
+        </div>
+      ))}</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+        <div style={S.card}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:14}}>Progress by Team Member</div>
+          {dash.by_user.filter(u=>u.tasks_total>0).map(u=>{
+            const pct=u.tasks_total?Math.round(u.tasks_complete/u.tasks_total*100):0;
+            return(<div key={u.id} style={{marginBottom:12}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><Avatar user={u} size={24}/><span style={{fontSize:13}}>{u.name}</span></div>
+                <span style={{fontSize:12,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{u.tasks_complete}/{u.tasks_total}</span>
+              </div>
+              <div style={{height:5,background:"#1e2d3d",borderRadius:3}}><div style={{height:"100%",width:pct+"%",background:u.color,borderRadius:3,transition:"width .5s"}}/></div>
+            </div>);
+          })}
+        </div>
+        <div style={S.card}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:14}}>Progress by Category</div>
+          {dash.by_category.filter(c=>c.tasks_total>0).map(c=>{
+            const pct=Math.round(c.tasks_complete/c.tasks_total*100);
+            const col=pct===100?"#4fd9a0":pct>50?"#4f8ef7":"#f7c948";
+            return(<div key={c.id} style={{marginBottom:11}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontSize:13}}>{c.name}</span><span style={{fontSize:12,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{pct}%</span></div>
+              <div style={{height:5,background:"#1e2d3d",borderRadius:3}}><div style={{height:"100%",width:pct+"%",background:col,borderRadius:3}}/></div>
+            </div>);
+          })}
+        </div>
+      </div>
+      <div style={{...S.card,marginTop:16}}>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:12}}>Needs Attention</div>
+        {dash.attention.length===0&&<div style={{fontSize:13,color:"#475569"}}>All clear! 🎉</div>}
+        {dash.attention.map(t=>(
+          <div key={t.id} onClick={()=>{const full=tasks.find(x=>x.id===t.id);if(full){setSelectedTask(full);setTab("checklist");}}}
+            style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0",borderBottom:"1px solid #1a2535",cursor:"pointer"}}>
+            <span style={{color:"#f87171",fontSize:12}}>⚠</span>
+            <span style={{fontSize:13,flex:1}}>{t.name}</span>
+            <span style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{t.category_name}</span>
+            <Badge status={t.review_status} type="review"/>
+          </div>
+        ))}
+      </div>
+    </div>);
+  }
+
+  // ── Checklist ───────────────────────────────────────────────────────────────
+  function Checklist(){
+    if(loading)return <Spinner/>;
+    const canEdit=(t)=>isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+    return(<div>
+      <div style={S.filterBar}>
+        <button style={S.filterBtn(!filterUser&&!filterCat)} onClick={()=>{setFilterUser(null);setFilterCat(null);}}>All</button>
+        {users.map(u=><button key={u.id} style={S.filterBtn(filterUser===u.id)} onClick={()=>setFilterUser(filterUser===u.id?null:u.id)}>{u.initials}</button>)}
+        <span style={{width:1,background:"#1e2d3d",margin:"0 4px",height:20,display:"inline-block"}}/>
+        {cats.map(c=><button key={c.id} style={S.filterBtn(filterCat===c.id)} onClick={()=>setFilterCat(filterCat===c.id?null:c.id)}>{c.name}</button>)}
+      </div>
+      {Object.entries(groupedTasks).map(([catName,{tasks:ct}])=>(
+        <div key={catName} style={{...S.card,marginBottom:14}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+            <span style={{fontSize:12,fontWeight:700,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase"}}>{catName}</span>
+            <span style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{ct.filter(t=>t.status==="complete").length}/{ct.length} complete</span>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{["Task","Assignee","Due","Status","Reviewer","Review"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <tbody>{ct.map(t=>(
+              <tr key={t.id} style={{cursor:"pointer"}} onClick={()=>setSelectedTask(t)}>
+                <td style={{...S.td,fontWeight:500}}>{t.notes&&<span style={{color:"#f7c948",marginRight:6,fontSize:11}}>●</span>}{t.name}</td>
+                <td style={S.td}><Avatar user={{initials:t.assignee_initials,color:t.assignee_color}}/></td>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{fmtDate(t.due_date)}</td>
+                <td style={S.td}>
+                  {canEdit(t)
+                    ?<select value={t.status} style={S.sel(SC[t.status]?.color||"#94a3b8")} onClick={e=>e.stopPropagation()} onChange={e=>{e.stopPropagation();patchTask(t.id,{status:e.target.value});}}>
+                      <option value="open">Open</option><option value="in_progress">In Progress</option><option value="complete">Complete</option>
+                    </select>
+                    :<Badge status={t.status}/>}
+                </td>
+                <td style={S.td}><Avatar user={{initials:t.reviewer_initials,color:"#64748b"}}/></td>
+                <td style={S.td}>
+                  {(isAdmin||t.reviewer_id===currentUser.id)
+                    ?<select value={t.review_status} style={S.sel(RC[t.review_status]?.color||"#94a3b8")} onClick={e=>e.stopPropagation()} onChange={e=>{e.stopPropagation();patchTask(t.id,{review_status:e.target.value});}}>
+                      <option value="pending">Pending Review</option><option value="approved">Approved</option><option value="needs_revision">Needs Revision</option>
+                    </select>
+                    :<Badge status={t.review_status} type="review"/>}
+                </td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      ))}
+    </div>);
+  }
+
+  // ── Reconciliations ─────────────────────────────────────────────────────────
+  function Reconciliations(){
+    if(loading)return <Spinner/>;
+    return(<div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Account Reconciliations</div>
+          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Synced from QuickBooks Online</div>
+        </div>
+        {isAdmin&&<button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>}
+      </div>
+      <table style={{width:"100%",borderCollapse:"collapse"}}>
+        <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
+        <tbody>{recons.map(r=>{
+          const variance=r.expected_balance!=null?r.qb_balance-r.expected_balance:null;
+          const vc=variance===0?"#4fd9a0":variance!=null?"#f87171":"#475569";
+          return(<tr key={r.id}>
+            <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{r.account_number} – {r.account_name}</td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.qb_balance)}</td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>
+              <input type="text" defaultValue={r.expected_balance!=null?r.expected_balance:""} placeholder="—"
+                onBlur={e=>{const v=parseFloat(e.target.value.replace(/[$,]/g,""));if(!isNaN(v))patchRecon(r.id,{expected_balance:v});}}
+                style={{background:"transparent",border:"none",color:"#e2e8f0",fontFamily:"'DM Mono',monospace",fontSize:12.5,textAlign:"right",width:110,outline:"none",borderBottom:"1px dashed #1e2d3d"}}/>
+            </td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,color:vc,fontWeight:variance!==0&&variance!=null?700:400}}>{variance!=null?(variance===0?"—":fmt(Math.abs(variance))):"—"}</td>
+            <td style={S.td}><Avatar user={{initials:r.assignee_initials,color:r.assignee_color}}/></td>
+            <td style={S.td}>
+              <select value={r.status} style={S.sel(XC[r.status]?.color||"#94a3b8")} onChange={e=>patchRecon(r.id,{status:e.target.value})}>
+                <option value="open">Open</option><option value="needs_attention">Variance</option><option value="reconciled">Reconciled</option>
+              </select>
+            </td>
+            <td style={{...S.td,fontSize:12,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{r.last_updated_at?new Date(r.last_updated_at).toLocaleDateString("en-US",{month:"short",day:"numeric"}):"—"}</td>
+          </tr>);
+        })}</tbody>
+      </table>
+    </div>);
+  }
+
+  // ── Task Modal ──────────────────────────────────────────────────────────────
+  function TaskModal(){
+    const [notes,setNotes]=useState(selectedTask?.notes||"");
+    const [editMode,setEditMode]=useState(false);
+    const [editData,setEditData]=useState({});
+    useEffect(()=>{setNotes(selectedTask?.notes||"");setEditMode(false);},[selectedTask?.id]);
+    if(!selectedTask)return null;
+    const t=selectedTask;
+    const assignee=users.find(u=>u.id===t.assignee_id);
+    const reviewer=users.find(u=>u.id===t.reviewer_id);
+    const canEdit=isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+
+    async function saveEdit(){
+      await patchTask(t.id,{...editData,notes});
+      setEditMode(false);setEditData({});
+    }
+
+    return(<div style={{position:"fixed",inset:0,background:"#0008",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setSelectedTask(null)}>
+      <div style={{background:"#111827",border:"1px solid #1e2d3d",borderRadius:16,width:520,padding:28,maxHeight:"80vh",overflow:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
+          <div>
+            <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>{t.category_name}</div>
+            {editMode&&isAdmin
+              ?<input className="form-input" defaultValue={t.name} onChange={e=>setEditData(p=>({...p,name:e.target.value}))} style={{fontSize:15,fontWeight:700,width:"100%"}}/>
+              :<div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{t.name}</div>}
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"flex-start"}}>
+            {isAdmin&&!editMode&&<button onClick={()=>setEditMode(true)} className="btn btn-ghost" style={{fontSize:11,padding:"5px 10px"}}>Edit</button>}
+            <button onClick={()=>setSelectedTask(null)} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:18}}>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Assigned To</div>
+            {editMode&&isAdmin
+              ?<select className="form-select" defaultValue={t.assignee_id} onChange={e=>setEditData(p=>({...p,assignee_id:parseInt(e.target.value)}))}>
+                {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+              </select>
+              :<div style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><Avatar user={assignee}/>{assignee?.name}</div>}
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Reviewer</div>
+            {editMode&&isAdmin
+              ?<select className="form-select" defaultValue={t.reviewer_id} onChange={e=>setEditData(p=>({...p,reviewer_id:parseInt(e.target.value)}))}>
+                {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+              </select>
+              :<div style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><Avatar user={reviewer}/>{reviewer?.name}</div>}
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Due Date</div>
+            {editMode&&isAdmin
+              ?<input type="date" className="form-input" defaultValue={t.due_date||""} onChange={e=>setEditData(p=>({...p,due_date:e.target.value}))}/>
+              :<span style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>{fmtDate(t.due_date)}</span>}
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Category</div>
+            {editMode&&isAdmin
+              ?<select className="form-select" defaultValue={t.category_id} onChange={e=>setEditData(p=>({...p,category_id:parseInt(e.target.value)}))}>
+                {cats.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              :<span style={{fontSize:13}}>{t.category_name}</span>}
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Status</div><Badge status={t.status}/></div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Review</div><Badge status={t.review_status} type="review"/></div>
+        </div>
+
+        <div style={{marginBottom:14}}>
+          <div className="form-label">Notes</div>
+          <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Add notes or comments…" disabled={!canEdit}
+            style={{width:"100%",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:80,fontFamily:"'DM Sans',sans-serif",opacity:canEdit?1:.6}}/>
+        </div>
+
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+          {editMode&&isAdmin&&<><button onClick={()=>{setEditMode(false);setEditData({});}} className="btn btn-ghost">Cancel</button><button onClick={saveEdit} className="btn btn-primary">Save Changes</button></>}
+          {!editMode&&canEdit&&<>
+            <button onClick={()=>patchTask(t.id,{notes}).then(()=>setSelectedTask(null))} className="btn btn-ghost">Save Note</button>
+            <button onClick={()=>patchTask(t.id,{status:"complete",notes}).then(()=>setSelectedTask(null))} className="btn btn-success">Mark Complete</button>
+            {(isAdmin||t.reviewer_id===currentUser.id)&&<button onClick={()=>patchTask(t.id,{review_status:"approved",notes}).then(()=>setSelectedTask(null))} className="btn btn-primary">Approve ✓</button>}
+          </>}
+        </div>
+      </div>
+    </div>);
+  }
+
+  // ── Settings (Admin Only) ───────────────────────────────────────────────────
+  function Settings(){
+    const [settingsTab,setSettingsTab]=useState("users");
+    const [showAddUser,setShowAddUser]=useState(false);
+    const [showAddCat,setShowAddCat]=useState(false);
+    const [showAddTask,setShowAddTask]=useState(false);
+    const [editUser,setEditUser]=useState(null);
+    const [editCat,setEditCat]=useState(null);
+
+    // Add User Form
+    const [newUser,setNewUser]=useState({name:"",initials:"",username:"",email:"",role:"preparer",color:"#4f8ef7",password:""});
+    async function addUser(){
+      try{await api("/api/users",{method:"POST",body:JSON.stringify(newUser)});await loadAll();setShowAddUser(false);setNewUser({name:"",initials:"",username:"",email:"",role:"preparer",color:"#4f8ef7",password:""});}
+      catch(e){alert(e.message);}
+    }
+    async function deleteUser(id){
+      if(!confirm("Delete this user?"))return;
+      try{await api(`/api/users/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
+    }
+    async function saveEditUser(){
+      try{await api(`/api/users/${editUser.id}`,{method:"PATCH",body:JSON.stringify(editUser)});await loadAll();setEditUser(null);}
+      catch(e){alert(e.message);}
+    }
+
+    // Add Category Form
+    const [newCat,setNewCat]=useState({name:"",sort_order:99});
+    async function addCat(){
+      try{await api("/api/categories",{method:"POST",body:JSON.stringify(newCat)});await loadAll();setShowAddCat(false);setNewCat({name:"",sort_order:99});}
+      catch(e){alert(e.message);}
+    }
+    async function deleteCat(id){
+      if(!confirm("Delete this category?"))return;
+      try{await api(`/api/categories/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
+    }
+    async function saveEditCat(){
+      try{await api(`/api/categories/${editCat.id}`,{method:"PATCH",body:JSON.stringify(editCat)});await loadAll();setEditCat(null);}
+      catch(e){alert(e.message);}
+    }
+
+    // Add Task Form
+    const [newTask,setNewTask]=useState({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:""});
+    async function addTask(){
+      if(!newTask.name||!newTask.category_id||!newTask.assignee_id||!newTask.reviewer_id){alert("Name, category, assignee, and reviewer are required.");return;}
+      try{
+        await api("/api/tasks",{method:"POST",body:JSON.stringify({...newTask,period_id:period.id,category_id:parseInt(newTask.category_id),assignee_id:parseInt(newTask.assignee_id),reviewer_id:parseInt(newTask.reviewer_id)})});
+        await loadAll();setShowAddTask(false);setNewTask({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:""});
+      }catch(e){alert(e.message);}
+    }
+    async function deleteTask(id){
+      if(!confirm("Delete this task?"))return;
+      try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
+    }
+
+    const stabs=["users","categories","tasks"];
+    return(<div>
+      <div style={{display:"flex",gap:0,marginBottom:24,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
+        {stabs.map(t=><button key={t} onClick={()=>setSettingsTab(t)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:settingsTab===t?"#1e2d3d":"transparent",color:settingsTab===t?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:settingsTab===t?600:400,textTransform:"capitalize"}}>{t}</button>)}
+      </div>
+
+      {/* USERS */}
+      {settingsTab==="users"&&<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Team Members</div>
+          <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddUser(true)}>+ Add User</button>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Name","Username","Role","Color","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+          <tbody>{users.map(u=>(
+            <tr key={u.id}>
+              <td style={S.td}><div style={{display:"flex",alignItems:"center",gap:8}}><Avatar user={u} size={26}/><span style={{fontWeight:500}}>{u.name}</span></div></td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{u.username}</td>
+              <td style={S.td}><span className={`tag ${u.role==="admin"?"tag-admin":"tag-user"}`}>{u.role}</span></td>
+              <td style={S.td}><div style={{width:22,height:22,borderRadius:6,background:u.color}}/></td>
+              <td style={S.td}><div style={{display:"flex",gap:6}}>
+                <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>setEditUser({...u})}>Edit</button>
+                {u.id!==currentUser.id&&<button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>deleteUser(u.id)}>Delete</button>}
+              </div></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>}
+
+      {/* CATEGORIES */}
+      {settingsTab==="categories"&&<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Categories</div>
+          <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddCat(true)}>+ Add Category</button>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Category","Sort Order","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+          <tbody>{cats.map(c=>(
+            <tr key={c.id}>
+              <td style={{...S.td,fontWeight:500}}>{c.name}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{c.sort_order}</td>
+              <td style={S.td}><div style={{display:"flex",gap:6}}>
+                <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>setEditCat({...c})}>Edit</button>
+                <button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>deleteCat(c.id)}>Delete</button>
+              </div></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>}
+
+      {/* TASKS */}
+      {settingsTab==="tasks"&&<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>All Tasks — {period?.label}</div>
+          <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddTask(true)}>+ Add Task</button>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Task","Category","Assignee","Due","Status","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+          <tbody>{tasks.map(t=>(
+            <tr key={t.id}>
+              <td style={{...S.td,fontWeight:500,maxWidth:260}}><div style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.name}</div></td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{t.category_name}</td>
+              <td style={S.td}><Avatar user={{initials:t.assignee_initials,color:t.assignee_color}} size={24}/></td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{fmtDate(t.due_date)}</td>
+              <td style={S.td}><Badge status={t.status}/></td>
+              <td style={S.td}><div style={{display:"flex",gap:6}}>
+                <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>setSelectedTask(t)}>Edit</button>
+                <button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>deleteTask(t.id)}>Delete</button>
+              </div></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>}
+
+      {/* Modals */}
+      {showAddUser&&<Modal title="Add Team Member" onClose={()=>setShowAddUser(false)}>
+        {[["Full Name","name","text"],["Initials (2-3 chars)","initials","text"],["Username","username","text"],["Email","email","email"],["Password","password","password"]].map(([label,key,type])=>(
+          <div key={key} className="form-group"><label className="form-label">{label}</label><input type={type} className="form-input" value={newUser[key]} onChange={e=>setNewUser(p=>({...p,[key]:e.target.value}))}/></div>
+        ))}
+        <div className="form-group"><label className="form-label">Role</label>
+          <select className="form-select" value={newUser.role} onChange={e=>setNewUser(p=>({...p,role:e.target.value}))}>
+            <option value="preparer">User (Preparer)</option><option value="reviewer">Reviewer</option><option value="admin">Admin</option>
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Color</label><input type="color" value={newUser.color} onChange={e=>setNewUser(p=>({...p,color:e.target.value}))} style={{width:"100%",height:36,border:"1px solid #1e2d3d",borderRadius:8,background:"#0d1117",cursor:"pointer"}}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowAddUser(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={addUser}>Add User</button>
+        </div>
+      </Modal>}
+
+      {editUser&&<Modal title="Edit Team Member" onClose={()=>setEditUser(null)}>
+        {[["Full Name","name","text"],["Initials","initials","text"],["Username","username","text"],["Email","email","email"],["New Password (leave blank to keep)","password","password"]].map(([label,key,type])=>(
+          <div key={key} className="form-group"><label className="form-label">{label}</label><input type={type} className="form-input" value={editUser[key]||""} onChange={e=>setEditUser(p=>({...p,[key]:e.target.value}))}/></div>
+        ))}
+        <div className="form-group"><label className="form-label">Role</label>
+          <select className="form-select" value={editUser.role} onChange={e=>setEditUser(p=>({...p,role:e.target.value}))}>
+            <option value="preparer">User (Preparer)</option><option value="reviewer">Reviewer</option><option value="admin">Admin</option>
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Color</label><input type="color" value={editUser.color} onChange={e=>setEditUser(p=>({...p,color:e.target.value}))} style={{width:"100%",height:36,border:"1px solid #1e2d3d",borderRadius:8,background:"#0d1117",cursor:"pointer"}}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setEditUser(null)}>Cancel</button>
+          <button className="btn btn-primary" onClick={saveEditUser}>Save Changes</button>
+        </div>
+      </Modal>}
+
+      {showAddCat&&<Modal title="Add Category" onClose={()=>setShowAddCat(false)}>
+        <div className="form-group"><label className="form-label">Category Name</label><input className="form-input" value={newCat.name} onChange={e=>setNewCat(p=>({...p,name:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Sort Order</label><input type="number" className="form-input" value={newCat.sort_order} onChange={e=>setNewCat(p=>({...p,sort_order:parseInt(e.target.value)}))}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowAddCat(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={addCat}>Add Category</button>
+        </div>
+      </Modal>}
+
+      {editCat&&<Modal title="Edit Category" onClose={()=>setEditCat(null)}>
+        <div className="form-group"><label className="form-label">Category Name</label><input className="form-input" value={editCat.name} onChange={e=>setEditCat(p=>({...p,name:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Sort Order</label><input type="number" className="form-input" value={editCat.sort_order} onChange={e=>setEditCat(p=>({...p,sort_order:parseInt(e.target.value)}))}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setEditCat(null)}>Cancel</button>
+          <button className="btn btn-primary" onClick={saveEditCat}>Save Changes</button>
+        </div>
+      </Modal>}
+
+      {showAddTask&&<Modal title="Add Task" onClose={()=>setShowAddTask(false)}>
+        <div className="form-group"><label className="form-label">Task Name</label><input className="form-input" value={newTask.name} onChange={e=>setNewTask(p=>({...p,name:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Category</label>
+          <select className="form-select" value={newTask.category_id} onChange={e=>setNewTask(p=>({...p,category_id:e.target.value}))}>
+            <option value="">Select category…</option>{cats.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Assignee</label>
+          <select className="form-select" value={newTask.assignee_id} onChange={e=>setNewTask(p=>({...p,assignee_id:e.target.value}))}>
+            <option value="">Select assignee…</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Reviewer</label>
+          <select className="form-select" value={newTask.reviewer_id} onChange={e=>setNewTask(p=>({...p,reviewer_id:e.target.value}))}>
+            <option value="">Select reviewer…</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Due Date</label><input type="date" className="form-input" value={newTask.due_date} onChange={e=>setNewTask(p=>({...p,due_date:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Notes</label><textarea className="form-input" value={newTask.notes} onChange={e=>setNewTask(p=>({...p,notes:e.target.value}))} style={{minHeight:60,resize:"vertical"}}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowAddTask(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={addTask}>Add Task</button>
+        </div>
+      </Modal>}
+    </div>);
+  }
+
+  const navItems=[
+    {id:"dashboard",label:"Dashboard",icon:"⬡"},
+    {id:"checklist",label:"Close Checklist",icon:"☑"},
+    {id:"recons",label:"Reconciliations",icon:"⇌"},
+    ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
+  ];
+
+  return(<div style={S.app}>
+    <div style={S.sidebar}>
+      <div style={{padding:"0 20px 20px",borderBottom:"1px solid #1e2d3d",marginBottom:8}}>
+        <div style={{fontSize:17,fontWeight:800,color:"#fff",letterSpacing:-0.5}}>CloseTool<span style={{fontSize:10,background:"#4f8ef722",color:"#4f8ef7",border:"1px solid #4f8ef740",padding:"1px 6px",borderRadius:4,fontFamily:"'DM Mono',monospace",marginLeft:6}}>QB</span></div>
+        <div style={{fontSize:11,color:"#475569",marginTop:4}}>{period?.label||"Loading…"}</div>
+      </div>
+      <div style={{margin:"0 12px 8px",padding:"8px 12px",background:"#1a2535",border:"1px solid #1e2d3d",borderRadius:8}}>
+        <div style={{fontSize:10,color:"#475569",marginBottom:2,fontFamily:"'DM Mono',monospace"}}>CLOSE PERIOD</div>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>{period?.label}</div>
+        <div style={{marginTop:6,height:3,background:"#1e2d3d",borderRadius:2}}><div style={{height:"100%",width:(dash?.close_pct||0)+"%",background:"#4f8ef7",borderRadius:2}}/></div>
+        <div style={{fontSize:10,color:"#4f8ef7",marginTop:3}}>{dash?.close_pct||0}% complete</div>
+      </div>
+      {navItems.map(n=><button key={n.id} style={S.navBtn(tab===n.id)} onClick={()=>setTab(n.id)}><span style={{fontSize:15}}>{n.icon}</span>{n.label}</button>)}
+      <div style={{marginTop:"auto",padding:"16px 20px",borderTop:"1px solid #1e2d3d"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+          <Avatar user={currentUser} size={28}/>
+          <div>
+            <div style={{fontSize:12,fontWeight:600,color:"#94a3b8"}}>{currentUser.name}</div>
+            <span className={`tag ${currentUser.role==="admin"?"tag-admin":"tag-user"}`}>{currentUser.role}</span>
+          </div>
+        </div>
+        <button onClick={handleLogout} style={{width:"100%",padding:"7px",background:"#1a2535",border:"1px solid #1e2d3d",borderRadius:8,color:"#64748b",fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>Sign Out</button>
+      </div>
+    </div>
+
+    <div style={S.main}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28}}>
+        <div>
+          <div style={{fontSize:22,fontWeight:700,color:"#f1f5f9",letterSpacing:-0.5}}>{navItems.find(n=>n.id===tab)?.label}</div>
+          <div style={{fontSize:13,color:"#64748b",marginTop:3}}>
+            {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}
+            {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
+            {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
+            {tab==="settings"&&"Admin only — manage team, categories, and tasks"}
+          </div>
+        </div>
+      </div>
+      {tab==="dashboard"&&<Dashboard/>}
+      {tab==="checklist"&&<Checklist/>}
+      {tab==="recons"&&<Reconciliations/>}
+      {tab==="settings"&&isAdmin&&<Settings/>}
+    </div>
+    {selectedTask&&<TaskModal/>}
+  </div>);
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<CloseApp/>);
+</script>
+</body>
+</html>
