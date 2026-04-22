@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+closeapp.db
+closeapp.db-journal
+closeapp.db-wal
+closeapp.db-shm
+.env
+.venv/
+venv/
+scratch/
+*.OLD.py
+*_new.py
+*_old.py
+*.bak

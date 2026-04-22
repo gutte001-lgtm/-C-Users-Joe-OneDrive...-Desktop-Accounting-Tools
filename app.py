@@ -5,7 +5,6 @@ from flask import Flask, jsonify, request, g, send_from_directory, session, redi
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
-from werkzeug.security import generate_password_hash, check_password_hash
 
 load_dotenv()
 
@@ -65,61 +64,23 @@ def rows_to_list(rows):
 def err(msg, code=400):
     return jsonify({"error": msg}), code
 
+# ── Auth disabled ─────────────────────────────────────────────────────────────
+# Login screen intentionally removed. The app runs as the seeded admin
+# (user id 1 — "Joe G.") for every request. See AGENTS.md §1 before touching.
+
+DEFAULT_USER_ID = 1
+
 def get_current_user():
-    uid = session.get("user_id")
-    return q1("SELECT * FROM users WHERE id=?", (uid,)) if uid else None
+    user = q1("SELECT * FROM users WHERE id=?", (DEFAULT_USER_ID,))
+    if not user:
+        user = q1("SELECT * FROM users ORDER BY id LIMIT 1")
+    return user
 
 def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("user_id"):
-            return jsonify({"error": "Not authenticated"}), 401
-        return f(*args, **kwargs)
-    return decorated
+    return f
 
 def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        user = get_current_user()
-        if not user or user["role"] != "admin":
-            return jsonify({"error": "Admin access required"}), 403
-        return f(*args, **kwargs)
-    return decorated
-
-# ── Auth ──────────────────────────────────────────────────────────────────────
-
-@app.route("/api/auth/login", methods=["GET", "POST", "OPTIONS"])
-def login():
-    if request.method == "OPTIONS":
-        return "", 204
-    if request.method == "GET":
-        return jsonify({"message": "login endpoint"})
-    b = request.json or {}
-    username = b.get("username", "").strip()
-    password = b.get("password", "")
-    if not username or not password:
-        return err("Username and password required")
-    user = q1("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (username,))
-    if not user or not user["password_hash"]:
-        return err("Invalid username or password")
-    if not check_password_hash(user["password_hash"], password):
-        return err("Invalid username or password")
-    session["user_id"] = user["id"]
-    session.permanent = True
-    return jsonify({
-        "id": user["id"],
-        "name": user["name"],
-        "initials": user["initials"],
-        "role": user["role"],
-        "color": user["color"]
-    })
-
-@app.route("/api/auth/logout", methods=["GET", "POST", "OPTIONS"])
-def logout():
-    if request.method == "OPTIONS":
-        return "", 204
-    session.clear()
-    return jsonify({"status": "logged out"})
+    return f
 
 @app.route("/api/auth/me", methods=["GET", "OPTIONS"])
 def me():
@@ -127,7 +88,7 @@ def me():
         return "", 204
     user = get_current_user()
     if not user:
-        return jsonify({"authenticated": False})
+        return jsonify({"authenticated": True, "id": 0, "name": "Guest", "initials": "?", "role": "admin", "color": "#4f8ef7"})
     return jsonify({
         "authenticated": True,
         "id": user["id"],
@@ -657,7 +618,8 @@ def flux_notes():
     note = (body.get("note") or "").strip()
     if not (period_id and rtype and account_name):
         return jsonify({"error": "period_id, report_type, account_name required"}), 400
-    uid = session.get("user_id")
+    user = get_current_user()
+    uid = user["id"] if user else DEFAULT_USER_ID
     if not note:
         run("DELETE FROM flux_notes WHERE period_id=? AND report_type=? AND account_name=?",
             (period_id, rtype, account_name))
@@ -1048,12 +1010,15 @@ scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
 scheduler.add_job(sync_qb_all_reports, "interval", minutes=15, id="qb_reports_sync")
 scheduler.start()
 
-# Run calendar setup on module load (wrapped so it doesn't crash imports)
+# Ensure the base schema + seed data exist before the fiscal-calendar migration
+# runs. init_db.init() is idempotent.
 try:
+    from init_db import init as _init_db
+    _init_db()
     with app.app_context():
         _ensure_fiscal_calendar()
 except Exception:
-    pass
+    traceback.print_exc()
 
 # ── Periods ───────────────────────────────────────────────────────────────────
 
@@ -1072,7 +1037,7 @@ def get_active_period():
     row = q1("SELECT * FROM periods WHERE is_active=1")
     return jsonify(dict(row)) if row else err("No active period", 404)
 
-@app.route("/api/periods/create", methods=["POST", "OPTIONS"])
+@app.route("/api/periods", methods=["POST", "OPTIONS"])
 @admin_required
 def create_period():
     if request.method == "OPTIONS":
@@ -1102,20 +1067,19 @@ def activate_period(pid):
 def get_users():
     if request.method == "OPTIONS":
         return "", 204
-    return jsonify(rows_to_list(q("SELECT id,name,initials,username,email,role,color FROM users")))
+    return jsonify(rows_to_list(q("SELECT id,name,initials,email,role,color FROM users")))
 
-@app.route("/api/users/create", methods=["POST", "OPTIONS"])
+@app.route("/api/users", methods=["POST", "OPTIONS"])
 @admin_required
 def create_user():
     if request.method == "OPTIONS":
         return "", 204
     b = request.json or {}
-    if not all(k in b for k in ("name", "initials", "username", "role", "color")):
-        return err("name, initials, username, role, color required")
+    if not all(k in b for k in ("name", "initials", "role", "color")):
+        return err("name, initials, role, color required")
     cur = run(
-        "INSERT INTO users (name,initials,username,email,role,color,password_hash) VALUES (?,?,?,?,?,?,?)",
-        (b["name"], b["initials"], b["username"], b.get("email", ""), b["role"], b["color"],
-         generate_password_hash(b.get("password", "changeme123"))))
+        "INSERT INTO users (name,initials,email,role,color) VALUES (?,?,?,?,?)",
+        (b["name"], b["initials"], b.get("email", ""), b["role"], b["color"]))
     return jsonify({"id": cur.lastrowid}), 201
 
 @app.route("/api/users/<int:uid>", methods=["PATCH", "DELETE", "OPTIONS"])
@@ -1124,15 +1088,21 @@ def manage_user(uid):
     if request.method == "OPTIONS":
         return "", 204
     if request.method == "DELETE":
-        if uid == session.get("user_id"):
-            return err("Cannot delete yourself")
+        if uid == DEFAULT_USER_ID:
+            return err("Cannot delete the default admin user")
+        tasks = q1("SELECT COUNT(*) AS n FROM tasks WHERE assignee_id=? OR reviewer_id=?", (uid, uid))["n"]
+        recons = q1("SELECT COUNT(*) AS n FROM reconciliations WHERE assignee_id=?", (uid,))["n"]
+        if tasks or recons:
+            parts = []
+            if tasks:  parts.append(f"{tasks} task(s)")
+            if recons: parts.append(f"{recons} reconciliation(s)")
+            return err(f"Cannot delete: user is still assigned to {' and '.join(parts)}. Reassign them first.", 409)
+        run("DELETE FROM task_activity WHERE user_id=?", (uid,))
         run("DELETE FROM users WHERE id=?", (uid,))
         return jsonify({"deleted": uid})
     b = request.json or {}
-    allowed = {"name", "initials", "username", "email", "role", "color"}
+    allowed = {"name", "initials", "email", "role", "color"}
     updates = {k: v for k, v in b.items() if k in allowed}
-    if "password" in b:
-        updates["password_hash"] = generate_password_hash(b["password"])
     if not updates:
         return err("No valid fields")
     set_clause = ", ".join(f"{k}=?" for k in updates)
@@ -1148,7 +1118,7 @@ def get_categories():
         return "", 204
     return jsonify(rows_to_list(q("SELECT * FROM categories ORDER BY sort_order")))
 
-@app.route("/api/categories/create", methods=["POST", "OPTIONS"])
+@app.route("/api/categories", methods=["POST", "OPTIONS"])
 @admin_required
 def create_category():
     if request.method == "OPTIONS":
@@ -1166,6 +1136,9 @@ def manage_category(cid):
     if request.method == "OPTIONS":
         return "", 204
     if request.method == "DELETE":
+        in_use = q1("SELECT COUNT(*) AS n FROM tasks WHERE category_id=?", (cid,))["n"]
+        if in_use:
+            return err(f"Cannot delete: category still has {in_use} task(s). Reassign or delete them first.", 409)
         run("DELETE FROM categories WHERE id=?", (cid,))
         return jsonify({"deleted": cid})
     b = request.json or {}
@@ -1202,7 +1175,7 @@ def get_tasks():
         return jsonify([])
     return jsonify(rows_to_list(q(TASK_SELECT + " WHERE t.period_id=? ORDER BY c.sort_order, t.id", (period_id,))))
 
-@app.route("/api/tasks/create", methods=["POST", "OPTIONS"])
+@app.route("/api/tasks", methods=["POST", "OPTIONS"])
 @admin_required
 def create_task():
     if request.method == "OPTIONS":
@@ -1288,7 +1261,7 @@ def get_reconciliations():
         return jsonify([])
     return jsonify(rows_to_list(q(RECON_SELECT + " WHERE r.period_id=? ORDER BY r.account_number", (period_id,))))
 
-@app.route("/api/reconciliations/create", methods=["POST", "OPTIONS"])
+@app.route("/api/reconciliations", methods=["POST", "OPTIONS"])
 @admin_required
 def create_reconciliation():
     if request.method == "OPTIONS":

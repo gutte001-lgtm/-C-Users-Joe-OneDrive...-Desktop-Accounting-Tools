@@ -20,7 +20,6 @@ CREATE TABLE IF NOT EXISTS users (
     email       TEXT    UNIQUE NOT NULL,
     role        TEXT    NOT NULL DEFAULT 'preparer',   -- admin | preparer | reviewer
     color       TEXT    NOT NULL DEFAULT '#4f8ef7',
-    password_hash TEXT,          -- placeholder for future Flask-Login
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

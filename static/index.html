@@ -75,51 +75,10 @@ function Modal({title,onClose,children}){
   </div></div>;
 }
 
-// ── Login Screen ──────────────────────────────────────────────────────────────
-function LoginScreen({onLogin}){
-  const [username,setUsername]=useState("");
-  const [password,setPassword]=useState("");
-  const [error,setError]=useState("");
-  const [loading,setLoading]=useState(false);
-
-  async function handleLogin(e){
-    e.preventDefault();setError("");setLoading(true);
-    try{
-      const user=await api("/api/auth/login",{method:"POST",body:JSON.stringify({username,password})});
-      onLogin(user);
-    }catch(err){setError(err.message);}
-    setLoading(false);
-  }
-  return(
-    <div style={{minHeight:"100vh",background:"#0d1117",display:"flex",alignItems:"center",justifyContent:"center"}}>
-      <div style={{width:380,background:"#111827",border:"1px solid #1e2d3d",borderRadius:20,padding:40}}>
-        <div style={{textAlign:"center",marginBottom:32}}>
-          <div style={{fontSize:24,fontWeight:800,color:"#fff",letterSpacing:-1}}>CloseTool <span style={{fontSize:11,background:"#4f8ef722",color:"#4f8ef7",border:"1px solid #4f8ef740",padding:"2px 8px",borderRadius:6,fontFamily:"'DM Mono',monospace",verticalAlign:"middle"}}>QB</span></div>
-          <div style={{fontSize:13,color:"#475569",marginTop:6}}>Month-End Close Management</div>
-        </div>
-        <form onSubmit={handleLogin}>
-          <div className="form-group">
-            <label className="form-label">Username</label>
-            <input className="form-input" value={username} onChange={e=>setUsername(e.target.value)} placeholder="Enter your username" autoFocus/>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Password</label>
-            <input className="form-input" type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Enter your password"/>
-          </div>
-          {error&&<div style={{color:"#f87171",fontSize:12,marginBottom:12,padding:"8px 12px",background:"#f8717118",borderRadius:6,border:"1px solid #f8717130"}}>{error}</div>}
-          <button type="submit" className="btn btn-primary" style={{width:"100%",padding:"11px",fontSize:14}} disabled={loading}>
-            {loading?"Signing in…":"Sign In"}
-          </button>
-        </form>
-      </div>
-    </div>
-  );
-}
-
 // ── Main App ──────────────────────────────────────────────────────────────────
+// NOTE: Login screen removed intentionally. See AGENTS.md before re-adding auth.
 function CloseApp(){
   const [currentUser,setCurrentUser]=useState(null);
-  const [authChecked,setAuthChecked]=useState(false);
   const [tab,setTab]=useState("dashboard");
   const [period,setPeriod]=useState(null);
   const [tasks,setTasks]=useState([]);
@@ -142,7 +101,7 @@ function CloseApp(){
   const isAdmin=currentUser?.role==="admin";
 
   useEffect(()=>{
-    api("/api/auth/me").then(u=>{if(u.authenticated)setCurrentUser(u);setAuthChecked(true);}).catch(()=>setAuthChecked(true));
+    api("/api/auth/me").then(u=>setCurrentUser(u)).catch(()=>setCurrentUser({id:0,name:"Guest",initials:"?",role:"admin",color:"#4f8ef7"}));
   },[]);
 
   const loadAll=useCallback(async()=>{
@@ -179,11 +138,6 @@ function CloseApp(){
     setSyncing(false);
   }
 
-  async function handleLogout(){
-    await api("/api/auth/logout",{method:"POST"}).catch(()=>{});
-    setCurrentUser(null);setTab("dashboard");
-  }
-
   const filteredTasks=tasks.filter(t=>(!filterUser||t.assignee_id===filterUser||t.reviewer_id===filterUser)&&(!filterCat||t.category_id===filterCat));
   const groupedTasks=cats.reduce((acc,c)=>{const ct=filteredTasks.filter(t=>t.category_id===c.id);if(ct.length)acc[c.name]={cat:c,tasks:ct};return acc},{});
 
@@ -201,17 +155,30 @@ function CloseApp(){
     sel:(color)=>({background:color+"15",color,border:`1px solid ${color}40`,borderRadius:12,padding:"2px 8px",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"'DM Mono',monospace",appearance:"none"}),
   };
 
-  if(!authChecked)return <div style={{minHeight:"100vh",background:"#0d1117",display:"flex",alignItems:"center",justifyContent:"center",color:"#475569",fontFamily:"'DM Mono',monospace"}}>Loading…</div>;
-  if(!currentUser)return <LoginScreen onLogin={setCurrentUser}/>;
+  if(!currentUser)return <div style={{minHeight:"100vh",background:"#0d1117",display:"flex",alignItems:"center",justifyContent:"center",color:"#475569",fontFamily:"'DM Mono',monospace"}}>Loading…</div>;
 
   // ── Dashboard ───────────────────────────────────────────────────────────────
   function Dashboard(){
     if(!dash)return <Spinner/>;
+    const TARGET_DAYS=7;
+    let daysValue="—",daysSub="No active period",daysColor="#64748b",daysPct=0;
+    if(period?.end_date){
+      const end=new Date(period.end_date+"T00:00:00");
+      const today=new Date();today.setHours(0,0,0,0);
+      let bd=0;
+      for(let d=new Date(end);d<today;d.setDate(d.getDate()+1)){
+        const dow=d.getDay();if(dow!==0&&dow!==6)bd++;
+      }
+      daysValue=String(bd);
+      daysSub=`Target: ${TARGET_DAYS} business days`;
+      daysColor=bd>TARGET_DAYS?"#f87171":bd>=TARGET_DAYS-1?"#f7c948":"#4fd9a0";
+      daysPct=Math.min(Math.round(bd/TARGET_DAYS*100),100);
+    }
     const kpis=[
       {label:"Close Progress",value:dash.close_pct+"%",sub:`${dash.tasks_complete} of ${dash.tasks_total} tasks`,color:"#4f8ef7",pct:dash.close_pct},
       {label:"Approved",value:dash.approval_pct+"%",sub:`${dash.tasks_approved} reviewed & signed`,color:"#4fd9a0",pct:dash.approval_pct},
       {label:"Reconciliations",value:dash.recon_pct+"%",sub:`${dash.recon_done} of ${dash.recon_total} accounts`,color:"#c084fc",pct:dash.recon_pct},
-      {label:"Days to Close",value:"8",sub:"Target: 7 business days",color:"#f7c948",pct:80},
+      {label:"Days to Close",value:daysValue,sub:daysSub,color:daysColor,pct:daysPct},
     ];
     return(<div>
       <div style={S.kpiGrid}>{kpis.map(k=>(
@@ -444,9 +411,9 @@ function CloseApp(){
     const [editCat,setEditCat]=useState(null);
 
     // Add User Form
-    const [newUser,setNewUser]=useState({name:"",initials:"",username:"",email:"",role:"preparer",color:"#4f8ef7",password:""});
+    const [newUser,setNewUser]=useState({name:"",initials:"",email:"",role:"preparer",color:"#4f8ef7"});
     async function addUser(){
-      try{await api("/api/users",{method:"POST",body:JSON.stringify(newUser)});await loadAll();setShowAddUser(false);setNewUser({name:"",initials:"",username:"",email:"",role:"preparer",color:"#4f8ef7",password:""});}
+      try{await api("/api/users",{method:"POST",body:JSON.stringify(newUser)});await loadAll();setShowAddUser(false);setNewUser({name:"",initials:"",email:"",role:"preparer",color:"#4f8ef7"});}
       catch(e){alert(e.message);}
     }
     async function deleteUser(id){
@@ -536,11 +503,11 @@ function CloseApp(){
           <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddUser(true)}>+ Add User</button>
         </div>
         <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <thead><tr>{["Name","Username","Role","Color","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+          <thead><tr>{["Name","Email","Role","Color","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
           <tbody>{users.map(u=>(
             <tr key={u.id}>
               <td style={S.td}><div style={{display:"flex",alignItems:"center",gap:8}}><Avatar user={u} size={26}/><span style={{fontWeight:500}}>{u.name}</span></div></td>
-              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{u.username}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{u.email||"—"}</td>
               <td style={S.td}><span className={`tag ${u.role==="admin"?"tag-admin":"tag-user"}`}>{u.role}</span></td>
               <td style={S.td}><div style={{width:22,height:22,borderRadius:6,background:u.color}}/></td>
               <td style={S.td}><div style={{display:"flex",gap:6}}>
@@ -599,7 +566,7 @@ function CloseApp(){
 
       {/* Modals */}
       {showAddUser&&<Modal title="Add Team Member" onClose={()=>setShowAddUser(false)}>
-        {[["Full Name","name","text"],["Initials (2-3 chars)","initials","text"],["Username","username","text"],["Email","email","email"],["Password","password","password"]].map(([label,key,type])=>(
+        {[["Full Name","name","text"],["Initials (2-3 chars)","initials","text"],["Email","email","email"]].map(([label,key,type])=>(
           <div key={key} className="form-group"><label className="form-label">{label}</label><input type={type} className="form-input" value={newUser[key]} onChange={e=>setNewUser(p=>({...p,[key]:e.target.value}))}/></div>
         ))}
         <div className="form-group"><label className="form-label">Role</label>
@@ -615,7 +582,7 @@ function CloseApp(){
       </Modal>}
 
       {editUser&&<Modal title="Edit Team Member" onClose={()=>setEditUser(null)}>
-        {[["Full Name","name","text"],["Initials","initials","text"],["Username","username","text"],["Email","email","email"],["New Password (leave blank to keep)","password","password"]].map(([label,key,type])=>(
+        {[["Full Name","name","text"],["Initials","initials","text"],["Email","email","email"]].map(([label,key,type])=>(
           <div key={key} className="form-group"><label className="form-label">{label}</label><input type={type} className="form-input" value={editUser[key]||""} onChange={e=>setEditUser(p=>({...p,[key]:e.target.value}))}/></div>
         ))}
         <div className="form-group"><label className="form-label">Role</label>
@@ -1019,7 +986,6 @@ function CloseApp(){
             <span className={`tag ${currentUser.role==="admin"?"tag-admin":"tag-user"}`}>{currentUser.role}</span>
           </div>
         </div>
-        <button onClick={handleLogout} style={{width:"100%",padding:"7px",background:"#1a2535",border:"1px solid #1e2d3d",borderRadius:8,color:"#64748b",fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>Sign Out</button>
       </div>
     </div>
 
