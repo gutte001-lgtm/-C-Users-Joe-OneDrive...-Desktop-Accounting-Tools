@@ -236,6 +236,17 @@ function CloseApp(){
   const [qbSyncState,setQbSyncState]=useState([]);
   const [syncingEntity,setSyncingEntity]=useState(null);
   const [fullBackfilling,setFullBackfilling]=useState(false);
+  const [report,setReport]=useState("customer_ledger");
+  const [reportData,setReportData]=useState(null);
+  const [reportLoading,setReportLoading]=useState(false);
+  const [reportFilters,setReportFilters]=useState({customer_id:"",vendor_id:"",account_id:"",epic:"",from:"",to:""});
+  const [qbCustomers,setQbCustomers]=useState([]);
+  const [qbVendors,setQbVendors]=useState([]);
+  const [qbAccounts,setQbAccounts]=useState([]);
+  const [entityBrowse,setEntityBrowse]=useState(null);     // current entity being browsed
+  const [entityRows,setEntityRows]=useState({total:0,rows:[]});
+  const [entityFilters,setEntityFilters]=useState({from:"",to:"",search:"",epic:""});
+  const [entityDetail,setEntityDetail]=useState(null);     // {entity, id, data}
   async function loadQbSyncState(){
     try{const s=await api("/api/qb/sync_state");setQbSyncState(s);}catch(e){console.error(e);}
   }
@@ -257,6 +268,35 @@ function CloseApp(){
       alert("Full backfill complete. See entity table for counts.");
     }catch(e){alert(e.message);}
     setFullBackfilling(false);
+  }
+  async function loadReportRefData(){
+    try{
+      const [custs,vnds,accts]=await Promise.all([
+        api("/api/qb/customers?limit=1000&sort=display_name&order=asc").then(r=>r.rows),
+        api("/api/qb/vendors?limit=1000&sort=display_name&order=asc").then(r=>r.rows),
+        api("/api/qb/accounts?limit=1000&sort=acct_num&order=asc").then(r=>r.rows),
+      ]);
+      setQbCustomers(custs);setQbVendors(vnds);setQbAccounts(accts);
+    }catch(e){console.error(e);}
+  }
+  async function runReport(){
+    const qs=new URLSearchParams();
+    Object.entries(reportFilters).forEach(([k,v])=>{if(v)qs.set(k,v);});
+    setReportLoading(true);
+    try{const d=await api(`/api/reports/${report}?${qs}`);setReportData(d);}
+    catch(e){alert(e.message);setReportData(null);}
+    setReportLoading(false);
+  }
+  async function loadEntityBrowse(entity){
+    const qs=new URLSearchParams();
+    Object.entries(entityFilters).forEach(([k,v])=>{if(v)qs.set(k,v);});
+    qs.set("limit","100");
+    try{const d=await api(`/api/qb/${entity}?${qs}`);setEntityBrowse(entity);setEntityRows(d);}
+    catch(e){alert(e.message);}
+  }
+  async function openEntityDetail(entity,id){
+    try{const d=await api(`/api/qb/${entity}/${id}`);setEntityDetail({entity,id,data:d});}
+    catch(e){alert(e.message);}
   }
 
   useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
@@ -1364,6 +1404,203 @@ function CloseApp(){
     </div></div>);
   }
 
+  // ── Reports ─────────────────────────────────────────────────────────────────
+  const REPORT_DEFS={
+    customer_ledger:{label:"Customer Ledger",desc:"All invoices, payments, credit memos, and sales receipts for one customer with running balance.",needs:["customer_id","from","to"]},
+    vendor_ledger:{label:"Vendor Ledger",desc:"All bills, bill payments, and vendor credits for one vendor with running balance.",needs:["vendor_id","from","to"]},
+    revenue_by_customer:{label:"Revenue by Customer",desc:"Sum of invoices grouped by customer. Sorted largest first.",needs:["from","to"]},
+    expense_by_vendor:{label:"Expense by Vendor",desc:"Sum of bills grouped by vendor. Sorted largest first.",needs:["from","to"]},
+    gl_detail:{label:"GL Detail",desc:"All transactions (JE lines, invoice lines, bill lines, purchase lines) hitting one account.",needs:["account_id","from","to"]},
+    by_epic:{label:"By Jira Epic",desc:"All QB documents tagged with a given Jira Epic ID, at header and line level.",needs:["epic"]},
+  };
+
+  function Reports(){
+    const def=REPORT_DEFS[report];
+    const filterInputs=(<div style={{display:"grid",gridTemplateColumns:`repeat(${def.needs.length+1},1fr)`,gap:10,alignItems:"end",marginBottom:12}}>
+      {def.needs.includes("customer_id")&&
+        <div><label className="form-label">Customer</label>
+          <select className="form-select" value={reportFilters.customer_id} onChange={e=>setReportFilters(p=>({...p,customer_id:e.target.value}))}>
+            <option value="">— pick —</option>{qbCustomers.map(c=><option key={c.id} value={c.id}>{c.display_name}</option>)}
+          </select></div>}
+      {def.needs.includes("vendor_id")&&
+        <div><label className="form-label">Vendor</label>
+          <select className="form-select" value={reportFilters.vendor_id} onChange={e=>setReportFilters(p=>({...p,vendor_id:e.target.value}))}>
+            <option value="">— pick —</option>{qbVendors.map(v=><option key={v.id} value={v.id}>{v.display_name}</option>)}
+          </select></div>}
+      {def.needs.includes("account_id")&&
+        <div><label className="form-label">Account</label>
+          <select className="form-select" value={reportFilters.account_id} onChange={e=>setReportFilters(p=>({...p,account_id:e.target.value}))}>
+            <option value="">— pick —</option>{qbAccounts.map(a=><option key={a.id} value={a.id}>{a.acct_num} {a.name}</option>)}
+          </select></div>}
+      {def.needs.includes("epic")&&
+        <div><label className="form-label">Jira Epic ID</label><input className="form-input" value={reportFilters.epic} onChange={e=>setReportFilters(p=>({...p,epic:e.target.value}))} placeholder="e.g. EPIC-123"/></div>}
+      {def.needs.includes("from")&&
+        <div><label className="form-label">From</label><input type="date" className="form-input" value={reportFilters.from} onChange={e=>setReportFilters(p=>({...p,from:e.target.value}))}/></div>}
+      {def.needs.includes("to")&&
+        <div><label className="form-label">To</label><input type="date" className="form-input" value={reportFilters.to} onChange={e=>setReportFilters(p=>({...p,to:e.target.value}))}/></div>}
+      <button className="btn btn-primary" style={{padding:"9px 18px",fontSize:12}} onClick={runReport} disabled={reportLoading}>{reportLoading?"Running…":"Run Report"}</button>
+    </div>);
+
+    return(<div>
+      <div style={{...S.card,marginBottom:14}}>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+          {Object.entries(REPORT_DEFS).map(([k,v])=>
+            <button key={k} onClick={()=>{setReport(k);setReportData(null);}} style={S.filterBtn(report===k)}>{v.label}</button>)}
+        </div>
+        <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>{def.desc}</div>
+        {filterInputs}
+      </div>
+
+      {reportData&&<div style={S.card}>
+        {/* Customer Ledger */}
+        {report==="customer_ledger"&&<div>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:12,alignItems:"center"}}>
+            <div><div style={{fontSize:14,fontWeight:700,color:"#f1f5f9"}}>{reportData.customer?.display_name}</div><div style={{fontSize:11.5,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{reportData.from} → {reportData.to}</div></div>
+            <div style={{fontSize:14,fontWeight:700,color:"#4f8ef7",fontFamily:"'DM Mono',monospace"}}>Ending: {fmt(reportData.ending_balance)}</div>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{["Date","Type","Doc","Memo","Debit","Credit","Balance"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=4?"right":"left"}}>{h}</th>)}</tr></thead>
+            <tbody>{reportData.rows.map((r,i)=>(
+              <tr key={i} style={{cursor:"pointer"}} onClick={()=>openEntityDetail(r.type==="invoice"?"invoices":r.type==="payment"?"payments":r.type==="credit_memo"?"credit_memos":"sales_receipts",r.id)}>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.date}</td>
+                <td style={{...S.td,fontSize:12}}><span style={{padding:"2px 6px",background:"#1e2d3d",color:"#94a3b8",borderRadius:4,fontFamily:"'DM Mono',monospace",fontSize:10.5}}>{r.type}</span></td>
+                <td style={{...S.td,fontSize:12,fontFamily:"'DM Mono',monospace"}}>{r.doc||"—"}</td>
+                <td style={{...S.td,fontSize:12,color:"#94a3b8",maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.memo||""}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.debit?fmt(r.debit):"—"}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.credit?fmt(r.credit):"—"}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:600}}>{fmt(r.running_balance)}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>}
+
+        {/* Vendor Ledger */}
+        {report==="vendor_ledger"&&<div>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:12,alignItems:"center"}}>
+            <div><div style={{fontSize:14,fontWeight:700,color:"#f1f5f9"}}>{reportData.vendor?.display_name}</div><div style={{fontSize:11.5,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{reportData.from} → {reportData.to}</div></div>
+            <div style={{fontSize:14,fontWeight:700,color:"#4f8ef7",fontFamily:"'DM Mono',monospace"}}>Ending: {fmt(reportData.ending_balance)}</div>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{["Date","Type","Doc","Memo","Debit","Credit","Balance"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=4?"right":"left"}}>{h}</th>)}</tr></thead>
+            <tbody>{reportData.rows.map((r,i)=>(
+              <tr key={i} style={{cursor:"pointer"}} onClick={()=>openEntityDetail(r.type==="bill"?"bills":r.type==="bill_payment"?"bill_payments":"vendor_credits",r.id)}>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.date}</td>
+                <td style={{...S.td,fontSize:12}}><span style={{padding:"2px 6px",background:"#1e2d3d",color:"#94a3b8",borderRadius:4,fontFamily:"'DM Mono',monospace",fontSize:10.5}}>{r.type}</span></td>
+                <td style={{...S.td,fontSize:12,fontFamily:"'DM Mono',monospace"}}>{r.doc||"—"}</td>
+                <td style={{...S.td,fontSize:12,color:"#94a3b8",maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.memo||""}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.debit?fmt(r.debit):"—"}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.credit?fmt(r.credit):"—"}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:600}}>{fmt(r.running_balance)}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>}
+
+        {/* Revenue by Customer */}
+        {report==="revenue_by_customer"&&<table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Customer","Invoices","Revenue"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{reportData.rows.map(r=>(
+            <tr key={r.customer_id} style={{cursor:"pointer"}} onClick={()=>{setReport("customer_ledger");setReportFilters(p=>({...p,customer_id:r.customer_id}));setTimeout(runReport,100);}}>
+              <td style={{...S.td,fontWeight:500}}>{r.customer_name||"—"}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.invoice_count}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,fontWeight:600}}>{fmt(r.revenue)}</td>
+            </tr>
+          ))}</tbody>
+        </table>}
+
+        {/* Expense by Vendor */}
+        {report==="expense_by_vendor"&&<table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Vendor","Bills","Expense"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{reportData.rows.map(r=>(
+            <tr key={r.vendor_id} style={{cursor:"pointer"}} onClick={()=>{setReport("vendor_ledger");setReportFilters(p=>({...p,vendor_id:r.vendor_id}));setTimeout(runReport,100);}}>
+              <td style={{...S.td,fontWeight:500}}>{r.vendor_name||"—"}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.bill_count}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,fontWeight:600}}>{fmt(r.expense)}</td>
+            </tr>
+          ))}</tbody>
+        </table>}
+
+        {/* GL Detail */}
+        {report==="gl_detail"&&<div>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:12,alignItems:"center"}}>
+            <div><div style={{fontSize:14,fontWeight:700,color:"#f1f5f9"}}>{reportData.account?.acct_num} — {reportData.account?.name}</div><div style={{fontSize:11.5,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{reportData.from} → {reportData.to}</div></div>
+            <div style={{fontSize:12,fontFamily:"'DM Mono',monospace",color:"#94a3b8"}}>Dr {fmt(reportData.totals.debits)} · Cr {fmt(reportData.totals.credits)} · Net <span style={{color:reportData.totals.net>=0?"#4fd9a0":"#f87171",fontWeight:700}}>{fmt(reportData.totals.net)}</span></div>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{["Date","Source","Doc","Description","Posting","Amount"].map((h,i)=><th key={h} style={{...S.th,textAlign:i===5?"right":"left"}}>{h}</th>)}</tr></thead>
+            <tbody>{reportData.rows.map((r,i)=>(
+              <tr key={i} style={{cursor:"pointer"}} onClick={()=>openEntityDetail(r.type==="journal_entry"?"journal_entries":r.type==="invoice"?"invoices":r.type==="bill"?"bills":"purchases",r.id)}>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.date}</td>
+                <td style={{...S.td,fontSize:12}}><span style={{padding:"2px 6px",background:"#1e2d3d",color:"#94a3b8",borderRadius:4,fontFamily:"'DM Mono',monospace",fontSize:10.5}}>{r.type}</span></td>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.doc||"—"}</td>
+                <td style={{...S.td,fontSize:12,maxWidth:320,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.description||""}</td>
+                <td style={{...S.td,fontSize:11,color:r.posting_type==="Debit"?"#4fd9a0":"#f7c948",fontFamily:"'DM Mono',monospace"}}>{r.posting_type}</td>
+                <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.amount)}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>}
+
+        {/* By Epic */}
+        {report==="by_epic"&&<div>
+          <div style={{fontSize:14,fontWeight:700,color:"#f1f5f9",marginBottom:8}}>Epic: <span style={{fontFamily:"'DM Mono',monospace",color:"#4f8ef7"}}>{reportData.epic}</span></div>
+          {Object.keys(reportData.headers_by_entity).length===0&&<div style={{color:"#475569",fontSize:13,padding:"20px 0"}}>No QB documents tagged with this epic.</div>}
+          {Object.entries(reportData.headers_by_entity).map(([entity,rows])=>(
+            <div key={entity} style={{marginBottom:14}}>
+              <div style={{fontSize:12,fontWeight:700,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",textTransform:"uppercase",marginBottom:6}}>{entity} · {rows.length} · total {fmt(reportData.totals[entity])}</div>
+              <table style={{width:"100%",borderCollapse:"collapse"}}>
+                <thead><tr>{["Date","Doc","Amount"].map((h,i)=><th key={h} style={{...S.th,textAlign:i===2?"right":"left"}}>{h}</th>)}</tr></thead>
+                <tbody>{rows.map(r=>(
+                  <tr key={r.id} style={{cursor:"pointer"}} onClick={()=>openEntityDetail(entity,r.id)}>
+                    <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.txn_date||"—"}</td>
+                    <td style={{...S.td,fontSize:12,fontFamily:"'DM Mono',monospace"}}>{r.doc_number||r.id}</td>
+                    <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.total_amt)}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          ))}
+        </div>}
+      </div>}
+
+      {entityDetail&&<div className="modal-overlay" onClick={()=>setEntityDetail(null)}>
+        <div className="modal-box" style={{width:720}} onClick={e=>e.stopPropagation()}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+            <div>
+              <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace"}}>{entityDetail.entity} · {entityDetail.id}</div>
+              <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9",marginTop:4}}>
+                {entityDetail.data.doc_number||entityDetail.data.display_name||entityDetail.data.name||entityDetail.entity}
+              </div>
+              <div style={{fontSize:11.5,color:"#64748b",fontFamily:"'DM Mono',monospace",marginTop:3}}>
+                {entityDetail.data.txn_date||""} {entityDetail.data.customer_name||entityDetail.data.vendor_name||""} {entityDetail.data.total_amt?`· ${fmt(entityDetail.data.total_amt)}`:""}
+                {entityDetail.data.jira_epic_id&&<span style={{marginLeft:6,padding:"1px 6px",background:"#4f8ef722",color:"#4f8ef7",borderRadius:4}}>{entityDetail.data.jira_epic_id}</span>}
+              </div>
+            </div>
+            <button onClick={()=>setEntityDetail(null)} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+          </div>
+          {entityDetail.data.lines&&entityDetail.data.lines.length>0&&<div>
+            <div className="form-label">Lines</div>
+            <table style={{width:"100%",borderCollapse:"collapse",marginBottom:12}}>
+              <thead><tr>{["#","Description","Item/Acct","Qty","Amount","Epic"].map((h,i)=><th key={h} style={{...S.th,textAlign:i===4?"right":"left"}}>{h}</th>)}</tr></thead>
+              <tbody>{entityDetail.data.lines.map(ln=>(
+                <tr key={ln.id}>
+                  <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:11}}>{ln.line_num||""}</td>
+                  <td style={{...S.td,fontSize:12,maxWidth:280,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ln.description||""}</td>
+                  <td style={{...S.td,fontSize:11.5,color:"#94a3b8"}}>{ln.item_name||ln.account_name||ln.account_id||""}</td>
+                  <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:11.5}}>{ln.qty!=null?ln.qty:""}</td>
+                  <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{ln.amount!=null?fmt(ln.amount):""}{ln.posting_type?<span style={{fontSize:10,color:"#64748b",marginLeft:4}}>{ln.posting_type.charAt(0)}</span>:""}</td>
+                  <td style={{...S.td,fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace"}}>{ln.jira_epic_id||""}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>}
+          <div className="form-label">Raw QuickBooks JSON</div>
+          <pre style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,padding:12,fontSize:10.5,color:"#cbd5e1",maxHeight:260,overflow:"auto",fontFamily:"'DM Mono',monospace",margin:0}}>{entityDetail.data.raw_json_parsed?JSON.stringify(entityDetail.data.raw_json_parsed,null,2):entityDetail.data.raw_json}</pre>
+        </div>
+      </div>}
+    </div>);
+  }
+
   // ── Review Queue ────────────────────────────────────────────────────────────
   function ReviewQueue(){
     const statusColor={pending:"#f7c948",posted:"#4fd9a0",dismissed:"#94a3b8",error:"#f87171"};
@@ -1464,6 +1701,7 @@ function CloseApp(){
     {id:"recons",label:"Reconciliations",icon:"⇌"},
     {id:"tb",label:"Trial Balance",icon:"Σ"},
     {id:"queue",label:"Review Queue",icon:"⇥"},
+    {id:"reports",label:"Reports",icon:"📊"},
     {id:"activity",label:"Activity Log",icon:"◷"},
     ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
   ];
@@ -1476,6 +1714,7 @@ function CloseApp(){
       if(tbMode==="flux"){loadAllSnapshots();}
     }
     if(tab==="queue")loadQueue();
+    if(tab==="reports")loadReportRefData();
   },[tab,period?.id,tbMode,queueStatusFilter,queueSourceFilter]);
 
   return(<div style={S.app}>
@@ -1515,6 +1754,7 @@ function CloseApp(){
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
             {tab==="tb"&&(tbMode==="flux"?"Compare two snapshots and flag material variance":`${tbSnapshots.length} snapshot${tbSnapshots.length===1?"":"s"} for ${period?.label||""}`)}
             {tab==="queue"&&`${queue.length} items · filter: ${queueStatusFilter||"all"}${queueSourceFilter?" / "+queueSourceFilter:""}`}
+            {tab==="reports"&&`Drill-down reports over synced QuickBooks data`}
             {tab==="activity"&&`${activityLog.length} events · period ${period?.label||""}`}
             {tab==="settings"&&"Admin only — manage team, categories, templates, and tasks"}
           </div>
@@ -1526,6 +1766,7 @@ function CloseApp(){
       {tab==="recons"&&<Reconciliations/>}
       {tab==="tb"&&<TrialBalance/>}
       {tab==="queue"&&<ReviewQueue/>}
+      {tab==="reports"&&<Reports/>}
       {tab==="activity"&&<ActivityLog/>}
       {tab==="settings"&&isAdmin&&<Settings/>}
     </div>

@@ -2045,6 +2045,352 @@ def scheduled_qb_sync():
     except Exception:
         traceback.print_exc()
 
+# ── QB Generic Data Access (for reporting) ────────────────────────────────────
+
+# Per-entity filter configuration. Keys are filter param names; values describe the SQL.
+ENTITY_FILTERS = {
+    "invoices":        {"date_col": "txn_date", "party_col": "customer_id", "party_name_col": "customer_name", "search_cols": ["doc_number","customer_name","memo","private_note"]},
+    "bills":           {"date_col": "txn_date", "party_col": "vendor_id",   "party_name_col": "vendor_name",   "search_cols": ["doc_number","vendor_name","memo","private_note"]},
+    "payments":        {"date_col": "txn_date", "party_col": "customer_id", "party_name_col": "customer_name", "search_cols": ["customer_name","private_note"]},
+    "bill_payments":   {"date_col": "txn_date", "party_col": "vendor_id",   "party_name_col": "vendor_name",   "search_cols": ["doc_number","vendor_name","private_note"]},
+    "sales_receipts":  {"date_col": "txn_date", "party_col": "customer_id", "party_name_col": "customer_name", "search_cols": ["doc_number","customer_name","memo"]},
+    "journal_entries": {"date_col": "txn_date", "search_cols": ["doc_number","memo","private_note"]},
+    "credit_memos":    {"date_col": "txn_date", "party_col": "customer_id", "party_name_col": "customer_name", "search_cols": ["doc_number","customer_name","memo"]},
+    "vendor_credits":  {"date_col": "txn_date", "party_col": "vendor_id",   "party_name_col": "vendor_name",   "search_cols": ["doc_number","vendor_name","memo"]},
+    "refund_receipts": {"date_col": "txn_date", "party_col": "customer_id", "party_name_col": "customer_name", "search_cols": ["doc_number","customer_name","memo"]},
+    "deposits":        {"date_col": "txn_date", "search_cols": ["doc_number","memo","private_note"]},
+    "purchases":       {"date_col": "txn_date", "party_col": "entity_id",   "party_name_col": "entity_name",   "search_cols": ["doc_number","entity_name","memo","private_note"]},
+    "transfers":       {"date_col": "txn_date", "search_cols": ["private_note"]},
+    "estimates":       {"date_col": "txn_date", "party_col": "customer_id", "party_name_col": "customer_name", "search_cols": ["doc_number","customer_name","memo"]},
+    "customers":       {"search_cols": ["display_name","company_name","email"]},
+    "vendors":         {"search_cols": ["display_name","company_name","email"]},
+    "employees":       {"search_cols": ["display_name","email"]},
+    "items":           {"search_cols": ["name","sku","description"]},
+    "accounts":        {"search_cols": ["name","acct_num"]},
+    "classes":         {"search_cols": ["name","fully_qualified_name"]},
+    "departments":     {"search_cols": ["name","fully_qualified_name"]},
+    "tax_codes":       {"search_cols": ["name","description"]},
+    "terms":           {"search_cols": ["name"]},
+    "payment_methods": {"search_cols": ["name"]},
+}
+
+SORT_WHITELIST = {"txn_date", "total_amt", "balance", "doc_number", "last_updated_at",
+                  "display_name", "name", "acct_num", "amount", "customer_name", "vendor_name"}
+
+def _build_entity_query(entity, args, count_only=False):
+    cfg = QB_ENTITIES[entity]
+    fcfg = ENTITY_FILTERS.get(entity, {})
+    table = cfg["header_table"]
+    clauses, params = [], []
+    if fcfg.get("date_col"):
+        if args.get("from"):
+            clauses.append(f"{fcfg['date_col']} >= ?"); params.append(args["from"])
+        if args.get("to"):
+            clauses.append(f"{fcfg['date_col']} <= ?"); params.append(args["to"])
+    if args.get("customer_id") and "customer_id" in _columns_of(table):
+        clauses.append("customer_id=?"); params.append(args["customer_id"])
+    if args.get("vendor_id") and "vendor_id" in _columns_of(table):
+        clauses.append("vendor_id=?"); params.append(args["vendor_id"])
+    if args.get("account_id") and "account_id" in _columns_of(table):
+        clauses.append("account_id=?"); params.append(args["account_id"])
+    if args.get("epic") and "jira_epic_id" in _columns_of(table):
+        clauses.append("jira_epic_id=?"); params.append(args["epic"])
+    if args.get("status") and "status" in _columns_of(table):
+        clauses.append("status=?"); params.append(args["status"])
+    if args.get("min_amount") and "total_amt" in _columns_of(table):
+        clauses.append("total_amt >= ?"); params.append(float(args["min_amount"]))
+    if args.get("max_amount") and "total_amt" in _columns_of(table):
+        clauses.append("total_amt <= ?"); params.append(float(args["max_amount"]))
+    if args.get("search") and fcfg.get("search_cols"):
+        needle = f"%{args['search']}%"
+        cols = [c for c in fcfg["search_cols"] if c in _columns_of(table)]
+        clauses.append("(" + " OR ".join(f"{c} LIKE ?" for c in cols) + ")")
+        params.extend([needle] * len(cols))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    if count_only:
+        return f"SELECT COUNT(*) AS c FROM {table}{where}", params
+    sort = args.get("sort") if args.get("sort") in SORT_WHITELIST else (fcfg.get("date_col") or "id")
+    order = "DESC" if (args.get("order") or "desc").lower() == "desc" else "ASC"
+    limit = min(int(args.get("limit") or 100), 1000)
+    offset = max(int(args.get("offset") or 0), 0)
+    return f"SELECT * FROM {table}{where} ORDER BY {sort} {order} LIMIT {limit} OFFSET {offset}", params
+
+_COLS_CACHE = {}
+def _columns_of(table):
+    if table not in _COLS_CACHE:
+        rows = q(f"PRAGMA table_info({table})")
+        _COLS_CACHE[table] = {r["name"] for r in rows}
+    return _COLS_CACHE[table]
+
+@app.route("/api/qb/entities", methods=["GET", "OPTIONS"])
+@login_required
+def qb_entities():
+    if request.method == "OPTIONS":
+        return "", 204
+    out = []
+    for key, cfg in QB_ENTITIES.items():
+        count = q1(f"SELECT COUNT(*) AS c FROM {cfg['header_table']}")["c"]
+        out.append({"entity": key, "qb_name": cfg["qb_name"], "kind": cfg["kind"],
+                    "table": cfg["header_table"], "line_table": cfg["line_table"],
+                    "record_count": count})
+    return jsonify(out)
+
+@app.route("/api/qb/<entity>", methods=["GET", "OPTIONS"])
+@login_required
+def qb_entity_list(entity):
+    if request.method == "OPTIONS":
+        return "", 204
+    if entity not in QB_ENTITIES:
+        return err("Unknown entity", 404)
+    args = request.args.to_dict()
+    sql, params = _build_entity_query(entity, args)
+    csql, cparams = _build_entity_query(entity, args, count_only=True)
+    rows = q(sql, params)
+    total = q1(csql, cparams)["c"]
+    return jsonify({"total": total, "limit": int(args.get("limit") or 100),
+                    "offset": int(args.get("offset") or 0),
+                    "rows": rows_to_list(rows)})
+
+@app.route("/api/qb/<entity>/export.csv", methods=["GET", "OPTIONS"])
+@login_required
+def qb_entity_csv(entity):
+    if request.method == "OPTIONS":
+        return "", 204
+    if entity not in QB_ENTITIES:
+        return err("Unknown entity", 404)
+    args = request.args.to_dict()
+    args["limit"] = "10000"
+    sql, params = _build_entity_query(entity, args)
+    rows = q(sql, params)
+    if not rows:
+        return Response("", mimetype="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{entity}.csv"'})
+    # Exclude raw_json from CSV by default to keep it human-readable
+    cols = [c for c in rows[0].keys() if c != "raw_json"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([r[c] for c in cols])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{entity}.csv"'})
+
+@app.route("/api/qb/<entity>/<eid>", methods=["GET", "OPTIONS"])
+@login_required
+def qb_entity_detail(entity, eid):
+    if request.method == "OPTIONS":
+        return "", 204
+    if entity not in QB_ENTITIES:
+        return err("Unknown entity", 404)
+    cfg = QB_ENTITIES[entity]
+    header = q1(f"SELECT * FROM {cfg['header_table']} WHERE id=?", (eid,))
+    if not header:
+        return err("Not found", 404)
+    result = dict(header)
+    if result.get("raw_json"):
+        try:
+            result["raw_json_parsed"] = json.loads(result["raw_json"])
+        except Exception:
+            pass
+    if cfg["line_table"]:
+        fk = _line_fk_column(cfg["line_table"])
+        lines = q(f"SELECT * FROM {cfg['line_table']} WHERE {fk}=? ORDER BY line_num, id", (eid,))
+        result["lines"] = rows_to_list(lines)
+    return jsonify(result)
+
+# ── Canned Reports ────────────────────────────────────────────────────────────
+
+@app.route("/api/reports/customer_ledger", methods=["GET", "OPTIONS"])
+@login_required
+def report_customer_ledger():
+    if request.method == "OPTIONS":
+        return "", 204
+    cid = request.args.get("customer_id")
+    if not cid:
+        return err("customer_id required")
+    date_from = request.args.get("from") or "1970-01-01"
+    date_to = request.args.get("to") or "9999-12-31"
+    cust = q1("SELECT id, display_name FROM qb_customers WHERE id=?", (cid,))
+    if not cust:
+        return err("Customer not found", 404)
+    events = []
+    for r in q("SELECT id, txn_date, doc_number, total_amt, balance, memo FROM qb_invoices WHERE customer_id=? AND txn_date BETWEEN ? AND ?",
+               (cid, date_from, date_to)):
+        events.append({"type": "invoice", "id": r["id"], "date": r["txn_date"], "doc": r["doc_number"],
+                       "debit": r["total_amt"] or 0, "credit": 0, "memo": r["memo"], "balance_open": r["balance"] or 0})
+    for r in q("SELECT id, txn_date, total_amt FROM qb_payments WHERE customer_id=? AND txn_date BETWEEN ? AND ?", (cid, date_from, date_to)):
+        events.append({"type": "payment", "id": r["id"], "date": r["txn_date"], "doc": "",
+                       "debit": 0, "credit": r["total_amt"] or 0, "memo": "", "balance_open": 0})
+    for r in q("SELECT id, txn_date, doc_number, total_amt, memo FROM qb_credit_memos WHERE customer_id=? AND txn_date BETWEEN ? AND ?", (cid, date_from, date_to)):
+        events.append({"type": "credit_memo", "id": r["id"], "date": r["txn_date"], "doc": r["doc_number"],
+                       "debit": 0, "credit": r["total_amt"] or 0, "memo": r["memo"], "balance_open": 0})
+    for r in q("SELECT id, txn_date, doc_number, total_amt, memo FROM qb_sales_receipts WHERE customer_id=? AND txn_date BETWEEN ? AND ?", (cid, date_from, date_to)):
+        events.append({"type": "sales_receipt", "id": r["id"], "date": r["txn_date"], "doc": r["doc_number"],
+                       "debit": r["total_amt"] or 0, "credit": r["total_amt"] or 0, "memo": r["memo"], "balance_open": 0})
+    events.sort(key=lambda e: (e["date"] or "", e["type"]))
+    running = 0
+    for e in events:
+        running += (e["debit"] or 0) - (e["credit"] or 0)
+        e["running_balance"] = round(running, 2)
+    return jsonify({
+        "customer": {"id": cust["id"], "display_name": cust["display_name"]},
+        "from": date_from, "to": date_to,
+        "rows": events, "ending_balance": round(running, 2),
+    })
+
+@app.route("/api/reports/vendor_ledger", methods=["GET", "OPTIONS"])
+@login_required
+def report_vendor_ledger():
+    if request.method == "OPTIONS":
+        return "", 204
+    vid = request.args.get("vendor_id")
+    if not vid:
+        return err("vendor_id required")
+    date_from = request.args.get("from") or "1970-01-01"
+    date_to = request.args.get("to") or "9999-12-31"
+    vnd = q1("SELECT id, display_name FROM qb_vendors WHERE id=?", (vid,))
+    if not vnd:
+        return err("Vendor not found", 404)
+    events = []
+    for r in q("SELECT id, txn_date, doc_number, total_amt, balance, memo FROM qb_bills WHERE vendor_id=? AND txn_date BETWEEN ? AND ?", (vid, date_from, date_to)):
+        events.append({"type": "bill", "id": r["id"], "date": r["txn_date"], "doc": r["doc_number"],
+                       "debit": 0, "credit": r["total_amt"] or 0, "memo": r["memo"], "balance_open": r["balance"] or 0})
+    for r in q("SELECT id, txn_date, doc_number, total_amt FROM qb_bill_payments WHERE vendor_id=? AND txn_date BETWEEN ? AND ?", (vid, date_from, date_to)):
+        events.append({"type": "bill_payment", "id": r["id"], "date": r["txn_date"], "doc": r["doc_number"],
+                       "debit": r["total_amt"] or 0, "credit": 0, "memo": "", "balance_open": 0})
+    for r in q("SELECT id, txn_date, doc_number, total_amt, memo FROM qb_vendor_credits WHERE vendor_id=? AND txn_date BETWEEN ? AND ?", (vid, date_from, date_to)):
+        events.append({"type": "vendor_credit", "id": r["id"], "date": r["txn_date"], "doc": r["doc_number"],
+                       "debit": r["total_amt"] or 0, "credit": 0, "memo": r["memo"], "balance_open": 0})
+    events.sort(key=lambda e: (e["date"] or "", e["type"]))
+    running = 0
+    for e in events:
+        running += (e["credit"] or 0) - (e["debit"] or 0)   # vendor owes us goes up with bills, down with payments
+        e["running_balance"] = round(running, 2)
+    return jsonify({
+        "vendor": {"id": vnd["id"], "display_name": vnd["display_name"]},
+        "from": date_from, "to": date_to,
+        "rows": events, "ending_balance": round(running, 2),
+    })
+
+@app.route("/api/reports/revenue_by_customer", methods=["GET", "OPTIONS"])
+@login_required
+def report_revenue_by_customer():
+    if request.method == "OPTIONS":
+        return "", 204
+    date_from = request.args.get("from") or "1970-01-01"
+    date_to = request.args.get("to") or "9999-12-31"
+    rows = q("""
+        SELECT customer_id, customer_name,
+               SUM(total_amt) AS revenue,
+               COUNT(*) AS invoice_count
+        FROM qb_invoices
+        WHERE txn_date BETWEEN ? AND ?
+        GROUP BY customer_id, customer_name
+        ORDER BY revenue DESC
+    """, (date_from, date_to))
+    return jsonify({"from": date_from, "to": date_to, "rows": rows_to_list(rows)})
+
+@app.route("/api/reports/expense_by_vendor", methods=["GET", "OPTIONS"])
+@login_required
+def report_expense_by_vendor():
+    if request.method == "OPTIONS":
+        return "", 204
+    date_from = request.args.get("from") or "1970-01-01"
+    date_to = request.args.get("to") or "9999-12-31"
+    rows = q("""
+        SELECT vendor_id, vendor_name,
+               SUM(total_amt) AS expense,
+               COUNT(*) AS bill_count
+        FROM qb_bills
+        WHERE txn_date BETWEEN ? AND ?
+        GROUP BY vendor_id, vendor_name
+        ORDER BY expense DESC
+    """, (date_from, date_to))
+    return jsonify({"from": date_from, "to": date_to, "rows": rows_to_list(rows)})
+
+@app.route("/api/reports/gl_detail", methods=["GET", "OPTIONS"])
+@login_required
+def report_gl_detail():
+    if request.method == "OPTIONS":
+        return "", 204
+    account_id = request.args.get("account_id")
+    if not account_id:
+        return err("account_id required")
+    date_from = request.args.get("from") or "1970-01-01"
+    date_to = request.args.get("to") or "9999-12-31"
+    acct = q1("SELECT id, name, acct_num, classification FROM qb_accounts WHERE id=?", (account_id,))
+    if not acct:
+        return err("Account not found", 404)
+    # Journal entry lines
+    je = q("""SELECT 'journal_entry' AS type, j.id, j.txn_date AS date, j.doc_number AS doc,
+                     l.posting_type, l.amount, l.description, l.entity_type, l.entity_id, l.jira_epic_id
+              FROM qb_journal_entry_lines l JOIN qb_journal_entries j ON j.id=l.journal_entry_id
+              WHERE l.account_id=? AND j.txn_date BETWEEN ? AND ?""", (account_id, date_from, date_to))
+    # Invoice lines (typically income account)
+    inv = q("""SELECT 'invoice' AS type, i.id, i.txn_date AS date, i.doc_number AS doc,
+                      'Credit' AS posting_type, l.amount, l.description,
+                      'Customer' AS entity_type, i.customer_id AS entity_id, l.jira_epic_id
+              FROM qb_invoice_lines l JOIN qb_invoices i ON i.id=l.invoice_id
+              WHERE l.account_id=? AND i.txn_date BETWEEN ? AND ?""", (account_id, date_from, date_to))
+    # Bill lines (typically expense account)
+    bill = q("""SELECT 'bill' AS type, b.id, b.txn_date AS date, b.doc_number AS doc,
+                       'Debit' AS posting_type, l.amount, l.description,
+                       'Vendor' AS entity_type, b.vendor_id AS entity_id, l.jira_epic_id
+                FROM qb_bill_lines l JOIN qb_bills b ON b.id=l.bill_id
+                WHERE l.account_id=? AND b.txn_date BETWEEN ? AND ?""", (account_id, date_from, date_to))
+    # Purchase lines (expense)
+    pur = q("""SELECT 'purchase' AS type, p.id, p.txn_date AS date, p.doc_number AS doc,
+                      'Debit' AS posting_type, l.amount, l.description,
+                      p.entity_type, p.entity_id, l.jira_epic_id
+               FROM qb_purchase_lines l JOIN qb_purchases p ON p.id=l.purchase_id
+               WHERE l.account_id=? AND p.txn_date BETWEEN ? AND ?""", (account_id, date_from, date_to))
+    all_rows = rows_to_list(je) + rows_to_list(inv) + rows_to_list(bill) + rows_to_list(pur)
+    all_rows.sort(key=lambda r: (r["date"] or "", r["id"]))
+    debits = sum((r["amount"] or 0) for r in all_rows if r["posting_type"] == "Debit")
+    credits = sum((r["amount"] or 0) for r in all_rows if r["posting_type"] == "Credit")
+    return jsonify({
+        "account": dict(acct),
+        "from": date_from, "to": date_to,
+        "rows": all_rows,
+        "totals": {"debits": round(debits, 2), "credits": round(credits, 2), "net": round(debits - credits, 2)},
+    })
+
+@app.route("/api/reports/by_epic", methods=["GET", "OPTIONS"])
+@login_required
+def report_by_epic():
+    if request.method == "OPTIONS":
+        return "", 204
+    epic = request.args.get("epic")
+    if not epic:
+        return err("epic required")
+    results = {}
+    for entity, cfg in QB_ENTITIES.items():
+        cols = _columns_of(cfg["header_table"])
+        if "jira_epic_id" not in cols:
+            continue
+        pick = ["id"] + [c for c in ("doc_number", "txn_date", "total_amt", "customer_name", "vendor_name") if c in cols]
+        rows = q(f"SELECT {','.join(pick)} FROM {cfg['header_table']} WHERE jira_epic_id=? ORDER BY " + ("txn_date" if "txn_date" in cols else "id"),
+                 (epic,))
+        if rows:
+            results[entity] = rows_to_list(rows)
+    # Also scan line-level epics (lines can have their own epic per device ticket matching)
+    line_results = {}
+    for entity, cfg in QB_ENTITIES.items():
+        lt = cfg["line_table"]
+        if not lt:
+            continue
+        if "jira_epic_id" not in _columns_of(lt):
+            continue
+        fk = _line_fk_column(lt)
+        rows = q(f"SELECT l.*, h.doc_number, h.txn_date FROM {lt} l JOIN {cfg['header_table']} h ON h.id=l.{fk} WHERE l.jira_epic_id=?", (epic,))
+        if rows:
+            line_results[entity] = rows_to_list(rows)
+    # Totals
+    totals = {}
+    for entity, rows in results.items():
+        totals[entity] = round(sum((r.get("total_amt") or 0) for r in rows), 2)
+    return jsonify({"epic": epic, "headers_by_entity": results, "lines_by_entity": line_results, "totals": totals})
+
 # ── Flux Analysis ─────────────────────────────────────────────────────────────
 
 @app.route("/api/flux", methods=["GET", "OPTIONS"])
