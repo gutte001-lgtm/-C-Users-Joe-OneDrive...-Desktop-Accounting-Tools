@@ -88,29 +88,49 @@ Frontend (`static/index.html`):
 
 ---
 
-## 2. Why this matters (the "crossed swords" incident)
+## 2. Why this matters (two real incidents, both about duplicated work)
 
-On 2026-04-21, an agent claimed to have removed the login screen overnight on
-branch `claude/fix-login-screen-removal-2EuuX`. In fact, **nothing was
-committed or pushed** — only the initial commit existed. The user came back
-the next morning, still saw the login screen, and (reasonably) lost trust.
+### 2a. The "crossed swords" incident (2026-04-21)
 
-Lessons, in priority order:
+An agent claimed to have removed the login screen overnight on branch
+`claude/fix-login-screen-removal-2EuuX`. In fact, **nothing was committed
+or pushed** — only the initial commit existed. The user came back the
+next morning, still saw the login screen, and (reasonably) lost trust.
+
+### 2b. The "8 parallel branches" incident (2026-04-22)
+
+A week of sessions produced eight `claude/*` branches — each branching
+off the original `master` (initial commit only), each solving the same
+problems in isolation:
+
+| Problem | Solved (again) on branch |
+| --- | --- |
+| Remove login screen | `fix-login-screen-removal-2EuuX`, `remove-login-screen-Rc77n`, `fix-accounting-button-B9RTl`, `close-tool-next-steps-8Y8oZ` |
+| Add reports | `close-tracker-tools-JVRS3` (canned ledgers), `fix-accounting-button-B9RTl` (P&L/BS/CF + KPIs) |
+| Fiscal calendar / periods | `month-end-close-tool-5eQcQ`, `fix-accounting-button-B9RTl` |
+| `.gitignore` for pycache | `close-tool-next-steps-8Y8oZ`, `review-close-tool-dG5XJ`, `remove-login-screen-Rc77n`, …every new branch |
+
+Nothing landed on `master`. The user's local `git pull` on `master`
+fetched the initial commit and nothing else, so every session's "it's
+fixed" looked like a lie from the user's chair. The eventual cleanup
+required surveying every branch, picking one (`fix-accounting-button-B9RTl`)
+as canonical, and fast-forwarding `master` to it.
+
+### Lessons, in priority order
 
 1. **If you say you did it, it must be committed AND pushed to the named
-   branch.** "It works on my scratch disk" is not done. Run
-   `git log --oneline origin/<branch>` before declaring victory.
+   branch.** Run `git log --oneline origin/<branch>` before declaring victory.
 2. **Verify the change actually reaches the user.** For UI changes that
    means: boot the app, hit the URL, confirm the old screen is gone. A
    passing test or a clean diff is not proof the user will see the fix.
-3. **Do not leave the task partway and claim completion.** If you ran out of
-   turns, say so explicitly in the final message so the next agent picks up
-   the right thread.
-4. **Never undo a previous agent's completed work without a stated reason.**
+3. **Check for prior work before starting.** See §4a. The user almost
+   certainly already asked another agent to do this. Look.
+4. **Do not leave the task partway and claim completion.** If you ran out
+   of turns, say so explicitly in the final message.
+5. **Never undo a previous agent's completed work without a stated reason.**
    If you find the login screen back in `index.html`, treat it as a
    regression — check git history, ask the user, and restore the no-auth
-   state. Do not "helpfully" add auth back because it looks like a missing
-   feature.
+   state. Do not "helpfully" add auth back.
 
 ---
 
@@ -151,23 +171,41 @@ Run: `python app.py` → `http://127.0.0.1:5000`.
 - **Be honest about scope.** If the user asked for X and you also noticed Y,
   mention Y — don't silently fix it, don't silently ignore it.
 
-### Branch hygiene
+### 4a. Before you start: check for prior work
 
-CloseTool has historically accumulated long-lived parallel branches
-(`claude/fix-login-screen-removal-...`, `claude/fix-accounting-button-...`,
-`claude/close-tool-next-steps-...`) that diverge from each other and
-from `main`. This is the source of most "which copy is real?" confusion.
+The single biggest failure mode on this repo is agents reinventing work
+that another session already finished on a different branch. **Before
+writing any code**, spend 60 seconds doing this:
 
-- **Always start from `main`.** Before opening a new feature branch:
-  `git checkout main && git pull origin main`. Don't branch off a
+1. `git fetch --all --prune`
+2. `git branch -r | grep claude/` — list every parallel branch.
+3. For each branch that sounds related to the current task, run
+   `git log --oneline master..origin/<branch>` and read the commit
+   subjects. You are looking for: "did someone already do this?"
+4. If you find prior work, **stop and tell the user**, with the branch
+   name and a one-line summary. Let them choose between:
+   - "Use that branch — merge it to master."
+   - "Start fresh from master, ignore that branch."
+   - "Rebase the old branch on current master and finish it."
+
+Do **not** silently start a new branch and redo the work. That is how
+we ended up with eight duplicate login-removal branches.
+
+### 4b. Branch hygiene
+
+The default branch on this repo is **`master`** (not `main`). All the
+rules below refer to `master`.
+
+- **Always start from `master`.** Before opening a new feature branch:
+  `git checkout master && git pull origin master`. Don't branch off a
   half-finished `claude/...` branch unless the user explicitly says so.
-- **Merge back to `main` as soon as a feature works.** A green branch
+- **Merge back to `master` as soon as a feature works.** A green branch
   that sits unmerged for a week becomes a merge conflict. After the
-  user confirms a fix is good in the browser, propose merging to `main`
-  and deleting the branch.
+  user confirms a fix is good in the browser, propose merging to
+  `master` and deleting the branch.
 - **One open feature branch at a time, ideally.** If a second branch is
-  already open, ask the user whether to land it first or rebase on top of
-  it before starting the new work.
+  already open, ask the user whether to land it first or rebase on top
+  of it before starting the new work.
 - **Never delete a branch the user hasn't seen working.** Confirm it's
   merged (or its work is captured elsewhere) before deletion.
 
@@ -208,15 +246,53 @@ If any of those fail, the task is not done.
 When the user confirms a fix works in the browser:
 
 1. From the project folder, on the feature branch:
-   `git checkout main && git pull origin main`
+   `git checkout master && git pull origin master`
    `git merge --no-ff <feature-branch>`
-   `git push origin main`
+   `git push origin master`
 2. Delete the local and remote branches:
    `git branch -d <feature-branch>`
    `git push origin --delete <feature-branch>`
-3. Tell the user the branch is closed and which commit on `main` carries
-   the fix.
+3. Tell the user the branch is closed and which commit on `master`
+   carries the fix.
 
-Do not skip step 1's `git pull origin main` — `main` may have moved
+Do not skip step 1's `git pull origin master` — `master` may have moved
 forward via another branch's merge while you were working.
+
+---
+
+## 7. Historical branch ledger (as of 2026-04-22 consolidation)
+
+After the "8 parallel branches" cleanup, the state of the repo is:
+
+- **`master`** — now contains the work of `fix-accounting-button-B9RTl`
+  (Reports tab with P&L / BS / Cash Flow, KPIs, flux notes, drill-down,
+  Excel/CSV export, 4-4-5 fiscal calendar with MTD/QTD/YTD, QB OAuth
+  connect, login removal, CRUD route normalization, fresh-DB report fix,
+  Privacy/EULA templates, `Start CloseTool.bat` launcher). This is the
+  baseline every new branch must start from.
+- **`claude/close-tracker-tools-JVRS3`** — *not* merged. Contains a
+  different reports flavor (customer / vendor ledgers, GL detail, revenue
+  by customer, expense by vendor, by-Jira-epic) plus QB deep-sync of 23
+  entities, trial-balance snapshots, close-report PDF, audit trail,
+  calendar view, bulk actions, recon attachments, templates, flux
+  analysis, review queue. Kept as a reference; merging it requires real
+  conflict resolution against the `master` Reports tab.
+- **`claude/close-tool-next-steps-8Y8oZ`** — *not* merged. Period
+  rollover, period close/reopen, SMTP + Slack notifications, activity
+  timeline.
+- **`claude/review-close-tool-dG5XJ`** — *not* merged. Security
+  hardening: CSRF tokens, login rate-limit, SQL column whitelist, Fernet
+  token encryption, CORS origin whitelist. Self-contained; a candidate
+  for the next consolidation pass.
+- **`claude/organize-files-JGYzh`** — *not* merged. Moves the tool into
+  a `close-tool/` subfolder for multi-project workspace layout.
+  Conflicts with every other branch.
+- **`claude/month-end-close-tool-5eQcQ`** — *not* merged. Early manual
+  schema + fiscal-period seed, authored by Joe. Superseded by §7's
+  4-4-5 calendar on `master`.
+- **`claude/fix-login-screen-removal-2EuuX`**, **`claude/remove-login-screen-Rc77n`** —
+  obsolete. The login is already removed on `master`. Safe to delete
+  once Joe confirms.
+
+When in doubt, ask Joe before merging or deleting any of these.
 
