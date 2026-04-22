@@ -58,23 +58,33 @@ def err(msg, code=400):
     return jsonify({"error": msg}), code
 
 def get_current_user():
+    """Auth is disabled: always return the first admin in the DB (falling back to
+    any user, falling back to a synthetic Joe). Every action is attributed to
+    this user in activity logs."""
     uid = session.get("user_id")
-    return q1("SELECT * FROM users WHERE id=?", (uid,)) if uid else None
+    if uid:
+        row = q1("SELECT * FROM users WHERE id=?", (uid,))
+        if row:
+            return row
+    row = q1("SELECT * FROM users WHERE role='admin' ORDER BY id LIMIT 1")
+    if row:
+        return row
+    row = q1("SELECT * FROM users ORDER BY id LIMIT 1")
+    if row:
+        return row
+    return {"id": 0, "name": "Admin", "initials": "JG", "role": "admin", "color": "#4f8ef7", "email": ""}
 
 def login_required(f):
+    """Auth disabled: pass-through decorator (kept so routes compile)."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not session.get("user_id"):
-            return jsonify({"error": "Not authenticated"}), 401
         return f(*args, **kwargs)
     return decorated
 
 def admin_required(f):
+    """Auth disabled: pass-through decorator."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        user = get_current_user()
-        if not user or user["role"] != "admin":
-            return jsonify({"error": "Admin access required"}), 403
         return f(*args, **kwargs)
     return decorated
 
@@ -86,28 +96,16 @@ def period_is_closed(period_id):
 
 @app.route("/api/auth/login", methods=["GET", "POST", "OPTIONS"])
 def login():
+    """Auth disabled: return the default user so legacy clients still work."""
     if request.method == "OPTIONS":
         return "", 204
-    if request.method == "GET":
-        return jsonify({"message": "login endpoint"})
-    b = request.json or {}
-    username = b.get("username", "").strip()
-    password = b.get("password", "")
-    if not username or not password:
-        return err("Username and password required")
-    user = q1("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (username,))
-    if not user or not user["password_hash"]:
-        return err("Invalid username or password")
-    if not check_password_hash(user["password_hash"], password):
-        return err("Invalid username or password")
-    session["user_id"] = user["id"]
-    session.permanent = True
+    user = get_current_user()
     return jsonify({
         "id": user["id"],
         "name": user["name"],
         "initials": user["initials"],
         "role": user["role"],
-        "color": user["color"]
+        "color": user["color"],
     })
 
 @app.route("/api/auth/logout", methods=["GET", "POST", "OPTIONS"])
@@ -122,15 +120,13 @@ def me():
     if request.method == "OPTIONS":
         return "", 204
     user = get_current_user()
-    if not user:
-        return jsonify({"authenticated": False})
     return jsonify({
         "authenticated": True,
         "id": user["id"],
         "name": user["name"],
         "initials": user["initials"],
         "role": user["role"],
-        "color": user["color"]
+        "color": user["color"],
     })
 
 # ── QuickBooks ────────────────────────────────────────────────────────────────
