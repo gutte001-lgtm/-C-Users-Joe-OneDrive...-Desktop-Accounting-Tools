@@ -1,7 +1,8 @@
-import os, sqlite3, traceback, io, csv, uuid
+import os, sqlite3, traceback, io, csv, uuid, json
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
 from functools import wraps
-from flask import Flask, jsonify, request, g, send_from_directory, session, Response
+from flask import Flask, jsonify, request, g, send_from_directory, session, Response, redirect
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
@@ -145,7 +146,10 @@ QB_API_BASE      = (
 )
 
 def get_tokens():
-    row = q1("SELECT access_token, refresh_token, expires_at FROM qb_tokens ORDER BY id DESC LIMIT 1")
+    try:
+        row = q1("SELECT access_token, refresh_token, expires_at FROM qb_tokens ORDER BY id DESC LIMIT 1")
+    except sqlite3.OperationalError:
+        return {}
     return dict(row) if row else {}
 
 def save_tokens(at, rt, ei):
@@ -168,25 +172,78 @@ def refresh_access_token():
         return d["access_token"]
     return None
 
-def qb_get(path):
+def _qb_token_or_error():
     tokens = get_tokens()
     if not tokens:
-        return None, "Not connected"
+        return None, "QuickBooks is not connected"
     now = datetime.now(timezone.utc).timestamp()
     token = tokens["access_token"]
     if tokens.get("expires_at", 0) < now + 60:
         token = refresh_access_token()
     if not token:
-        return None, "Token refresh failed"
+        return None, "QuickBooks token refresh failed — reconnect required"
+    return token, None
+
+def qb_get(path):
+    token, error = _qb_token_or_error()
+    if error:
+        return None, error
     resp = requests.get(
         f"{QB_API_BASE}/{QB_REALM_ID}{path}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}")
 
+def qb_post(path, body):
+    token, error = _qb_token_or_error()
+    if error:
+        return None, error
+    if not QB_REALM_ID:
+        return None, "QB_REALM_ID not configured — reconnect QuickBooks"
+    resp = requests.post(
+        f"{QB_API_BASE}/{QB_REALM_ID}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        json=body)
+    if resp.ok:
+        return resp.json(), None
+    try:
+        detail = resp.json()
+    except Exception:
+        detail = {"text": resp.text[:500]}
+    fault = (detail.get("Fault", {}) or {}).get("Error", [{}])[0] if isinstance(detail, dict) else {}
+    msg = fault.get("Message") or fault.get("Detail") or str(detail)[:300]
+    return None, f"QB {resp.status_code}: {msg}"
+
+@app.route("/qb/connect")
+@login_required
+def qb_connect():
+    user = get_current_user()
+    if not user or user["role"] != "admin":
+        return err("Admin required", 403)
+    if not QB_CLIENT_ID:
+        return err("QB_CLIENT_ID not configured in environment", 500)
+    state = uuid.uuid4().hex
+    session["qb_oauth_state"] = state
+    params = urlencode({
+        "client_id": QB_CLIENT_ID,
+        "scope": "com.intuit.quickbooks.accounting openid profile email",
+        "redirect_uri": QB_REDIRECT_URI,
+        "response_type": "code",
+        "state": state,
+    })
+    return redirect(f"https://appcenter.intuit.com/connect/oauth2?{params}")
+
 @app.route("/qb/callback")
 def qb_callback():
     code = request.args.get("code")
     realm = request.args.get("realmId")
+    state = request.args.get("state")
+    expected_state = session.pop("qb_oauth_state", None)
+    if expected_state and state != expected_state:
+        return err("OAuth state mismatch", 400)
     if not code:
         return err("Missing code")
     resp = requests.post(QB_TOKEN_URL,
@@ -198,7 +255,9 @@ def qb_callback():
     save_tokens(d["access_token"], d["refresh_token"], d["expires_in"])
     if realm:
         os.environ["QB_REALM_ID"] = realm
-    return jsonify({"status": "connected", "realm_id": realm})
+        global QB_REALM_ID
+        QB_REALM_ID = realm
+    return redirect("/?qb=connected")
 
 @app.route("/api/qb/status", methods=["GET", "OPTIONS"])
 @login_required
@@ -1168,6 +1227,228 @@ def close_report_pdf(pid):
     fname = f"close_report_{period['label'].replace(' ', '_')}.pdf"
     return Response(pdf, mimetype="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+# ── Flux Analysis ─────────────────────────────────────────────────────────────
+
+@app.route("/api/flux", methods=["GET", "OPTIONS"])
+@login_required
+def flux_analysis():
+    if request.method == "OPTIONS":
+        return "", 204
+    current_id = request.args.get("current_snapshot_id", type=int)
+    prior_id = request.args.get("prior_snapshot_id", type=int)
+    pct_threshold = float(request.args.get("pct_threshold", 10))
+    dollar_threshold = float(request.args.get("dollar_threshold", 1000))
+    if not current_id:
+        return err("current_snapshot_id required")
+    cur = q1("SELECT s.*, p.label AS period_label FROM tb_snapshots s JOIN periods p ON p.id=s.period_id WHERE s.id=?", (current_id,))
+    if not cur:
+        return err("Current snapshot not found", 404)
+    if not prior_id:
+        prior = q1("""SELECT s.*, p.label AS period_label FROM tb_snapshots s JOIN periods p ON p.id=s.period_id
+                      WHERE s.snapshotted_at < ? ORDER BY s.snapshotted_at DESC LIMIT 1""", (cur["snapshotted_at"],))
+        if not prior:
+            return err("No prior snapshot available to compare against")
+    else:
+        prior = q1("SELECT s.*, p.label AS period_label FROM tb_snapshots s JOIN periods p ON p.id=s.period_id WHERE s.id=?", (prior_id,))
+        if not prior:
+            return err("Prior snapshot not found", 404)
+    cur_rows = q("SELECT * FROM tb_snapshot_rows WHERE snapshot_id=?", (cur["id"],))
+    prior_rows = q("SELECT * FROM tb_snapshot_rows WHERE snapshot_id=?", (prior["id"],))
+    def key(r):
+        return (r["account_number"] or "") + "|" + r["account_name"]
+    prior_map = {key(r): r for r in prior_rows}
+    cur_map = {key(r): r for r in cur_rows}
+    all_keys = sorted(set(cur_map) | set(prior_map))
+    results = []
+    for k in all_keys:
+        c = cur_map.get(k)
+        p = prior_map.get(k)
+        current_balance = c["balance"] if c else 0.0
+        prior_balance = p["balance"] if p else 0.0
+        delta = current_balance - prior_balance
+        pct = None
+        if prior_balance != 0:
+            pct = round(delta / abs(prior_balance) * 100, 2)
+        elif current_balance != 0:
+            pct = None  # new account
+        dollar_flagged = abs(delta) >= dollar_threshold
+        pct_flagged = pct is not None and abs(pct) >= pct_threshold
+        flagged = dollar_flagged or pct_flagged or (c is None) or (p is None)
+        base = c or p
+        results.append({
+            "account_number": base["account_number"],
+            "account_name": base["account_name"],
+            "account_type": base["account_type"],
+            "classification": base["classification"],
+            "prior_balance": prior_balance,
+            "current_balance": current_balance,
+            "delta": round(delta, 2),
+            "pct_change": pct,
+            "flagged": flagged,
+            "new_account": p is None,
+            "removed_account": c is None,
+        })
+    results.sort(key=lambda r: (not r["flagged"], -abs(r["delta"])))
+    return jsonify({
+        "current": {"id": cur["id"], "label": cur["label"], "period_label": cur["period_label"], "snapshotted_at": cur["snapshotted_at"]},
+        "prior": {"id": prior["id"], "label": prior["label"], "period_label": prior["period_label"], "snapshotted_at": prior["snapshotted_at"]},
+        "pct_threshold": pct_threshold,
+        "dollar_threshold": dollar_threshold,
+        "rows": results,
+        "flagged_count": sum(1 for r in results if r["flagged"]),
+    })
+
+@app.route("/api/tb_snapshots", methods=["GET", "OPTIONS"])
+@login_required
+def tb_snapshots_all():
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q("""SELECT s.id, s.label, s.snapshotted_at, s.period_id, p.label AS period_label,
+                       (SELECT COUNT(*) FROM tb_snapshot_rows WHERE snapshot_id=s.id) AS row_count
+                FROM tb_snapshots s JOIN periods p ON p.id=s.period_id
+                ORDER BY s.snapshotted_at DESC""")
+    return jsonify(rows_to_list(rows))
+
+# ── Review Queue (unified QB post queue) ──────────────────────────────────────
+
+TARGET_PATHS = {
+    "invoice": "/invoice",
+    "sales_receipt": "/salesreceipt",
+    "bill": "/bill",
+    "payment": "/payment",
+    "credit_memo": "/creditmemo",
+    "bill_payment": "/billpayment",
+    "vendor_credit": "/vendorcredit",
+}
+
+@app.route("/api/pending_posts", methods=["GET", "POST", "OPTIONS"])
+@login_required
+def pending_posts_list():
+    if request.method == "OPTIONS":
+        return "", 204
+    if request.method == "GET":
+        status = request.args.get("status")
+        source = request.args.get("source")
+        clauses, params = [], []
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if source:
+            clauses.append("source=?"); params.append(source)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = q(f"""SELECT p.*, u.name AS posted_by_name, u.initials AS posted_by_initials
+                     FROM pending_posts p LEFT JOIN users u ON u.id=p.posted_by
+                     {where} ORDER BY p.created_at DESC LIMIT 500""", params)
+        return jsonify(rows_to_list(rows))
+    user = get_current_user()
+    if user["role"] != "admin":
+        return err("Admin required", 403)
+    b = request.json or {}
+    required = ("source", "target_type", "payload")
+    if not all(k in b for k in required):
+        return err("source, target_type, payload required")
+    if b["target_type"] not in TARGET_PATHS:
+        return err(f"target_type must be one of: {', '.join(TARGET_PATHS)}")
+    payload_str = json.dumps(b["payload"]) if isinstance(b["payload"], (dict, list)) else str(b["payload"])
+    try:
+        cur = run("""INSERT INTO pending_posts
+                     (source,external_id,target_type,customer_vendor,amount,reference,payload,notes)
+                     VALUES (?,?,?,?,?,?,?,?)""",
+                  (b["source"], b.get("external_id"), b["target_type"],
+                   b.get("customer_vendor"), b.get("amount"), b.get("reference"),
+                   payload_str, b.get("notes", "")))
+    except sqlite3.IntegrityError:
+        return err("Duplicate: a pending post with this source + external_id already exists", 409)
+    return jsonify({"id": cur.lastrowid}), 201
+
+@app.route("/api/pending_posts/<int:pid>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
+@login_required
+def pending_post_detail(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    row = q1("""SELECT p.*, u.name AS posted_by_name, u.initials AS posted_by_initials
+                FROM pending_posts p LEFT JOIN users u ON u.id=p.posted_by WHERE p.id=?""", (pid,))
+    if not row:
+        return err("Pending post not found", 404)
+    if request.method == "GET":
+        d = dict(row)
+        try:
+            d["payload_obj"] = json.loads(d["payload"])
+        except Exception:
+            d["payload_obj"] = None
+        return jsonify(d)
+    user = get_current_user()
+    if user["role"] != "admin":
+        return err("Admin required", 403)
+    if request.method == "DELETE":
+        run("DELETE FROM pending_posts WHERE id=?", (pid,))
+        return jsonify({"deleted": pid})
+    b = request.json or {}
+    allowed = {"status", "notes", "customer_vendor", "amount", "reference", "payload"}
+    updates = {k: v for k, v in b.items() if k in allowed}
+    if "payload" in updates and isinstance(updates["payload"], (dict, list)):
+        updates["payload"] = json.dumps(updates["payload"])
+    if not updates:
+        return err("No valid fields")
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    run(f"UPDATE pending_posts SET {set_clause} WHERE id=?", list(updates.values()) + [pid])
+    return jsonify({"updated": pid})
+
+@app.route("/api/pending_posts/<int:pid>/post", methods=["POST", "OPTIONS"])
+@admin_required
+def pending_post_execute(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    row = q1("SELECT * FROM pending_posts WHERE id=?", (pid,))
+    if not row:
+        return err("Pending post not found", 404)
+    if row["status"] == "posted":
+        return err("Already posted", 409)
+    path = TARGET_PATHS.get(row["target_type"])
+    if not path:
+        return err(f"Unknown target_type: {row['target_type']}")
+    try:
+        body = json.loads(row["payload"])
+    except Exception:
+        return err("Stored payload is not valid JSON")
+    result, error = qb_post(path, body)
+    user = get_current_user()
+    if error:
+        run("""UPDATE pending_posts SET status='error', error_message=?, updated_at=? WHERE id=?""",
+            (error, datetime.utcnow().isoformat(), pid))
+        return err(error, 502)
+    # Extract the new QB id — first top-level key after the primary wrapper
+    qb_id = None
+    if isinstance(result, dict):
+        for v in result.values():
+            if isinstance(v, dict) and "Id" in v:
+                qb_id = v["Id"]
+                break
+    run("""UPDATE pending_posts SET status='posted', qb_id=?, posted_by=?, posted_at=?,
+           error_message=NULL, updated_at=? WHERE id=?""",
+        (qb_id, user["id"], datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), pid))
+    return jsonify({"posted": pid, "qb_id": qb_id, "response": result})
+
+@app.route("/api/pending_posts/<int:pid>/link", methods=["POST", "OPTIONS"])
+@admin_required
+def pending_post_link(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    qb_id = (b.get("qb_id") or "").strip()
+    if not qb_id:
+        return err("qb_id required")
+    row = q1("SELECT 1 FROM pending_posts WHERE id=?", (pid,))
+    if not row:
+        return err("Pending post not found", 404)
+    user = get_current_user()
+    run("""UPDATE pending_posts SET status='posted', qb_id=?, posted_by=?, posted_at=?,
+           error_message=NULL, updated_at=?, notes=COALESCE(notes,'')||?
+           WHERE id=?""",
+        (qb_id, user["id"], datetime.utcnow().isoformat(), datetime.utcnow().isoformat(),
+         f"\n[linked manually to QB #{qb_id}]", pid))
+    return jsonify({"linked": pid, "qb_id": qb_id})
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 

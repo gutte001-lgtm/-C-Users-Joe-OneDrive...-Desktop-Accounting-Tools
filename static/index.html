@@ -143,6 +143,16 @@ function CloseApp(){
   const [tbDetail,setTbDetail]=useState(null);
   const [tbLoading,setTbLoading]=useState(false);
   const [tbTaking,setTbTaking]=useState(false);
+  const [tbMode,setTbMode]=useState("snapshots");   // snapshots | flux
+  const [allSnapshots,setAllSnapshots]=useState([]);
+  const [fluxOpts,setFluxOpts]=useState({current:"",prior:"",pct:10,dollar:1000});
+  const [fluxData,setFluxData]=useState(null);
+  const [fluxLoading,setFluxLoading]=useState(false);
+  const [queue,setQueue]=useState([]);
+  const [queueStatusFilter,setQueueStatusFilter]=useState("pending");
+  const [queueSourceFilter,setQueueSourceFilter]=useState("");
+  const [queueSelected,setQueueSelected]=useState(null);
+  const [qbStatus,setQbStatus]=useState(null);
 
   const isAdmin=currentUser?.role==="admin";
 
@@ -197,6 +207,31 @@ function CloseApp(){
     if(!confirm("Delete this snapshot?"))return;
     try{await api(`/api/tb_snapshots/${sid}`,{method:"DELETE"});await loadTbSnapshots();if(tbDetail?.id===sid)setTbDetail(null);}
     catch(e){alert(e.message);}
+  }
+  async function loadAllSnapshots(){
+    try{const s=await api("/api/tb_snapshots");setAllSnapshots(s);
+      if(s.length&&!fluxOpts.current)setFluxOpts(p=>({...p,current:s[0].id,prior:s[1]?.id||""}));
+    }catch(e){console.error(e);}
+  }
+  async function runFlux(){
+    if(!fluxOpts.current){alert("Pick a current snapshot");return;}
+    setFluxLoading(true);
+    try{
+      const qs=new URLSearchParams({current_snapshot_id:fluxOpts.current,pct_threshold:fluxOpts.pct,dollar_threshold:fluxOpts.dollar});
+      if(fluxOpts.prior)qs.set("prior_snapshot_id",fluxOpts.prior);
+      const d=await api(`/api/flux?${qs}`);setFluxData(d);
+    }catch(e){alert(e.message);setFluxData(null);}
+    setFluxLoading(false);
+  }
+  async function loadQueue(){
+    const qs=new URLSearchParams();
+    if(queueStatusFilter)qs.set("status",queueStatusFilter);
+    if(queueSourceFilter)qs.set("source",queueSourceFilter);
+    try{const rows=await api(`/api/pending_posts?${qs}`);setQueue(rows);}
+    catch(e){console.error(e);}
+  }
+  async function loadQbStatus(){
+    try{const s=await api("/api/qb/status");setQbStatus(s);}catch(e){setQbStatus(null);}
   }
 
   useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
@@ -676,7 +711,7 @@ function CloseApp(){
       }catch(e){alert(e.message);}
     }
 
-    const stabs=["users","categories","tasks","templates"];
+    const stabs=["users","categories","tasks","templates","integrations"];
     return(<div>
       <div style={{display:"flex",gap:0,marginBottom:24,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
         {stabs.map(t=><button key={t} onClick={()=>setSettingsTab(t)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:settingsTab===t?"#1e2d3d":"transparent",color:settingsTab===t?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:settingsTab===t?600:400,textTransform:"capitalize"}}>{t}</button>)}
@@ -877,6 +912,33 @@ function CloseApp(){
             </div>
           </div>
         </div>}
+      </div>}
+
+      {/* INTEGRATIONS */}
+      {settingsTab==="integrations"&&<div style={S.card}>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>Integrations</div>
+        <div style={{fontSize:11.5,color:"#64748b",marginBottom:16}}>Connect external systems so the close tracker can read balances and post journal entries, invoices, bills, and payments.</div>
+        <div style={{display:"grid",gap:10}}>
+          {[
+            {key:"qb",name:"QuickBooks Online",desc:"Read balances, pull trial balance, post invoices / sales receipts / bills / payments.",connected:!!qbStatus?.connected,connectUrl:"/qb/connect",extra:qbStatus?.connected?`Token expires in ~${Math.round((qbStatus.token_expires_in||0)/60)}m`:""},
+            {key:"billcom",name:"Bill.com",desc:"Pull bills & payments to reconcile AP into QuickBooks.",connected:false,connectUrl:null,extra:"Not yet wired — scheduled after QB write foundation."},
+            {key:"authnet",name:"Authorize.net",desc:"Pull settled batches; match to invoices or propose sales receipts for the review queue.",connected:false,connectUrl:null,extra:"Not yet wired."},
+            {key:"pandadoc",name:"PandaDoc",desc:"Watch for completed sales documents; propose invoices for the review queue.",connected:false,connectUrl:null,extra:"Not yet wired."},
+            {key:"shopify",name:"Shopify",desc:"Pull daily payouts; propose sales receipts or reconcile clearing account.",connected:false,connectUrl:null,extra:"Not yet wired."},
+            {key:"jira",name:"Jira",desc:"Read epic + device tickets; link ops tickets to QB documents for price/delivery tie-out.",connected:false,connectUrl:null,extra:"Not yet wired."},
+            {key:"teams",name:"Microsoft Teams",desc:"Post notifications when tasks go overdue or reviews need revision.",connected:false,connectUrl:null,extra:"Paste an Incoming Webhook URL (coming soon)."},
+          ].map(i=>(
+            <div key={i.key} style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:10,padding:"14px 16px",display:"flex",alignItems:"center",gap:14}}>
+              <div style={{width:8,height:40,borderRadius:4,background:i.connected?"#4fd9a0":"#1e2d3d"}}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:600,color:"#e2e8f0"}}>{i.name}{i.connected?<span style={{fontSize:10,marginLeft:8,padding:"1px 8px",background:"#4fd9a018",color:"#4fd9a0",border:"1px solid #4fd9a040",borderRadius:4,fontFamily:"'DM Mono',monospace"}}>CONNECTED</span>:<span style={{fontSize:10,marginLeft:8,padding:"1px 8px",background:"#1e2d3d",color:"#64748b",border:"1px solid #334155",borderRadius:4,fontFamily:"'DM Mono',monospace"}}>NOT CONNECTED</span>}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:3}}>{i.desc}</div>
+                {i.extra&&<div style={{fontSize:11,color:"#475569",fontFamily:"'DM Mono',monospace",marginTop:4}}>{i.extra}</div>}
+              </div>
+              {i.connectUrl&&<a href={i.connectUrl} className="btn btn-primary" style={{fontSize:12,padding:"7px 14px",textDecoration:"none"}}>{i.connected?"Reconnect":"Connect"}</a>}
+            </div>
+          ))}
+        </div>
       </div>}
 
       {/* Template Modals */}
@@ -1112,8 +1174,64 @@ function CloseApp(){
     </div></div>);
   }
 
+  // ── Flux Analysis (TB sub-view) ─────────────────────────────────────────────
+  function FluxView(){
+    return(<div style={S.card}>
+      <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>Flux Analysis</div>
+      <div style={{fontSize:11.5,color:"#64748b",marginBottom:14}}>Compare two trial-balance snapshots. Accounts with a variance above the thresholds are flagged.</div>
+      <div style={{display:"grid",gridTemplateColumns:"1.5fr 1.5fr .8fr .8fr auto",gap:10,marginBottom:14,alignItems:"end"}}>
+        <div><label className="form-label">Current</label>
+          <select className="form-select" value={fluxOpts.current} onChange={e=>setFluxOpts(p=>({...p,current:e.target.value}))}>
+            <option value="">— pick —</option>
+            {allSnapshots.map(s=><option key={s.id} value={s.id}>{s.period_label} — {s.label} ({new Date(s.snapshotted_at+"Z").toLocaleDateString()})</option>)}
+          </select>
+        </div>
+        <div><label className="form-label">Prior (auto-picks previous if blank)</label>
+          <select className="form-select" value={fluxOpts.prior} onChange={e=>setFluxOpts(p=>({...p,prior:e.target.value}))}>
+            <option value="">— auto —</option>
+            {allSnapshots.map(s=><option key={s.id} value={s.id}>{s.period_label} — {s.label}</option>)}
+          </select>
+        </div>
+        <div><label className="form-label">% threshold</label><input type="number" className="form-input" value={fluxOpts.pct} onChange={e=>setFluxOpts(p=>({...p,pct:e.target.value}))}/></div>
+        <div><label className="form-label">$ threshold</label><input type="number" className="form-input" value={fluxOpts.dollar} onChange={e=>setFluxOpts(p=>({...p,dollar:e.target.value}))}/></div>
+        <button className="btn btn-primary" style={{padding:"9px 18px",fontSize:12}} onClick={runFlux} disabled={fluxLoading}>{fluxLoading?"Running…":"Run Flux"}</button>
+      </div>
+      {!fluxData&&!fluxLoading&&<div style={{color:"#475569",fontSize:13,padding:"20px 0"}}>Pick a current snapshot and click Run Flux. You need at least two snapshots to compare.</div>}
+      {fluxLoading&&<Spinner/>}
+      {fluxData&&<div>
+        <div style={{fontSize:11.5,color:"#64748b",marginBottom:12,fontFamily:"'DM Mono',monospace"}}>
+          {fluxData.current.period_label} — {fluxData.current.label} &nbsp;vs&nbsp; {fluxData.prior.period_label} — {fluxData.prior.label} &nbsp;·&nbsp;
+          <span style={{color:"#f7c948"}}>{fluxData.flagged_count}</span> flagged of {fluxData.rows.length}
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["","Account","Classification","Prior","Current","Δ$","Δ%"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=3?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{fluxData.rows.map((r,i)=>{
+            const dc=r.delta>0?"#4fd9a0":r.delta<0?"#f87171":"#94a3b8";
+            return(<tr key={i} style={{background:r.flagged?"#1a2535":undefined}}>
+              <td style={{...S.td,width:20}}>{r.flagged?<span style={{color:"#f7c948"}}>⚠</span>:""}</td>
+              <td style={{...S.td,fontSize:12.5}}>
+                <span style={{fontFamily:"'DM Mono',monospace",color:"#94a3b8",marginRight:6}}>{r.account_number||"—"}</span>{r.account_name}
+                {r.new_account&&<span style={{fontSize:10,marginLeft:6,padding:"1px 6px",background:"#4fd9a018",color:"#4fd9a0",borderRadius:4,fontFamily:"'DM Mono',monospace"}}>NEW</span>}
+                {r.removed_account&&<span style={{fontSize:10,marginLeft:6,padding:"1px 6px",background:"#f8717118",color:"#f87171",borderRadius:4,fontFamily:"'DM Mono',monospace"}}>REMOVED</span>}
+              </td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{r.classification||"—"}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{fmt(r.prior_balance)}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12}}>{fmt(r.current_balance)}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12,color:dc,fontWeight:r.flagged?700:400}}>{r.delta>=0?"+":""}{fmt(r.delta)}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12,color:dc}}>{r.pct_change==null?"—":(r.pct_change>=0?"+":"")+r.pct_change+"%"}</td>
+            </tr>);
+          })}</tbody>
+        </table>
+      </div>}
+    </div>);
+  }
+
   // ── Trial Balance ───────────────────────────────────────────────────────────
   function TrialBalance(){
+    const tbToggle=(<div style={{display:"flex",gap:0,marginBottom:14,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
+      {["snapshots","flux"].map(m=><button key={m} onClick={()=>setTbMode(m)} style={{padding:"6px 18px",borderRadius:7,border:"none",background:tbMode===m?"#1e2d3d":"transparent",color:tbMode===m?"#e2e8f0":"#64748b",fontSize:12,cursor:"pointer",fontWeight:tbMode===m?600:400,textTransform:"capitalize"}}>{m==="flux"?"Flux Analysis":"Snapshots"}</button>)}
+    </div>);
+    if(tbMode==="flux"){return(<div>{tbToggle}<FluxView/></div>);}
     if(tbDetail){
       const total=(tbDetail.rows||[]).reduce((s,r)=>s+(r.balance||0),0);
       const byCls=tbDetail.totals_by_classification||{};
@@ -1156,7 +1274,7 @@ function CloseApp(){
         </table>
       </div>);
     }
-    return(<div style={S.card}>
+    return(<div>{tbToggle}<div style={S.card}>
       <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,alignItems:"center"}}>
         <div>
           <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Trial Balance Snapshots — {period?.label}</div>
@@ -1184,6 +1302,99 @@ function CloseApp(){
             </tr>
           ))}</tbody>
         </table>}
+    </div></div>);
+  }
+
+  // ── Review Queue ────────────────────────────────────────────────────────────
+  function ReviewQueue(){
+    const statusColor={pending:"#f7c948",posted:"#4fd9a0",dismissed:"#94a3b8",error:"#f87171"};
+    async function doAction(id,action,body){
+      try{
+        if(action==="post")await api(`/api/pending_posts/${id}/post`,{method:"POST"});
+        else if(action==="link")await api(`/api/pending_posts/${id}/link`,{method:"POST",body:JSON.stringify(body)});
+        else if(action==="dismiss")await api(`/api/pending_posts/${id}`,{method:"PATCH",body:JSON.stringify({status:"dismissed"})});
+        else if(action==="reopen")await api(`/api/pending_posts/${id}`,{method:"PATCH",body:JSON.stringify({status:"pending"})});
+        else if(action==="delete"){if(!confirm("Delete this queue item?"))return;await api(`/api/pending_posts/${id}`,{method:"DELETE"});}
+        await loadQueue();
+        if(queueSelected?.id===id){
+          if(action==="delete")setQueueSelected(null);
+          else{const d=await api(`/api/pending_posts/${id}`);setQueueSelected(d);}
+        }
+      }catch(e){alert(e.message);}
+    }
+    async function openDetail(id){try{const d=await api(`/api/pending_posts/${id}`);setQueueSelected(d);}catch(e){alert(e.message);}}
+    return(<div>
+      <div style={{...S.card,marginBottom:14,display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+        <span style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>STATUS</span>
+        {["pending","posted","dismissed","error",""].map(s=>
+          <button key={s||"all"} style={S.filterBtn(queueStatusFilter===s)} onClick={()=>setQueueStatusFilter(s)}>{s||"All"}</button>
+        )}
+        <span style={{width:1,background:"#1e2d3d",margin:"0 4px",height:20}}/>
+        <span style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>SOURCE</span>
+        {["","manual","authnet","pandadoc","billcom","shopify"].map(s=>
+          <button key={s||"all"} style={S.filterBtn(queueSourceFilter===s)} onClick={()=>setQueueSourceFilter(s)}>{s||"All"}</button>
+        )}
+        <button className="btn btn-ghost" style={{fontSize:11,padding:"5px 12px",marginLeft:"auto"}} onClick={loadQueue}>↻ Refresh</button>
+      </div>
+      <div style={S.card}>
+        {queue.length===0?<div style={{color:"#475569",fontSize:13,padding:"20px 0",textAlign:"center"}}>No items in the queue.</div>:
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Source","Type","Ref / Customer","Amount","Ext ID","Status","Created",""].map((h,i)=><th key={h} style={{...S.th,textAlign:i===3?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{queue.map(p=>{
+            const sc=statusColor[p.status]||"#94a3b8";
+            return(<tr key={p.id} style={{cursor:"pointer"}} onClick={()=>openDetail(p.id)}>
+              <td style={{...S.td,fontSize:12,fontFamily:"'DM Mono',monospace",color:"#94a3b8"}}>{p.source}</td>
+              <td style={{...S.td,fontSize:12}}><span style={{padding:"2px 6px",background:"#1e2d3d",color:"#94a3b8",borderRadius:4,fontFamily:"'DM Mono',monospace",fontSize:10.5}}>{p.target_type}</span></td>
+              <td style={{...S.td,maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                <div style={{fontWeight:500}}>{p.customer_vendor||"—"}</div>
+                <div style={{fontSize:11,color:"#64748b",marginTop:1}}>{p.reference||""}</div>
+              </td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{p.amount!=null?fmt(p.amount):"—"}</td>
+              <td style={{...S.td,fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{p.external_id||"—"}</td>
+              <td style={S.td}>
+                <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,color:sc,border:`1px solid ${sc}40`,background:sc+"15",fontFamily:"'DM Mono',monospace"}}>{p.status}</span>
+                {p.qb_id&&<div style={{fontSize:10,color:"#4fd9a0",fontFamily:"'DM Mono',monospace",marginTop:2}}>QB #{p.qb_id}</div>}
+              </td>
+              <td style={{...S.td,fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{new Date(p.created_at+"Z").toLocaleDateString("en-US",{month:"short",day:"numeric"})}</td>
+              <td style={S.td} onClick={e=>e.stopPropagation()}>
+                {p.status==="pending"&&isAdmin&&<div style={{display:"flex",gap:4}}>
+                  <button className="btn btn-primary" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>doAction(p.id,"post")} title="Post to QuickBooks">⇨ Post</button>
+                  <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 8px"}} onClick={()=>doAction(p.id,"dismiss")}>Skip</button>
+                </div>}
+                {p.status==="error"&&isAdmin&&<button className="btn btn-primary" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>doAction(p.id,"post")}>Retry</button>}
+                {p.status==="dismissed"&&isAdmin&&<button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>doAction(p.id,"reopen")}>Reopen</button>}
+              </td>
+            </tr>);
+          })}</tbody>
+        </table>}
+      </div>
+      {queueSelected&&<div className="modal-overlay" onClick={()=>setQueueSelected(null)}>
+        <div className="modal-box" style={{width:640}} onClick={e=>e.stopPropagation()}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
+            <div>
+              <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>{queueSelected.source} → {queueSelected.target_type}</div>
+              <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{queueSelected.customer_vendor||queueSelected.reference||"Pending Post"}</div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:3,fontFamily:"'DM Mono',monospace"}}>ID {queueSelected.id} · ext {queueSelected.external_id||"—"} · {queueSelected.amount!=null?fmt(queueSelected.amount):""}</div>
+            </div>
+            <button onClick={()=>setQueueSelected(null)} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+          </div>
+          {queueSelected.status==="error"&&queueSelected.error_message&&
+            <div style={{background:"#f8717118",border:"1px solid #f8717140",color:"#f87171",padding:"10px 12px",borderRadius:8,fontSize:12,marginBottom:12,fontFamily:"'DM Mono',monospace",whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{queueSelected.error_message}</div>}
+          {queueSelected.qb_id&&
+            <div style={{background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",padding:"8px 12px",borderRadius:8,fontSize:12,marginBottom:12,fontFamily:"'DM Mono',monospace"}}>Posted to QB as #{queueSelected.qb_id}</div>}
+          <div className="form-label">QuickBooks Payload</div>
+          <pre style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,padding:12,fontSize:11,color:"#cbd5e1",maxHeight:240,overflow:"auto",fontFamily:"'DM Mono',monospace",margin:0}}>{queueSelected.payload_obj?JSON.stringify(queueSelected.payload_obj,null,2):queueSelected.payload}</pre>
+          <div className="form-label" style={{marginTop:12}}>Notes</div>
+          <div style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#cbd5e1",whiteSpace:"pre-wrap",minHeight:30}}>{queueSelected.notes||<span style={{color:"#475569"}}>—</span>}</div>
+          {isAdmin&&<div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:14,flexWrap:"wrap"}}>
+            {queueSelected.status!=="posted"&&<button className="btn btn-ghost" onClick={()=>{const qid=prompt("Enter existing QuickBooks document ID to link:");if(qid)doAction(queueSelected.id,"link",{qb_id:qid});}}>🔗 Link existing</button>}
+            {queueSelected.status==="pending"&&<button className="btn btn-ghost" onClick={()=>doAction(queueSelected.id,"dismiss")}>Dismiss</button>}
+            {queueSelected.status==="dismissed"&&<button className="btn btn-ghost" onClick={()=>doAction(queueSelected.id,"reopen")}>Reopen</button>}
+            <button className="btn btn-danger" onClick={()=>doAction(queueSelected.id,"delete")}>Delete</button>
+            {(queueSelected.status==="pending"||queueSelected.status==="error")&&<button className="btn btn-primary" onClick={()=>doAction(queueSelected.id,"post")}>⇨ Post to QuickBooks</button>}
+          </div>}
+        </div>
+      </div>}
     </div>);
   }
 
@@ -1193,15 +1404,20 @@ function CloseApp(){
     {id:"calendar",label:"Calendar",icon:"▦"},
     {id:"recons",label:"Reconciliations",icon:"⇌"},
     {id:"tb",label:"Trial Balance",icon:"Σ"},
+    {id:"queue",label:"Review Queue",icon:"⇥"},
     {id:"activity",label:"Activity Log",icon:"◷"},
     ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
   ];
 
   useEffect(()=>{
     if(tab==="activity"&&period)loadActivity();
-    if(tab==="settings"&&isAdmin)loadTemplates();
-    if(tab==="tb"&&period){loadTbSnapshots();setTbDetail(null);}
-  },[tab,period?.id]);
+    if(tab==="settings"&&isAdmin){loadTemplates();loadQbStatus();}
+    if(tab==="tb"&&period){
+      if(tbMode==="snapshots"){loadTbSnapshots();setTbDetail(null);}
+      if(tbMode==="flux"){loadAllSnapshots();}
+    }
+    if(tab==="queue")loadQueue();
+  },[tab,period?.id,tbMode,queueStatusFilter,queueSourceFilter]);
 
   return(<div style={S.app}>
     <div style={S.sidebar}>
@@ -1238,7 +1454,8 @@ function CloseApp(){
             {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
             {tab==="calendar"&&`${tasks.filter(t=>t.due_date).length} tasks with due dates`}
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
-            {tab==="tb"&&`${tbSnapshots.length} snapshot${tbSnapshots.length===1?"":"s"} for ${period?.label||""}`}
+            {tab==="tb"&&(tbMode==="flux"?"Compare two snapshots and flag material variance":`${tbSnapshots.length} snapshot${tbSnapshots.length===1?"":"s"} for ${period?.label||""}`)}
+            {tab==="queue"&&`${queue.length} items · filter: ${queueStatusFilter||"all"}${queueSourceFilter?" / "+queueSourceFilter:""}`}
             {tab==="activity"&&`${activityLog.length} events · period ${period?.label||""}`}
             {tab==="settings"&&"Admin only — manage team, categories, templates, and tasks"}
           </div>
@@ -1249,6 +1466,7 @@ function CloseApp(){
       {tab==="calendar"&&<CalendarView/>}
       {tab==="recons"&&<Reconciliations/>}
       {tab==="tb"&&<TrialBalance/>}
+      {tab==="queue"&&<ReviewQueue/>}
       {tab==="activity"&&<ActivityLog/>}
       {tab==="settings"&&isAdmin&&<Settings/>}
     </div>

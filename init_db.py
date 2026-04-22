@@ -154,6 +154,31 @@ CREATE TABLE IF NOT EXISTS tb_snapshot_rows (
 
 CREATE INDEX IF NOT EXISTS idx_tb_rows_snapshot ON tb_snapshot_rows(snapshot_id);
 
+-- ─────────────────────────────────────────
+--  Pending Posts (unified review queue for QB writes)
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS pending_posts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT NOT NULL,              -- authnet | pandadoc | billcom | shopify | manual
+    external_id     TEXT,                       -- source transaction/doc id (idempotency key)
+    target_type     TEXT NOT NULL,              -- invoice | sales_receipt | bill | payment | credit_memo
+    customer_vendor TEXT,                       -- display name
+    amount          REAL,
+    reference       TEXT,                       -- short description for the queue row
+    payload         TEXT NOT NULL,              -- JSON body to send to QB
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | posted | dismissed | error
+    qb_id           TEXT,                       -- QB document ID after successful post
+    error_message   TEXT,
+    notes           TEXT DEFAULT '',
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    posted_by       INTEGER REFERENCES users(id),
+    posted_at       DATETIME
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_external
+    ON pending_posts(source, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_posts(status);
+
 -- Trigger: auto-update tasks.updated_at
 CREATE TRIGGER IF NOT EXISTS tasks_updated_at
 AFTER UPDATE ON tasks
