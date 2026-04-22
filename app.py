@@ -216,6 +216,36 @@ def _ensure_qb_tokens_table():
         db.execute("ALTER TABLE qb_tokens ADD COLUMN realm_id TEXT")
     db.commit()
 
+# OAuth state is also persisted here so the callback can validate even if the
+# session cookie didn't survive the Intuit round-trip (e.g. user hit the app
+# on localhost but the redirect_uri is 127.0.0.1, or Edge stripped SameSite=Lax
+# on some flows). Rows expire after _QB_STATE_TTL seconds.
+_QB_STATE_TTL = 900  # 15 minutes
+
+def _ensure_qb_oauth_states_table():
+    db = get_db()
+    db.execute("CREATE TABLE IF NOT EXISTS qb_oauth_states (state TEXT PRIMARY KEY, created_at REAL)")
+    db.commit()
+
+def _save_oauth_state(state):
+    _ensure_qb_oauth_states_table()
+    db = get_db()
+    now = datetime.now(timezone.utc).timestamp()
+    db.execute("DELETE FROM qb_oauth_states WHERE created_at < ?", (now - _QB_STATE_TTL,))
+    db.execute("INSERT OR REPLACE INTO qb_oauth_states (state, created_at) VALUES (?, ?)", (state, now))
+    db.commit()
+
+def _consume_oauth_state(state):
+    _ensure_qb_oauth_states_table()
+    db = get_db()
+    now = datetime.now(timezone.utc).timestamp()
+    row = db.execute("SELECT created_at FROM qb_oauth_states WHERE state=?", (state,)).fetchone()
+    db.execute("DELETE FROM qb_oauth_states WHERE state=?", (state,))
+    db.commit()
+    if not row:
+        return False
+    return (now - row["created_at"]) <= _QB_STATE_TTL
+
 def get_tokens():
     _ensure_qb_tokens_table()
     row = q1("SELECT access_token, refresh_token, expires_at, realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
@@ -276,11 +306,18 @@ def qb_get(path):
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}: {resp.text[:200]}")
 
+def _qb_error(reason):
+    print(f"[qb] connect failed: {reason}", flush=True)
+    return redirect("/?qb=error&reason=" + urllib.parse.quote(reason, safe=""))
+
 @app.route("/api/qb/connect")
 @login_required
 def qb_connect():
+    if not QB_CLIENT_ID or not QB_CLIENT_SECRET:
+        return _qb_error("missing_credentials")
     state = secrets.token_urlsafe(16)
     session["qb_state"] = state
+    _save_oauth_state(state)
     params = {
         "client_id": QB_CLIENT_ID,
         "scope": "com.intuit.quickbooks.accounting",
@@ -295,17 +332,37 @@ def qb_callback():
     code = request.args.get("code")
     realm = request.args.get("realmId")
     state = request.args.get("state")
+    qb_err = request.args.get("error")
+    if qb_err:
+        return _qb_error(f"intuit_{qb_err}")
     if not code:
-        return redirect("/?qb=error")
-    if state and state != session.get("qb_state"):
-        return redirect("/?qb=error")
-    resp = requests.post(QB_TOKEN_URL,
-        data={"grant_type": "authorization_code", "code": code, "redirect_uri": QB_REDIRECT_URI},
-        auth=(QB_CLIENT_ID, QB_CLIENT_SECRET))
+        return _qb_error("missing_code")
+    if not state:
+        return _qb_error("missing_state")
+    session_state = session.get("qb_state")
+    state_ok = (state == session_state) or _consume_oauth_state(state)
+    if not state_ok:
+        return _qb_error("state_mismatch")
+    if not QB_CLIENT_ID or not QB_CLIENT_SECRET:
+        return _qb_error("missing_credentials")
+    try:
+        resp = requests.post(QB_TOKEN_URL,
+            data={"grant_type": "authorization_code", "code": code, "redirect_uri": QB_REDIRECT_URI},
+            auth=(QB_CLIENT_ID, QB_CLIENT_SECRET),
+            headers={"Accept": "application/json"},
+            timeout=15)
+    except requests.RequestException as e:
+        return _qb_error(f"network:{type(e).__name__}")
     if not resp.ok:
-        return redirect("/?qb=error")
-    d = resp.json()
-    save_tokens(d["access_token"], d["refresh_token"], d["expires_in"], realm_id=realm)
+        print(f"[qb] token exchange {resp.status_code}: {resp.text[:300]}", flush=True)
+        return _qb_error(f"token_exchange_{resp.status_code}")
+    try:
+        d = resp.json()
+    except ValueError:
+        return _qb_error("token_response_not_json")
+    if not d.get("access_token") or not d.get("refresh_token"):
+        return _qb_error("token_response_incomplete")
+    save_tokens(d["access_token"], d["refresh_token"], d.get("expires_in", 3600), realm_id=realm)
     session.pop("qb_state", None)
     return redirect("/?qb=connected")
 
@@ -322,28 +379,95 @@ def qb_status():
         "token_expires_in": max(0, int(tokens.get("expires_at", 0) - datetime.now(timezone.utc).timestamp()))
     })
 
+def sync_qb_accounts(period_id):
+    """Pull QB's chart of accounts, cache it, and make sure there's a
+    reconciliation row for every Asset/Liability/Equity account in the given
+    period. Updates qb_balance on existing rows too. Idempotent: matches
+    existing rows by AcctNum → Name → falls back to creating with QB Id as
+    account_number."""
+    _ensure_report_tables()
+    data, error = qb_get("/query?query=SELECT%20*%20FROM%20Account%20MAXRESULTS%201000")
+    if error:
+        return {"ok": False, "error": error}
+    accounts = data.get("QueryResponse", {}).get("Account", []) or []
+    db = get_db()
+    for a in accounts:
+        db.execute("""INSERT INTO qb_accounts (id, name, acct_num, account_type, classification, synced_at)
+                      VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                      ON CONFLICT(id) DO UPDATE SET
+                        name=excluded.name, acct_num=excluded.acct_num,
+                        account_type=excluded.account_type, classification=excluded.classification,
+                        synced_at=CURRENT_TIMESTAMP""",
+                   (str(a.get("Id", "")), a.get("Name", ""), (a.get("AcctNum") or "").strip(),
+                    a.get("AccountType", ""), a.get("Classification", "")))
+
+    bs_accounts = [a for a in accounts if a.get("Classification") in ("Asset", "Liability", "Equity")]
+    existing = q("SELECT id, account_number, account_name FROM reconciliations WHERE period_id=?", (period_id,))
+    by_num  = {r["account_number"]: r["id"] for r in existing if (r["account_number"] or "").strip()}
+    by_name = {r["account_name"].strip().lower(): r["id"] for r in existing if r["account_name"]}
+
+    admin = q1("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1") \
+            or q1("SELECT id FROM users ORDER BY id LIMIT 1")
+    assignee_id = admin["id"] if admin else DEFAULT_USER_ID
+
+    created = updated = 0
+    for a in bs_accounts:
+        acct_num = (a.get("AcctNum") or "").strip()
+        name = (a.get("Name") or "").strip()
+        if not name:
+            continue
+        try:
+            bal = float(a.get("CurrentBalance") or 0)
+        except (TypeError, ValueError):
+            bal = 0.0
+        rid = None
+        if acct_num and acct_num in by_num:
+            rid = by_num[acct_num]
+        elif name.lower() in by_name:
+            rid = by_name[name.lower()]
+        if rid:
+            db.execute("UPDATE reconciliations SET qb_balance=?, last_synced_at=CURRENT_TIMESTAMP WHERE id=?", (bal, rid))
+            updated += 1
+        else:
+            db.execute("""INSERT INTO reconciliations
+                          (period_id, account_number, account_name, assignee_id,
+                           qb_balance, expected_balance, status, last_synced_at)
+                          VALUES (?,?,?,?,?,NULL,'open',CURRENT_TIMESTAMP)""",
+                       (period_id, acct_num or f"QB{a.get('Id','')}", name, assignee_id, bal))
+            created += 1
+    db.commit()
+    return {"ok": True, "created": created, "updated": updated, "total": len(bs_accounts)}
+
+def _activate_current_period_if_stale(max_stale_days=60):
+    """If there's no active period, or the active period ended more than
+    max_stale_days ago, activate the 4-4-5 month that contains today. Returns
+    the active period id (or None if nothing could be activated)."""
+    _ensure_fiscal_calendar()
+    today = date.today()
+    today_iso = today.isoformat()
+    active = q1("SELECT id, end_date FROM periods WHERE is_active=1")
+    if active:
+        try:
+            end = date.fromisoformat(active["end_date"])
+            if (today - end).days <= max_stale_days:
+                return active["id"]
+        except (TypeError, ValueError):
+            pass
+    cur = q1("""SELECT id FROM periods WHERE period_type='month'
+                AND start_date <= ? AND end_date >= ?
+                ORDER BY start_date DESC LIMIT 1""", (today_iso, today_iso))
+    if not cur:
+        return active["id"] if active else None
+    run("UPDATE periods SET is_active=0")
+    run("UPDATE periods SET is_active=1 WHERE id=?", (cur["id"],))
+    return cur["id"]
+
 def sync_qb_balances():
     with app.app_context():
-        data, error = qb_get("/query?query=SELECT%20*%20FROM%20Account%20MAXRESULTS%201000")
-        if error:
-            return {"synced": 0, "error": error}
-        bal_map = {
-            a.get("AcctNum", "").strip(): float(a["CurrentBalance"])
-            for a in data.get("QueryResponse", {}).get("Account", [])
-            if a.get("AcctNum") and a.get("CurrentBalance") is not None
-        }
-        db = get_db()
-        updated = 0
         period = q1("SELECT id FROM periods WHERE is_active=1")
         if not period:
-            return {"synced": 0, "error": "No active period"}
-        for r in q("SELECT id, account_number FROM reconciliations WHERE period_id=?", (period["id"],)):
-            bal = bal_map.get(r["account_number"])
-            if bal is not None:
-                db.execute("UPDATE reconciliations SET qb_balance=?, last_synced_at=CURRENT_TIMESTAMP WHERE id=?", (bal, r["id"]))
-                updated += 1
-        db.commit()
-        return {"synced": updated}
+            return {"ok": False, "error": "No active period"}
+        return sync_qb_accounts(period["id"])
 
 @app.route("/api/qb/sync", methods=["POST", "OPTIONS"])
 @login_required
@@ -352,6 +476,40 @@ def manual_sync():
     if request.method == "OPTIONS":
         return "", 204
     return jsonify(sync_qb_balances())
+
+@app.route("/api/qb/bootstrap", methods=["POST", "OPTIONS"])
+@login_required
+@csrf_protect
+def qb_bootstrap():
+    """One-click 'set this up from my real QuickBooks': activate the current
+    4-4-5 month, seed reconciliations from QB's chart of accounts, and pull
+    P&L/BS/CF for current month, its quarter, and its year."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not get_tokens():
+        return jsonify({"ok": False, "error": "Not connected to QuickBooks"}), 400
+    period_id = _activate_current_period_if_stale()
+    if not period_id:
+        return jsonify({"ok": False, "error": "Could not activate a current period"}), 500
+    accounts_result = sync_qb_accounts(period_id)
+    active = q1("SELECT id, parent_id, fiscal_year FROM periods WHERE id=?", (period_id,))
+    targets = [active["id"]]
+    if active["parent_id"]:
+        targets.append(active["parent_id"])
+    year_row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=?",
+                  (active["fiscal_year"],))
+    if year_row:
+        targets.append(year_row["id"])
+    report_results = {}
+    for pid in targets:
+        for rtype in ("pl", "bs", "cf"):
+            report_results[f"{pid}:{rtype}"] = sync_qb_report(pid, rtype)
+    return jsonify({
+        "ok": True,
+        "period_id": period_id,
+        "accounts": accounts_result,
+        "reports": report_results,
+    })
 
 # ── QuickBooks Report Sync (P&L, Balance Sheet) ───────────────────────────────
 
