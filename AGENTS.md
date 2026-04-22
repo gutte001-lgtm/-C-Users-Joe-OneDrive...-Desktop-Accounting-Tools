@@ -329,7 +329,8 @@ hardening port, the state of the repo is:
 ### Remaining unmerged branches
 
 - **`claude/fix-quickbooks-sync-PPv7R`** — in-flight at time of writing.
-  Adds historical sweep: `sync_qb_recons_from_bs(period_id)` derives
+  Two stacked features on one branch:
+  (a) Historical sweep: `sync_qb_recons_from_bs(period_id)` derives
   per-period reconciliations from each period's cached Balance Sheet
   (correct historical ending balances, unlike the current-balance stamp
   from `sync_qb_accounts`); `sync_history_range(start, end)` iterates
@@ -337,9 +338,27 @@ hardening port, the state of the repo is:
   P&L/BS/CF + derives recons; new `/api/qb/sync_history` endpoint and
   `/api/qb/bootstrap` now sweeps 2024-01-01 → today by default
   (`skip_history: true` to opt out). Frontend: Reconciliations tab
-  gained a period dropdown + "↻ Sync This Period" button (local state,
-  doesn't mutate the globally-active period); Reports gained a "⇣ Sync
-  History" button and a real error string instead of `JSON.stringify(results)`.
+  gained a period dropdown + "↻ Sync This Period" button; Reports
+  gained a "⇣ Sync History" button and a real error string instead of
+  `JSON.stringify(results)`.
+  (b) Close-period workflow. New `periods` columns: `is_closed`,
+  `closed_at`, `closed_by` (idempotent ALTER migration in
+  `_ensure_period_close_columns()`). `_backfill_closed_once()` runs on
+  first-ever startup (when nothing has been closed yet) and marks every
+  month whose `end_date` is strictly before the most-recently-ended
+  month as closed — so Joe lands on the prior completed month (March
+  2026 today) instead of January 2022. `_activate_current_close_period()`
+  picks the earliest month with `is_closed=0` as the active close
+  period; it replaces `_activate_current_period_if_stale()` (kept as an
+  alias). New endpoints `POST /api/periods/<id>/close` and
+  `POST /api/periods/<id>/reopen`; `/close` auto-advances `is_active`
+  to the next unclosed month and returns the new active row. Frontend
+  sidebar "CLOSE PERIOD" block is now a dropdown (all months, newest
+  first) + "✓ Close This Period" button; changing the dropdown flips
+  `is_active` and refetches Dashboard / Checklist / Reconciliations
+  so the whole close workflow moves together. Reports keeps its own
+  independent period picker. Reconciliations follows the global close
+  period by default but keeps its own dropdown for historical peeking.
 - **`claude/close-tracker-tools-JVRS3`** — a *different* reports flavor
   (customer / vendor ledgers, GL detail, revenue by customer, expense
   by vendor, by-Jira-epic) plus QB deep-sync of 23 entities,

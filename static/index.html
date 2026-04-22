@@ -127,11 +127,12 @@ function CloseApp(){
     api("/api/auth/me").then(u=>setCurrentUser(u)).catch(()=>setCurrentUser({id:0,name:"Guest",initials:"?",role:"admin",color:"#4f8ef7"}));
   },[]);
 
+  const [allPeriods,setAllPeriods]=useState([]);
   const loadAll=useCallback(async()=>{
     setLoading(true);
     try{
-      const [p,u,c]=await Promise.all([api("/api/periods/active"),api("/api/users"),api("/api/categories")]);
-      setPeriod(p);setUsers(u);setCats(c);
+      const [p,u,c,ps]=await Promise.all([api("/api/periods/active"),api("/api/users"),api("/api/categories"),api("/api/periods")]);
+      setPeriod(p);setUsers(u);setCats(c);setAllPeriods(ps);
       const [t,r,d]=await Promise.all([api(`/api/tasks?period_id=${p.id}`),api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
       setTasks(t);setRecons(r);setDash(d);
     }catch(e){console.error(e);}
@@ -139,6 +140,32 @@ function CloseApp(){
   },[]);
 
   useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
+
+  async function switchClosePeriod(pid){
+    if(!pid||pid===period?.id)return;
+    try{
+      await api(`/api/periods/${pid}/activate`,{method:"POST"});
+      const [p,ps]=await Promise.all([api("/api/periods/active"),api("/api/periods")]);
+      setPeriod(p);setAllPeriods(ps);
+      const [t,r,d]=await Promise.all([api(`/api/tasks?period_id=${p.id}`),api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
+      setTasks(t);setRecons(r);setDash(d);
+    }catch(e){alert(e.message);}
+  }
+  async function closeActivePeriod(){
+    if(!period?.id)return;
+    if(!confirm(`Mark "${period.label}" as closed? The active close period will advance to the next unclosed month. (You can reopen it later.)`))return;
+    try{
+      const r=await api(`/api/periods/${period.id}/close`,{method:"POST"});
+      const next=r.active;
+      const [ps]=await Promise.all([api("/api/periods")]);
+      setAllPeriods(ps);
+      if(next){
+        setPeriod(next);
+        const [t,rr,d]=await Promise.all([api(`/api/tasks?period_id=${next.id}`),api(`/api/reconciliations?period_id=${next.id}`),api(`/api/dashboard?period_id=${next.id}`)]);
+        setTasks(t);setRecons(rr);setDash(d);
+      }
+    }catch(e){alert(e.message);}
+  }
 
   async function patchTask(id,patch){
     try{
@@ -334,16 +361,15 @@ function CloseApp(){
     const [reconErr,setReconErr]=useState(null);
 
     useEffect(()=>{
-      api("/api/periods").then(ps=>{
-        const months=ps.filter(p=>(p.period_type||"month")==="month")
-                       .sort((a,b)=>b.start_date.localeCompare(a.start_date));
-        setReconPeriods(months);
-        if(!reconPeriodId){
-          const active=months.find(p=>p.is_active)||months[0];
-          if(active)setReconPeriodId(active.id);
-        }
-      }).catch(e=>setReconErr(e.message));
-    },[]);
+      const months=allPeriods.filter(p=>(p.period_type||"month")==="month")
+                             .sort((a,b)=>b.start_date.localeCompare(a.start_date));
+      setReconPeriods(months);
+    },[allPeriods]);
+
+    // Follow the global close period by default; user can still override.
+    useEffect(()=>{
+      if(period?.id&&reconPeriodId!==period.id)setReconPeriodId(period.id);
+    },[period?.id]);
 
     useEffect(()=>{
       if(!reconPeriodId)return;
@@ -1100,10 +1126,22 @@ function CloseApp(){
         <div style={{fontSize:11,color:"#475569",marginTop:4}}>{period?.label||"Loading…"}</div>
       </div>
       <div style={{margin:"0 12px 8px",padding:"8px 12px",background:"#1a2535",border:"1px solid #1e2d3d",borderRadius:8}}>
-        <div style={{fontSize:10,color:"#475569",marginBottom:2,fontFamily:"'DM Mono',monospace"}}>CLOSE PERIOD</div>
-        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>{period?.label}</div>
+        <div style={{fontSize:10,color:"#475569",marginBottom:4,fontFamily:"'DM Mono',monospace",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span>CLOSE PERIOD</span>
+          {period&&(period.is_closed?<span style={{color:"#4fd9a0"}}>✓ CLOSED</span>:<span style={{color:"#f7c948"}}>OPEN</span>)}
+        </div>
+        {isAdmin?
+          <select value={period?.id||""} onChange={e=>switchClosePeriod(parseInt(e.target.value))}
+            style={{width:"100%",padding:"4px 6px",background:"#0f172a",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:6,fontSize:12.5,fontWeight:600,fontFamily:"'DM Sans',sans-serif",outline:"none",cursor:"pointer"}}>
+            {allPeriods.filter(p=>(p.period_type||"month")==="month")
+              .sort((a,b)=>b.start_date.localeCompare(a.start_date))
+              .map(p=><option key={p.id} value={p.id}>{p.label}{p.is_closed?" ✓":""}{p.is_active?" ●":""}</option>)}
+          </select>
+          :<div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>{period?.label}</div>}
         <div style={{marginTop:6,height:3,background:"#1e2d3d",borderRadius:2}}><div style={{height:"100%",width:(dash?.close_pct||0)+"%",background:"#4f8ef7",borderRadius:2}}/></div>
         <div style={{fontSize:10,color:"#4f8ef7",marginTop:3}}>{dash?.close_pct||0}% complete</div>
+        {isAdmin&&period&&!period.is_closed&&<button onClick={closeActivePeriod} title="Mark this period closed and advance to the next unclosed month"
+          style={{marginTop:8,width:"100%",padding:"5px 8px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:6,fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>✓ Close This Period</button>}
       </div>
       {navItems.map(n=><button key={n.id} style={S.navBtn(tab===n.id)} onClick={()=>setTab(n.id)}><span style={{fontSize:15}}>{n.icon}</span>{n.label}</button>)}
       <div style={{marginTop:"auto",padding:"16px 20px",borderTop:"1px solid #1e2d3d"}}>

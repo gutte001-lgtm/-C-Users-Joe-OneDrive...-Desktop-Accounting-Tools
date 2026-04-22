@@ -438,29 +438,65 @@ def sync_qb_accounts(period_id):
     db.commit()
     return {"ok": True, "created": created, "updated": updated, "total": len(bs_accounts)}
 
-def _activate_current_period_if_stale(max_stale_days=60):
-    """If there's no active period, or the active period ended more than
-    max_stale_days ago, activate the 4-4-5 month that contains today. Returns
-    the active period id (or None if nothing could be activated)."""
+def _ensure_period_close_columns():
+    """Idempotent: add is_closed / closed_at / closed_by columns to `periods`
+    if they're missing. Safe to call repeatedly."""
+    db = get_db()
+    cols = {r[1] for r in db.execute("PRAGMA table_info(periods)").fetchall()}
+    for col, ddl in [
+        ("is_closed", "ALTER TABLE periods ADD COLUMN is_closed INTEGER NOT NULL DEFAULT 0"),
+        ("closed_at", "ALTER TABLE periods ADD COLUMN closed_at DATETIME"),
+        ("closed_by", "ALTER TABLE periods ADD COLUMN closed_by INTEGER REFERENCES users(id)"),
+    ]:
+        if col not in cols:
+            db.execute(ddl)
+    db.commit()
+
+def _backfill_closed_once():
+    """On first-ever run (no period has been marked closed yet), mark every
+    month period that ENDED BEFORE the most-recently-ended month as closed.
+    Result: the earliest unclosed month is the most recently completed month.
+    Joe's expected starting point — 'April 2026 today → start on March 2026'."""
+    _ensure_period_close_columns()
+    if q1("SELECT 1 FROM periods WHERE is_closed=1 LIMIT 1"):
+        return  # user has already closed something; don't touch history
+    today_iso = date.today().isoformat()
+    latest_ended = q1("""SELECT end_date FROM periods
+                         WHERE period_type='month' AND end_date < ?
+                         ORDER BY end_date DESC LIMIT 1""", (today_iso,))
+    if not latest_ended:
+        return
+    run("""UPDATE periods SET is_closed=1, closed_at=CURRENT_TIMESTAMP
+           WHERE period_type='month' AND end_date < ?""", (latest_ended["end_date"],))
+
+def _next_open_month():
+    """The earliest month period with is_closed=0, globally. That's the close
+    period the app should default to: 'whichever period has not been closed'.
+    Returns a full row or None."""
+    return q1("""SELECT * FROM periods
+                 WHERE period_type='month' AND is_closed=0
+                 ORDER BY start_date ASC LIMIT 1""")
+
+def _activate_current_close_period():
+    """Make the 'next open month' the active close period. Safe to call
+    repeatedly; no-op if the active period is already the next-open-month.
+    Returns the active period id (or None if no months exist)."""
     _ensure_fiscal_calendar()
-    today = date.today()
-    today_iso = today.isoformat()
-    active = q1("SELECT id, end_date FROM periods WHERE is_active=1")
-    if active:
-        try:
-            end = date.fromisoformat(active["end_date"])
-            if (today - end).days <= max_stale_days:
-                return active["id"]
-        except (TypeError, ValueError):
-            pass
-    cur = q1("""SELECT id FROM periods WHERE period_type='month'
-                AND start_date <= ? AND end_date >= ?
-                ORDER BY start_date DESC LIMIT 1""", (today_iso, today_iso))
-    if not cur:
+    _ensure_period_close_columns()
+    _backfill_closed_once()
+    target = _next_open_month()
+    if not target:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
         return active["id"] if active else None
+    current = q1("SELECT id FROM periods WHERE is_active=1")
+    if current and current["id"] == target["id"]:
+        return target["id"]
     run("UPDATE periods SET is_active=0")
-    run("UPDATE periods SET is_active=1 WHERE id=?", (cur["id"],))
-    return cur["id"]
+    run("UPDATE periods SET is_active=1 WHERE id=?", (target["id"],))
+    return target["id"]
+
+# Back-compat alias — older call sites still reference the old name.
+_activate_current_period_if_stale = _activate_current_close_period
 
 def sync_qb_balances():
     with app.app_context():
@@ -1409,6 +1445,9 @@ try:
     _init_db()
     with app.app_context():
         _ensure_fiscal_calendar()
+        _ensure_period_close_columns()
+        _backfill_closed_once()
+        _activate_current_close_period()
 except Exception:
     traceback.print_exc()
 
@@ -1453,6 +1492,51 @@ def activate_period(pid):
     run("UPDATE periods SET is_active=0")
     run("UPDATE periods SET is_active=1 WHERE id=?", (pid,))
     return jsonify({"activated": pid})
+
+@app.route("/api/periods/<int:pid>/close", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def close_period(pid):
+    """Mark a period as closed and auto-advance `is_active` to the next
+    unclosed month. Response includes the newly-active period so the
+    frontend can jump to it without a second round-trip."""
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_period_close_columns()
+    row = q1("SELECT id, label FROM periods WHERE id=?", (pid,))
+    if not row:
+        return err("Period not found", 404)
+    u = get_current_user()
+    uid = u["id"] if u else None
+    run("UPDATE periods SET is_closed=1, closed_at=CURRENT_TIMESTAMP, closed_by=? WHERE id=?", (uid, pid))
+    new_active_id = _activate_current_close_period()
+    new_active = q1("SELECT * FROM periods WHERE id=?", (new_active_id,)) if new_active_id else None
+    return jsonify({
+        "closed": pid,
+        "closed_label": row["label"],
+        "active": dict(new_active) if new_active else None,
+    })
+
+@app.route("/api/periods/<int:pid>/reopen", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def reopen_period(pid):
+    """Undo a close. If the reopened period is earlier than the currently
+    active one, it becomes active again (it's now the earliest unclosed)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_period_close_columns()
+    row = q1("SELECT id, label FROM periods WHERE id=?", (pid,))
+    if not row:
+        return err("Period not found", 404)
+    run("UPDATE periods SET is_closed=0, closed_at=NULL, closed_by=NULL WHERE id=?", (pid,))
+    new_active_id = _activate_current_close_period()
+    new_active = q1("SELECT * FROM periods WHERE id=?", (new_active_id,)) if new_active_id else None
+    return jsonify({
+        "reopened": pid,
+        "reopened_label": row["label"],
+        "active": dict(new_active) if new_active else None,
+    })
 
 # ── Users ─────────────────────────────────────────────────────────────────────
 
