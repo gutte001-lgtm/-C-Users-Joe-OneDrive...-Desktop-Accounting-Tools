@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# App data
+closeapp.db
+closeapp.db-journal
+closeapp.db-wal
+closeapp.db-shm
+.env
+.env.local
