@@ -379,28 +379,95 @@ def qb_status():
         "token_expires_in": max(0, int(tokens.get("expires_at", 0) - datetime.now(timezone.utc).timestamp()))
     })
 
+def sync_qb_accounts(period_id):
+    """Pull QB's chart of accounts, cache it, and make sure there's a
+    reconciliation row for every Asset/Liability/Equity account in the given
+    period. Updates qb_balance on existing rows too. Idempotent: matches
+    existing rows by AcctNum → Name → falls back to creating with QB Id as
+    account_number."""
+    _ensure_report_tables()
+    data, error = qb_get("/query?query=SELECT%20*%20FROM%20Account%20MAXRESULTS%201000")
+    if error:
+        return {"ok": False, "error": error}
+    accounts = data.get("QueryResponse", {}).get("Account", []) or []
+    db = get_db()
+    for a in accounts:
+        db.execute("""INSERT INTO qb_accounts (id, name, acct_num, account_type, classification, synced_at)
+                      VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                      ON CONFLICT(id) DO UPDATE SET
+                        name=excluded.name, acct_num=excluded.acct_num,
+                        account_type=excluded.account_type, classification=excluded.classification,
+                        synced_at=CURRENT_TIMESTAMP""",
+                   (str(a.get("Id", "")), a.get("Name", ""), (a.get("AcctNum") or "").strip(),
+                    a.get("AccountType", ""), a.get("Classification", "")))
+
+    bs_accounts = [a for a in accounts if a.get("Classification") in ("Asset", "Liability", "Equity")]
+    existing = q("SELECT id, account_number, account_name FROM reconciliations WHERE period_id=?", (period_id,))
+    by_num  = {r["account_number"]: r["id"] for r in existing if (r["account_number"] or "").strip()}
+    by_name = {r["account_name"].strip().lower(): r["id"] for r in existing if r["account_name"]}
+
+    admin = q1("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1") \
+            or q1("SELECT id FROM users ORDER BY id LIMIT 1")
+    assignee_id = admin["id"] if admin else DEFAULT_USER_ID
+
+    created = updated = 0
+    for a in bs_accounts:
+        acct_num = (a.get("AcctNum") or "").strip()
+        name = (a.get("Name") or "").strip()
+        if not name:
+            continue
+        try:
+            bal = float(a.get("CurrentBalance") or 0)
+        except (TypeError, ValueError):
+            bal = 0.0
+        rid = None
+        if acct_num and acct_num in by_num:
+            rid = by_num[acct_num]
+        elif name.lower() in by_name:
+            rid = by_name[name.lower()]
+        if rid:
+            db.execute("UPDATE reconciliations SET qb_balance=?, last_synced_at=CURRENT_TIMESTAMP WHERE id=?", (bal, rid))
+            updated += 1
+        else:
+            db.execute("""INSERT INTO reconciliations
+                          (period_id, account_number, account_name, assignee_id,
+                           qb_balance, expected_balance, status, last_synced_at)
+                          VALUES (?,?,?,?,?,NULL,'open',CURRENT_TIMESTAMP)""",
+                       (period_id, acct_num or f"QB{a.get('Id','')}", name, assignee_id, bal))
+            created += 1
+    db.commit()
+    return {"ok": True, "created": created, "updated": updated, "total": len(bs_accounts)}
+
+def _activate_current_period_if_stale(max_stale_days=60):
+    """If there's no active period, or the active period ended more than
+    max_stale_days ago, activate the 4-4-5 month that contains today. Returns
+    the active period id (or None if nothing could be activated)."""
+    _ensure_fiscal_calendar()
+    today = date.today()
+    today_iso = today.isoformat()
+    active = q1("SELECT id, end_date FROM periods WHERE is_active=1")
+    if active:
+        try:
+            end = date.fromisoformat(active["end_date"])
+            if (today - end).days <= max_stale_days:
+                return active["id"]
+        except (TypeError, ValueError):
+            pass
+    cur = q1("""SELECT id FROM periods WHERE period_type='month'
+                AND start_date <= ? AND end_date >= ?
+                ORDER BY start_date DESC LIMIT 1""", (today_iso, today_iso))
+    if not cur:
+        return active["id"] if active else None
+    run("UPDATE periods SET is_active=0")
+    run("UPDATE periods SET is_active=1 WHERE id=?", (cur["id"],))
+    return cur["id"]
+
 def sync_qb_balances():
     with app.app_context():
-        data, error = qb_get("/query?query=SELECT%20*%20FROM%20Account%20MAXRESULTS%201000")
-        if error:
-            return {"synced": 0, "error": error}
-        bal_map = {
-            a.get("AcctNum", "").strip(): float(a["CurrentBalance"])
-            for a in data.get("QueryResponse", {}).get("Account", [])
-            if a.get("AcctNum") and a.get("CurrentBalance") is not None
-        }
-        db = get_db()
-        updated = 0
         period = q1("SELECT id FROM periods WHERE is_active=1")
         if not period:
-            return {"synced": 0, "error": "No active period"}
-        for r in q("SELECT id, account_number FROM reconciliations WHERE period_id=?", (period["id"],)):
-            bal = bal_map.get(r["account_number"])
-            if bal is not None:
-                db.execute("UPDATE reconciliations SET qb_balance=?, last_synced_at=CURRENT_TIMESTAMP WHERE id=?", (bal, r["id"]))
-                updated += 1
-        db.commit()
-        return {"synced": updated}
+            return {"ok": False, "error": "No active period"}
+        return sync_qb_accounts(period["id"])
 
 @app.route("/api/qb/sync", methods=["POST", "OPTIONS"])
 @login_required
@@ -409,6 +476,40 @@ def manual_sync():
     if request.method == "OPTIONS":
         return "", 204
     return jsonify(sync_qb_balances())
+
+@app.route("/api/qb/bootstrap", methods=["POST", "OPTIONS"])
+@login_required
+@csrf_protect
+def qb_bootstrap():
+    """One-click 'set this up from my real QuickBooks': activate the current
+    4-4-5 month, seed reconciliations from QB's chart of accounts, and pull
+    P&L/BS/CF for current month, its quarter, and its year."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not get_tokens():
+        return jsonify({"ok": False, "error": "Not connected to QuickBooks"}), 400
+    period_id = _activate_current_period_if_stale()
+    if not period_id:
+        return jsonify({"ok": False, "error": "Could not activate a current period"}), 500
+    accounts_result = sync_qb_accounts(period_id)
+    active = q1("SELECT id, parent_id, fiscal_year FROM periods WHERE id=?", (period_id,))
+    targets = [active["id"]]
+    if active["parent_id"]:
+        targets.append(active["parent_id"])
+    year_row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=?",
+                  (active["fiscal_year"],))
+    if year_row:
+        targets.append(year_row["id"])
+    report_results = {}
+    for pid in targets:
+        for rtype in ("pl", "bs", "cf"):
+            report_results[f"{pid}:{rtype}"] = sync_qb_report(pid, rtype)
+    return jsonify({
+        "ok": True,
+        "period_id": period_id,
+        "accounts": accounts_result,
+        "reports": report_results,
+    })
 
 # ── QuickBooks Report Sync (P&L, Balance Sheet) ───────────────────────────────
 

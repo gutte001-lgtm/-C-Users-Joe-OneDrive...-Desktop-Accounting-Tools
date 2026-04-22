@@ -154,10 +154,35 @@ function CloseApp(){
     catch(e){alert(e.message);}
   }
 
+  const [syncMsg,setSyncMsg]=useState(null);
   async function syncQB(){
-    setSyncing(true);
-    try{await api("/api/qb/sync",{method:"POST"});const r=await api(`/api/reconciliations?period_id=${period?.id}`);setRecons(r);}
-    catch(e){console.error(e);}
+    setSyncing(true);setSyncMsg(null);
+    try{
+      const res=await api("/api/qb/sync",{method:"POST"});
+      const r=await api(`/api/reconciliations?period_id=${period?.id}`);setRecons(r);
+      if(res.ok===false)setSyncMsg({kind:"error",text:res.error||"Sync failed"});
+      else setSyncMsg({kind:"ok",text:`Synced ${res.total||0} balance-sheet accounts · ${res.created||0} created, ${res.updated||0} updated`});
+    }
+    catch(e){setSyncMsg({kind:"error",text:e.message});}
+    setSyncing(false);
+  }
+  async function bootstrapQB(){
+    if(!confirm("This will activate the current month, pull your QuickBooks chart of accounts, create reconciliation rows for every balance-sheet account, and sync P&L / BS / CF. Continue?"))return;
+    setSyncing(true);setSyncMsg(null);
+    try{
+      const res=await api("/api/qb/bootstrap",{method:"POST"});
+      if(!res.ok){setSyncMsg({kind:"error",text:res.error||"Bootstrap failed"});}
+      else{
+        const a=res.accounts||{};
+        setSyncMsg({kind:"ok",text:`Ready. ${a.created||0} new accounts, ${a.updated||0} existing updated, P&L/BS/CF synced.`});
+      }
+      const p=await api("/api/periods/active").catch(()=>null);
+      if(p)setPeriod(p);
+      if(p?.id){
+        const [r,d]=await Promise.all([api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
+        setRecons(r);setDash(d);
+      }
+    }catch(e){setSyncMsg({kind:"error",text:e.message});}
     setSyncing(false);
   }
 
@@ -304,14 +329,26 @@ function CloseApp(){
   // ── Reconciliations ─────────────────────────────────────────────────────────
   function Reconciliations(){
     if(loading)return <Spinner/>;
+    const stale=period?.end_date&&((new Date()-new Date(period.end_date+"T00:00:00"))/86400000>60);
     return(<div style={S.card}>
-      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+      {stale&&<div style={{padding:"10px 14px",marginBottom:14,borderRadius:8,background:"#f59e0b18",border:"1px solid #f59e0b40",color:"#f59e0b",fontSize:12.5,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <span>⚠ Active period "{period?.label}" ended more than 60 days ago. Click <b>Initialize from QuickBooks</b> to activate the current month and pull fresh data.</span>
+        {isAdmin&&<button onClick={bootstrapQB} disabled={syncing} style={{marginLeft:"auto",padding:"6px 12px",background:"#f59e0b",border:"none",color:"#0d1117",borderRadius:6,fontSize:12,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"Initialize from QB"}</button>}
+      </div>}
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,gap:10,flexWrap:"wrap"}}>
         <div>
           <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Account Reconciliations</div>
-          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Synced from QuickBooks Online</div>
+          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Synced from QuickBooks Online · {period?.label||"—"}</div>
         </div>
-        {isAdmin&&<button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>}
+        {isAdmin&&<div style={{display:"flex",gap:8}}>
+          {recons.length===0&&qbStatus?.connected&&<button onClick={bootstrapQB} disabled={syncing} style={{padding:"6px 14px",background:"#2CA01C",border:"none",color:"#fff",borderRadius:8,fontSize:12,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"⇣ Initialize from QuickBooks"}</button>}
+          <button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>
+        </div>}
       </div>
+      {syncMsg&&<div style={{marginBottom:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:syncMsg.kind==="ok"?"#4fd9a018":"#f8717118",border:`1px solid ${syncMsg.kind==="ok"?"#4fd9a040":"#f8717140"}`,color:syncMsg.kind==="ok"?"#4fd9a0":"#f87171"}}>{syncMsg.text}</div>}
+      {recons.length===0&&<div style={{padding:30,textAlign:"center",color:"#64748b",fontSize:13,fontFamily:"'DM Mono',monospace"}}>
+        {qbStatus?.connected?"No reconciliation rows yet. Click Initialize from QuickBooks above.":"Connect QuickBooks in Settings, then Initialize."}
+      </div>}
       <table style={{width:"100%",borderCollapse:"collapse"}}>
         <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
         <tbody>{recons.map(r=>{
@@ -653,7 +690,14 @@ function CloseApp(){
             {qbStatus?.connected?"Reconnect QuickBooks":"Connect QuickBooks"}
           </a>
         </div>
-        {qbStatus?.connected&&<button onClick={syncQB} disabled={syncing} style={{padding:"7px 16px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync Balances Now"}</button>}
+        {qbStatus?.connected&&<div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+          <button onClick={bootstrapQB} disabled={syncing} style={{padding:"8px 18px",background:"#2CA01C",border:"none",color:"#fff",borderRadius:8,fontSize:13,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"⇣ Initialize from QuickBooks"}</button>
+          <button onClick={syncQB} disabled={syncing} style={{padding:"7px 16px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync Balances Now"}</button>
+          <div style={{fontSize:11.5,color:"#64748b",flex:"1 1 100%",marginTop:6}}>
+            <b>Initialize</b> activates the current month, creates a reconciliation row for every Asset / Liability / Equity account in your QB, and pulls P&amp;L, Balance Sheet, and Cash Flow. Safe to re-run.
+          </div>
+        </div>}
+        {syncMsg&&<div style={{marginTop:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:syncMsg.kind==="ok"?"#4fd9a018":"#f8717118",border:`1px solid ${syncMsg.kind==="ok"?"#4fd9a040":"#f8717140"}`,color:syncMsg.kind==="ok"?"#4fd9a0":"#f87171"}}>{syncMsg.text}</div>}
       </div>}
 
       {settingsTab==="groups"&&<div style={S.card}>
