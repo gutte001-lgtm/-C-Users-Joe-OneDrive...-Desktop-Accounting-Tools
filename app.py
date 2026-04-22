@@ -9,14 +9,16 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 load_dotenv()
 
-# Patch Flask session save to drop 'partitioned' kwarg unsupported by this Werkzeug build.
-import flask.sessions as _fs
-_orig_save = _fs.SecureCookieSessionInterface.save_session
-def _patched_save(self, app, session, response):
-    _orig_sc = response.set_cookie
-    response.set_cookie = lambda *a, **kw: _orig_sc(*a, **{k:v for k,v in kw.items() if k!="partitioned"})
-    return _orig_save(self, app, session, response)
-_fs.SecureCookieSessionInterface.save_session = _patched_save
+# Patch Werkzeug Response.set_cookie to drop 'partitioned' kwarg if this build doesn't support it.
+# Needed when Flask>=3.1 is paired with an older Werkzeug that lacks the partitioned parameter.
+import inspect as _inspect
+from werkzeug.wrappers import Response as _WResponse
+if 'partitioned' not in _inspect.signature(_WResponse.set_cookie).parameters:
+    _orig_set_cookie = _WResponse.set_cookie
+    def _patched_set_cookie(self, *args, **kwargs):
+        kwargs.pop('partitioned', None)
+        return _orig_set_cookie(self, *args, **kwargs)
+    _WResponse.set_cookie = _patched_set_cookie
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(BASE_DIR, "closeapp.db")
