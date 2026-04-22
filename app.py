@@ -216,6 +216,36 @@ def _ensure_qb_tokens_table():
         db.execute("ALTER TABLE qb_tokens ADD COLUMN realm_id TEXT")
     db.commit()
 
+# OAuth state is also persisted here so the callback can validate even if the
+# session cookie didn't survive the Intuit round-trip (e.g. user hit the app
+# on localhost but the redirect_uri is 127.0.0.1, or Edge stripped SameSite=Lax
+# on some flows). Rows expire after _QB_STATE_TTL seconds.
+_QB_STATE_TTL = 900  # 15 minutes
+
+def _ensure_qb_oauth_states_table():
+    db = get_db()
+    db.execute("CREATE TABLE IF NOT EXISTS qb_oauth_states (state TEXT PRIMARY KEY, created_at REAL)")
+    db.commit()
+
+def _save_oauth_state(state):
+    _ensure_qb_oauth_states_table()
+    db = get_db()
+    now = datetime.now(timezone.utc).timestamp()
+    db.execute("DELETE FROM qb_oauth_states WHERE created_at < ?", (now - _QB_STATE_TTL,))
+    db.execute("INSERT OR REPLACE INTO qb_oauth_states (state, created_at) VALUES (?, ?)", (state, now))
+    db.commit()
+
+def _consume_oauth_state(state):
+    _ensure_qb_oauth_states_table()
+    db = get_db()
+    now = datetime.now(timezone.utc).timestamp()
+    row = db.execute("SELECT created_at FROM qb_oauth_states WHERE state=?", (state,)).fetchone()
+    db.execute("DELETE FROM qb_oauth_states WHERE state=?", (state,))
+    db.commit()
+    if not row:
+        return False
+    return (now - row["created_at"]) <= _QB_STATE_TTL
+
 def get_tokens():
     _ensure_qb_tokens_table()
     row = q1("SELECT access_token, refresh_token, expires_at, realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
@@ -276,11 +306,18 @@ def qb_get(path):
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}: {resp.text[:200]}")
 
+def _qb_error(reason):
+    print(f"[qb] connect failed: {reason}", flush=True)
+    return redirect("/?qb=error&reason=" + urllib.parse.quote(reason, safe=""))
+
 @app.route("/api/qb/connect")
 @login_required
 def qb_connect():
+    if not QB_CLIENT_ID or not QB_CLIENT_SECRET:
+        return _qb_error("missing_credentials")
     state = secrets.token_urlsafe(16)
     session["qb_state"] = state
+    _save_oauth_state(state)
     params = {
         "client_id": QB_CLIENT_ID,
         "scope": "com.intuit.quickbooks.accounting",
@@ -295,17 +332,37 @@ def qb_callback():
     code = request.args.get("code")
     realm = request.args.get("realmId")
     state = request.args.get("state")
+    qb_err = request.args.get("error")
+    if qb_err:
+        return _qb_error(f"intuit_{qb_err}")
     if not code:
-        return redirect("/?qb=error")
-    if state and state != session.get("qb_state"):
-        return redirect("/?qb=error")
-    resp = requests.post(QB_TOKEN_URL,
-        data={"grant_type": "authorization_code", "code": code, "redirect_uri": QB_REDIRECT_URI},
-        auth=(QB_CLIENT_ID, QB_CLIENT_SECRET))
+        return _qb_error("missing_code")
+    if not state:
+        return _qb_error("missing_state")
+    session_state = session.get("qb_state")
+    state_ok = (state == session_state) or _consume_oauth_state(state)
+    if not state_ok:
+        return _qb_error("state_mismatch")
+    if not QB_CLIENT_ID or not QB_CLIENT_SECRET:
+        return _qb_error("missing_credentials")
+    try:
+        resp = requests.post(QB_TOKEN_URL,
+            data={"grant_type": "authorization_code", "code": code, "redirect_uri": QB_REDIRECT_URI},
+            auth=(QB_CLIENT_ID, QB_CLIENT_SECRET),
+            headers={"Accept": "application/json"},
+            timeout=15)
+    except requests.RequestException as e:
+        return _qb_error(f"network:{type(e).__name__}")
     if not resp.ok:
-        return redirect("/?qb=error")
-    d = resp.json()
-    save_tokens(d["access_token"], d["refresh_token"], d["expires_in"], realm_id=realm)
+        print(f"[qb] token exchange {resp.status_code}: {resp.text[:300]}", flush=True)
+        return _qb_error(f"token_exchange_{resp.status_code}")
+    try:
+        d = resp.json()
+    except ValueError:
+        return _qb_error("token_response_not_json")
+    if not d.get("access_token") or not d.get("refresh_token"):
+        return _qb_error("token_response_incomplete")
+    save_tokens(d["access_token"], d["refresh_token"], d.get("expires_in", 3600), realm_id=realm)
     session.pop("qb_state", None)
     return redirect("/?qb=connected")
 

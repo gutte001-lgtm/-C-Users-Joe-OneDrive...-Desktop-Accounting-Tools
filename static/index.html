@@ -101,10 +101,25 @@ function CloseApp(){
   const [loading,setLoading]=useState(true);
   const [qbToast,setQbToast]=useState(()=>{
     const p=new URLSearchParams(window.location.search);
-    if(p.get("qb")==="connected"){window.history.replaceState({},"","/");return "connected";}
-    if(p.get("qb")==="error"){window.history.replaceState({},"","/");return "error";}
+    if(p.get("qb")==="connected"){window.history.replaceState({},"","/");return {kind:"connected"};}
+    if(p.get("qb")==="error"){const reason=p.get("reason")||"";window.history.replaceState({},"","/");return {kind:"error",reason};}
     return null;
   });
+  const qbErrorMessage=(reason)=>{
+    const map={
+      missing_credentials:"QB_CLIENT_ID / QB_CLIENT_SECRET are not set in .env.",
+      missing_code:"Intuit didn't return an authorization code.",
+      missing_state:"Intuit didn't return the state parameter.",
+      state_mismatch:"State mismatch — the auth flow was interrupted. Try again.",
+      token_response_not_json:"Intuit returned a non-JSON response at token exchange.",
+      token_response_incomplete:"Intuit's token response was missing access/refresh token.",
+    };
+    if(map[reason])return map[reason];
+    if(reason&&reason.startsWith("token_exchange_"))return `Intuit rejected the token exchange (HTTP ${reason.slice("token_exchange_".length)}). Check QB_CLIENT_SECRET and that QB_REDIRECT_URI matches your Intuit app settings.`;
+    if(reason&&reason.startsWith("intuit_"))return `Intuit returned an error: ${reason.slice("intuit_".length)}.`;
+    if(reason&&reason.startsWith("network:"))return `Network error contacting Intuit (${reason.slice("network:".length)}).`;
+    return "QuickBooks connection failed. Try again.";
+  };
 
   const isAdmin=currentUser?.role==="admin";
 
@@ -970,8 +985,8 @@ function CloseApp(){
   ];
 
   return(<div style={S.app}>
-    {qbToast&&<div style={{position:"fixed",top:20,right:20,zIndex:999,padding:"12px 20px",borderRadius:10,fontSize:13,fontWeight:600,background:qbToast==="connected"?"#4fd9a018":"#f8717118",border:`1px solid ${qbToast==="connected"?"#4fd9a040":"#f8717140"}`,color:qbToast==="connected"?"#4fd9a0":"#f87171"}}>
-      {qbToast==="connected"?"✓ QuickBooks connected successfully!":"✗ QuickBooks connection failed. Try again."}
+    {qbToast&&<div style={{position:"fixed",top:20,right:20,zIndex:999,padding:"12px 20px",borderRadius:10,fontSize:13,fontWeight:600,background:qbToast.kind==="connected"?"#4fd9a018":"#f8717118",border:`1px solid ${qbToast.kind==="connected"?"#4fd9a040":"#f8717140"}`,color:qbToast.kind==="connected"?"#4fd9a0":"#f87171",maxWidth:420,lineHeight:1.4}}>
+      {qbToast.kind==="connected"?"✓ QuickBooks connected successfully!":<span>✗ {qbErrorMessage(qbToast.reason)}{qbToast.reason&&<span style={{display:"block",fontWeight:400,fontSize:11,opacity:0.7,marginTop:3,fontFamily:"'DM Mono',monospace"}}>reason: {qbToast.reason}</span>}</span>}
       <button onClick={()=>setQbToast(null)} style={{marginLeft:12,background:"none",border:"none",color:"inherit",cursor:"pointer",fontSize:16}}>×</button>
     </div>}
     <div style={S.sidebar}>
