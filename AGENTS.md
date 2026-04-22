@@ -309,7 +309,21 @@ hardening port, the state of the repo is:
   fiscal calendar with MTD/QTD/YTD, QB OAuth connect, login removal,
   CRUD route normalization, fresh-DB report fix, Privacy/EULA
   templates, `Start CloseTool.bat` launcher) **plus** the security
-  hardening ported from `claude/review-close-tool-dG5XJ` (see §4c).
+  hardening ported from `claude/review-close-tool-dG5XJ` (see §4c)
+  **plus** the QuickBooks bootstrap + connect-diagnostics merge from
+  `claude/fix-quickbooks-connection-Jhw21` (2026-04-22):
+  `_activate_current_period_if_stale()` auto-advances `is_active` to
+  today's 4-4-5 month when the active period ended >60 days ago;
+  `sync_qb_accounts(period_id)` upserts a reconciliation row per BS
+  account from the real QB chart of accounts; `/api/qb/sync` returns
+  `{created, updated, total}`; new `/api/qb/bootstrap` one-click
+  (activate month + seed recons + pull P&L/BS/CF for month/quarter/
+  year); Settings → QuickBooks "Initialize from QuickBooks" button;
+  stale-period banner on Reconciliations; OAuth callback returns a
+  specific `reason` code per failure branch and persists state in
+  `qb_oauth_states` so it survives `localhost` vs `127.0.0.1` cookie
+  drops; `/api/qb/connect` fails fast when `QB_CLIENT_ID`/`SECRET`
+  aren't set.
   This is the baseline every new branch must start from.
 
 ### Remaining unmerged branches
@@ -338,6 +352,8 @@ hardening port, the state of the repo is:
 - `claude/fix-login-screen-removal-2EuuX`,
   `claude/remove-login-screen-Rc77n` — obsolete (login already removed
   on `master`).
+- `claude/fix-quickbooks-connection-Jhw21` — landed on `master` via
+  `--no-ff` merge (QB bootstrap + connect-diagnostics).
 
 When in doubt, ask Joe before merging or deleting any of the
 unmerged-but-still-present branches above.
