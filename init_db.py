@@ -17,10 +17,11 @@ CREATE TABLE IF NOT EXISTS users (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL,
     initials    TEXT    NOT NULL,
+    username    TEXT    UNIQUE,
     email       TEXT    UNIQUE NOT NULL,
     role        TEXT    NOT NULL DEFAULT 'preparer',   -- admin | preparer | reviewer
     color       TEXT    NOT NULL DEFAULT '#4f8ef7',
-    password_hash TEXT,          -- placeholder for future Flask-Login
+    password_hash TEXT,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -33,6 +34,9 @@ CREATE TABLE IF NOT EXISTS periods (
     start_date  DATE    NOT NULL,
     end_date    DATE    NOT NULL,
     is_active   INTEGER NOT NULL DEFAULT 0,
+    status      TEXT    NOT NULL DEFAULT 'open',   -- open | closed
+    closed_at   DATETIME,
+    closed_by   INTEGER REFERENCES users(id),
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -59,6 +63,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status          TEXT NOT NULL DEFAULT 'open',        -- open | in_progress | complete
     review_status   TEXT NOT NULL DEFAULT 'pending',     -- pending | approved | needs_revision
     notes           TEXT DEFAULT '',
+    frequency       TEXT DEFAULT 'Monthly',              -- Monthly | Weekly | Daily | Quarterly | Annually | As Needed | Bi-Weekly
+    due_offset      INTEGER,                              -- days from period end (nullable)
     completed_at    DATETIME,
     approved_at     DATETIME,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -82,17 +88,44 @@ CREATE TABLE IF NOT EXISTS task_activity (
 --  Reconciliations
 -- ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS reconciliations (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    period_id        INTEGER NOT NULL REFERENCES periods(id),
-    account_number   TEXT    NOT NULL,
-    account_name     TEXT    NOT NULL,
-    assignee_id      INTEGER NOT NULL REFERENCES users(id),
-    qb_balance       REAL,
-    expected_balance REAL,
-    status           TEXT NOT NULL DEFAULT 'open',  -- open | reconciled | needs_attention
-    last_synced_at   DATETIME,
-    last_updated_at  DATETIME,
-    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_id          INTEGER NOT NULL REFERENCES periods(id),
+    account_number     TEXT    NOT NULL,
+    account_name       TEXT    NOT NULL,
+    assignee_id        INTEGER NOT NULL REFERENCES users(id),
+    qb_balance         REAL,
+    expected_balance   REAL,
+    variance_threshold REAL,                           -- abs variance above this -> needs_attention
+    notes              TEXT DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'open',   -- open | reconciled | needs_attention
+    last_synced_at     DATETIME,
+    last_updated_at    DATETIME,
+    created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ─────────────────────────────────────────
+--  Reconciliation Activity Log
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recon_activity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    recon_id    INTEGER NOT NULL REFERENCES reconciliations(id),
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    action      TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ─────────────────────────────────────────
+--  QuickBooks OAuth tokens
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS qb_tokens (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    access_token  TEXT,
+    refresh_token TEXT,
+    expires_at    REAL,
+    realm_id      TEXT,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Trigger: auto-update tasks.updated_at
@@ -102,6 +135,34 @@ BEGIN
     UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 """
+
+# Idempotent ALTER TABLE migrations for existing databases.
+# Each entry: (table, column, definition).
+MIGRATIONS = [
+    ("users",            "username",           "TEXT"),
+    ("users",            "password_hash",      "TEXT"),
+    ("periods",          "status",             "TEXT NOT NULL DEFAULT 'open'"),
+    ("periods",          "closed_at",          "DATETIME"),
+    ("periods",          "closed_by",          "INTEGER"),
+    ("tasks",            "frequency",          "TEXT DEFAULT 'Monthly'"),
+    ("tasks",            "due_offset",         "INTEGER"),
+    ("reconciliations",  "variance_threshold", "REAL"),
+    ("reconciliations",  "notes",              "TEXT DEFAULT ''"),
+    ("qb_tokens",        "realm_id",           "TEXT"),
+    ("qb_tokens",        "created_at",         "DATETIME"),
+]
+
+
+def migrate(conn):
+    cur = conn.cursor()
+    for table, col, defn in MIGRATIONS:
+        cur.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cur.fetchall()}
+        if not existing:
+            continue  # table doesn't exist yet; SCHEMA will create it fresh
+        if col not in existing:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
+    conn.commit()
 
 SEED_USERS = [
     (1, "Joe G.",    "JG", "joe@company.com",   "admin",    "#4f8ef7"),
@@ -166,6 +227,7 @@ SEED_RECONS = [
 def init():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    migrate(conn)
 
     cur = conn.cursor()
 

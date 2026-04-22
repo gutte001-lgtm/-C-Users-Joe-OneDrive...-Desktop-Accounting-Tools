@@ -235,7 +235,10 @@ TASKS = [
 
 
 def run():
+    from init_db import SCHEMA, migrate
     conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    migrate(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     cur = conn.cursor()
 
@@ -268,11 +271,18 @@ def run():
         assign_id = uid(assignee)
         review_id = uid(reviewer)
         due_date  = calc_due(PE, due_offset)
+        offset_int = None
+        try:
+            if due_offset is not None:
+                offset_int = int(float(str(due_offset)))
+        except (ValueError, TypeError):
+            offset_int = None
         cur.execute("""
             INSERT INTO tasks
-            (period_id, category_id, name, assignee_id, reviewer_id, due_date, status, review_status, notes)
-            VALUES (1, ?, ?, ?, ?, ?, 'open', 'pending', ?)
-        """, (cat_id, task_name, assign_id, review_id, due_date, f"Frequency: {frequency}"))
+            (period_id, category_id, name, assignee_id, reviewer_id, due_date,
+             status, review_status, notes, frequency, due_offset)
+            VALUES (1, ?, ?, ?, ?, ?, 'open', 'pending', '', ?, ?)
+        """, (cat_id, task_name, assign_id, review_id, due_date, frequency, offset_int))
 
     conn.commit()
     conn.close()

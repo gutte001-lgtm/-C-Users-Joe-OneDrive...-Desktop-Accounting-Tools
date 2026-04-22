@@ -1,11 +1,14 @@
-import os, sqlite3, traceback
-from datetime import datetime, timezone
+import os, secrets, sqlite3, traceback
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
-from flask import Flask, jsonify, request, g, send_from_directory, session
+from urllib.parse import urlencode
+from flask import Flask, jsonify, request, g, redirect, send_from_directory, session
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 from werkzeug.security import generate_password_hash, check_password_hash
+
+from notifications import notify
 
 load_dotenv()
 
@@ -75,6 +78,10 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def period_is_closed(period_id):
+    row = q1("SELECT status FROM periods WHERE id=?", (period_id,))
+    return bool(row and row["status"] == "closed")
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.route("/api/auth/login", methods=["GET", "POST", "OPTIONS"])
@@ -131,8 +138,9 @@ def me():
 QB_CLIENT_ID     = os.getenv("QB_CLIENT_ID", "")
 QB_CLIENT_SECRET = os.getenv("QB_CLIENT_SECRET", "")
 QB_REDIRECT_URI  = os.getenv("QB_REDIRECT_URI", "http://127.0.0.1:5000/qb/callback")
-QB_REALM_ID      = os.getenv("QB_REALM_ID", "")
 QB_ENVIRONMENT   = os.getenv("QB_ENVIRONMENT", "sandbox")
+QB_SCOPE         = os.getenv("QB_SCOPE", "com.intuit.quickbooks.accounting")
+QB_AUTH_URL      = "https://appcenter.intuit.com/connect/oauth2"
 QB_TOKEN_URL     = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QB_API_BASE      = (
     "https://sandbox-quickbooks.api.intuit.com/v3/company"
@@ -141,14 +149,15 @@ QB_API_BASE      = (
 )
 
 def get_tokens():
-    row = q1("SELECT access_token, refresh_token, expires_at FROM qb_tokens ORDER BY id DESC LIMIT 1")
+    row = q1("SELECT access_token, refresh_token, expires_at, realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
     return dict(row) if row else {}
 
-def save_tokens(at, rt, ei):
+def save_tokens(at, rt, ei, realm=None):
     ea = datetime.now(timezone.utc).timestamp() + ei
     db = get_db()
-    db.execute("CREATE TABLE IF NOT EXISTS qb_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, access_token TEXT, refresh_token TEXT, expires_at REAL)")
-    db.execute("INSERT INTO qb_tokens (access_token, refresh_token, expires_at) VALUES (?,?,?)", (at, rt, ea))
+    db.execute(
+        "INSERT INTO qb_tokens (access_token, refresh_token, expires_at, realm_id) VALUES (?,?,?,?)",
+        (at, rt, ea, realm))
     db.commit()
 
 def refresh_access_token():
@@ -160,7 +169,11 @@ def refresh_access_token():
         auth=(QB_CLIENT_ID, QB_CLIENT_SECRET))
     if resp.ok:
         d = resp.json()
-        save_tokens(d["access_token"], d.get("refresh_token", tokens["refresh_token"]), d["expires_in"])
+        save_tokens(
+            d["access_token"],
+            d.get("refresh_token", tokens["refresh_token"]),
+            d["expires_in"],
+            tokens.get("realm_id"))
         return d["access_token"]
     return None
 
@@ -168,6 +181,9 @@ def qb_get(path):
     tokens = get_tokens()
     if not tokens:
         return None, "Not connected"
+    realm = tokens.get("realm_id")
+    if not realm:
+        return None, "No realm on file"
     now = datetime.now(timezone.utc).timestamp()
     token = tokens["access_token"]
     if tokens.get("expires_at", 0) < now + 60:
@@ -175,26 +191,52 @@ def qb_get(path):
     if not token:
         return None, "Token refresh failed"
     resp = requests.get(
-        f"{QB_API_BASE}/{QB_REALM_ID}{path}",
+        f"{QB_API_BASE}/{realm}{path}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}")
 
+@app.route("/qb/connect")
+@login_required
+def qb_connect():
+    if not QB_CLIENT_ID:
+        return err("QB_CLIENT_ID not configured", 500)
+    state = secrets.token_urlsafe(24)
+    session["qb_oauth_state"] = state
+    params = {
+        "client_id":     QB_CLIENT_ID,
+        "response_type": "code",
+        "scope":         QB_SCOPE,
+        "redirect_uri":  QB_REDIRECT_URI,
+        "state":         state,
+    }
+    return redirect(f"{QB_AUTH_URL}?{urlencode(params)}")
+
 @app.route("/qb/callback")
 def qb_callback():
-    code = request.args.get("code")
+    code  = request.args.get("code")
     realm = request.args.get("realmId")
+    state = request.args.get("state")
+    expected = session.pop("qb_oauth_state", None)
     if not code:
         return err("Missing code")
+    if not expected or state != expected:
+        return err("Invalid OAuth state", 400)
     resp = requests.post(QB_TOKEN_URL,
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": QB_REDIRECT_URI},
         auth=(QB_CLIENT_ID, QB_CLIENT_SECRET))
     if not resp.ok:
         return err("Token exchange failed", 500)
     d = resp.json()
-    save_tokens(d["access_token"], d["refresh_token"], d["expires_in"])
-    if realm:
-        os.environ["QB_REALM_ID"] = realm
-    return jsonify({"status": "connected", "realm_id": realm})
+    save_tokens(d["access_token"], d["refresh_token"], d["expires_in"], realm)
+    return redirect("/?qb=connected")
+
+@app.route("/api/qb/disconnect", methods=["POST", "OPTIONS"])
+@admin_required
+def qb_disconnect():
+    if request.method == "OPTIONS":
+        return "", 204
+    run("DELETE FROM qb_tokens")
+    return jsonify({"status": "disconnected"})
 
 @app.route("/api/qb/status", methods=["GET", "OPTIONS"])
 @login_required
@@ -206,6 +248,8 @@ def qb_status():
         return jsonify({"connected": False})
     return jsonify({
         "connected": True,
+        "realm_id": tokens.get("realm_id"),
+        "environment": QB_ENVIRONMENT,
         "token_expires_in": max(0, int(tokens.get("expires_at", 0) - datetime.now(timezone.utc).timestamp()))
     })
 
@@ -238,10 +282,6 @@ def manual_sync():
     if request.method == "OPTIONS":
         return "", 204
     return jsonify(sync_qb_balances())
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
-scheduler.start()
 
 # ── Periods ───────────────────────────────────────────────────────────────────
 
@@ -282,6 +322,99 @@ def activate_period(pid):
     run("UPDATE periods SET is_active=0")
     run("UPDATE periods SET is_active=1 WHERE id=?", (pid,))
     return jsonify({"activated": pid})
+
+@app.route("/api/periods/<int:pid>/close", methods=["POST", "OPTIONS"])
+@admin_required
+def close_period(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    user = get_current_user()
+    run("UPDATE periods SET status='closed', closed_at=CURRENT_TIMESTAMP, closed_by=? WHERE id=?", (user["id"], pid))
+    return jsonify({"closed": pid})
+
+@app.route("/api/periods/<int:pid>/reopen", methods=["POST", "OPTIONS"])
+@admin_required
+def reopen_period(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    run("UPDATE periods SET status='open', closed_at=NULL, closed_by=NULL WHERE id=?", (pid,))
+    return jsonify({"reopened": pid})
+
+def _calc_due(end_date_str, offset):
+    if offset is None or end_date_str is None:
+        return None
+    try:
+        return (date.fromisoformat(end_date_str) + timedelta(days=int(offset))).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+@app.route("/api/periods/rollover", methods=["POST", "OPTIONS"])
+@admin_required
+def rollover_period():
+    """
+    Clone tasks from `source_period_id` (defaults to most recent) into a newly
+    created period. Recomputes each task's due_date from its `due_offset`
+    relative to the new period's end_date. Also clones reconciliation shells
+    (account number/name/assignee/threshold) minus balances.
+    Body: { label, start_date, end_date, source_period_id?, activate? }
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    label = b.get("label", "").strip()
+    start = b.get("start_date", "")
+    end   = b.get("end_date", "")
+    if not (label and start and end):
+        return err("label, start_date, end_date required")
+
+    src = b.get("source_period_id")
+    if src is None:
+        row = q1("SELECT id FROM periods ORDER BY start_date DESC LIMIT 1")
+        src = row["id"] if row else None
+
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO periods (label,start_date,end_date,is_active,status) VALUES (?,?,?,0,'open')",
+        (label, start, end))
+    new_id = cur.lastrowid
+
+    cloned_tasks = 0
+    cloned_recons = 0
+    if src:
+        for t in q(
+            "SELECT category_id,name,assignee_id,reviewer_id,frequency,due_offset,notes FROM tasks WHERE period_id=?",
+            (src,)):
+            due = _calc_due(end, t["due_offset"])
+            db.execute(
+                """INSERT INTO tasks
+                   (period_id,category_id,name,assignee_id,reviewer_id,due_date,frequency,due_offset,notes,status,review_status)
+                   VALUES (?,?,?,?,?,?,?,?,?, 'open','pending')""",
+                (new_id, t["category_id"], t["name"], t["assignee_id"], t["reviewer_id"],
+                 due, t["frequency"], t["due_offset"], t["notes"] or ""))
+            cloned_tasks += 1
+        for r in q(
+            "SELECT account_number,account_name,assignee_id,expected_balance,variance_threshold FROM reconciliations WHERE period_id=?",
+            (src,)):
+            db.execute(
+                """INSERT INTO reconciliations
+                   (period_id,account_number,account_name,assignee_id,expected_balance,variance_threshold,status)
+                   VALUES (?,?,?,?,?,?, 'open')""",
+                (new_id, r["account_number"], r["account_name"], r["assignee_id"],
+                 r["expected_balance"], r["variance_threshold"]))
+            cloned_recons += 1
+
+    if b.get("activate"):
+        db.execute("UPDATE periods SET is_active=0")
+        db.execute("UPDATE periods SET is_active=1 WHERE id=?", (new_id,))
+
+    db.commit()
+    return jsonify({
+        "id": new_id,
+        "label": label,
+        "cloned_tasks": cloned_tasks,
+        "cloned_recons": cloned_recons,
+        "source_period_id": src,
+    }), 201
 
 # ── Users ─────────────────────────────────────────────────────────────────────
 
@@ -425,8 +558,11 @@ def manage_task(tid):
     old = q1("SELECT * FROM tasks WHERE id=?", (tid,))
     if not old:
         return err("Task not found", 404)
+    if period_is_closed(old["period_id"]):
+        return err("Period is closed; reopen it to edit", 423)
     if user["role"] == "admin":
-        allowed = {"status", "review_status", "notes", "assignee_id", "reviewer_id", "due_date", "name", "category_id"}
+        allowed = {"status", "review_status", "notes", "assignee_id", "reviewer_id",
+                   "due_date", "name", "category_id", "frequency", "due_offset"}
     else:
         if old["assignee_id"] != user["id"] and old["reviewer_id"] != user["id"]:
             return err("You can only update your own tasks", 403)
@@ -447,10 +583,49 @@ def manage_task(tid):
     if "review_status" in updates:
         run("INSERT INTO task_activity (task_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
             (tid, actor_id, "review_change", old["review_status"], updates["review_status"]))
-    if "notes" in updates:
+    if "notes" in updates and updates["notes"] != (old["notes"] or ""):
         run("INSERT INTO task_activity (task_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
             (tid, actor_id, "note", None, updates["notes"]))
-    return jsonify(dict(q1("SELECT * FROM tasks WHERE id=?", (tid,))))
+    _notify_task_change(old, updates, user)
+    return jsonify(dict(q1(TASK_SELECT + " WHERE t.id=?", (tid,))))
+
+@app.route("/api/tasks/<int:tid>/activity", methods=["GET", "OPTIONS"])
+@login_required
+def get_task_activity(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q("""
+        SELECT a.id, a.action, a.old_value, a.new_value, a.created_at,
+               u.name AS user_name, u.initials AS user_initials, u.color AS user_color
+        FROM task_activity a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.task_id=?
+        ORDER BY a.created_at DESC, a.id DESC
+    """, (tid,))
+    return jsonify(rows_to_list(rows))
+
+def _notify_task_change(old, updates, actor):
+    """Fire notifications for meaningful status/review transitions."""
+    if "status" in updates and updates["status"] == "complete" and old["status"] != "complete":
+        reviewer = q1("SELECT name,email FROM users WHERE id=?", (old["reviewer_id"],))
+        if reviewer:
+            notify(reviewer["email"],
+                f"[Close] Ready for review: {old['name']}",
+                f"{actor['name']} marked '{old['name']}' complete. Please review.")
+    if "review_status" in updates:
+        new_rev = updates["review_status"]
+        if new_rev == "needs_revision" and old["review_status"] != "needs_revision":
+            assignee = q1("SELECT name,email FROM users WHERE id=?", (old["assignee_id"],))
+            if assignee:
+                notify(assignee["email"],
+                    f"[Close] Needs revision: {old['name']}",
+                    f"{actor['name']} sent '{old['name']}' back for revision.")
+        elif new_rev == "approved" and old["review_status"] != "approved":
+            assignee = q1("SELECT name,email FROM users WHERE id=?", (old["assignee_id"],))
+            if assignee:
+                notify(assignee["email"],
+                    f"[Close] Approved: {old['name']}",
+                    f"{actor['name']} approved '{old['name']}'.")
 
 # ── Reconciliations ───────────────────────────────────────────────────────────
 
@@ -490,27 +665,75 @@ def create_reconciliation():
          b.get("qb_balance"), b.get("expected_balance"), "open"))
     return jsonify({"id": cur.lastrowid}), 201
 
-@app.route("/api/reconciliations/<int:rid>", methods=["PATCH", "DELETE", "OPTIONS"])
+@app.route("/api/reconciliations/<int:rid>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
 @login_required
 def manage_reconciliation(rid):
     if request.method == "OPTIONS":
         return "", 204
+    if request.method == "GET":
+        row = q1(RECON_SELECT + " WHERE r.id=?", (rid,))
+        return jsonify(dict(row)) if row else err("Reconciliation not found", 404)
     if request.method == "DELETE":
         user = get_current_user()
         if user["role"] != "admin":
             return err("Admin required", 403)
+        run("DELETE FROM recon_activity WHERE recon_id=?", (rid,))
         run("DELETE FROM reconciliations WHERE id=?", (rid,))
         return jsonify({"deleted": rid})
     b = request.json or {}
     user = get_current_user()
-    allowed = {"expected_balance", "status", "assignee_id", "account_number", "account_name"} if user["role"] == "admin" else {"expected_balance", "status"}
+    old = q1("SELECT * FROM reconciliations WHERE id=?", (rid,))
+    if not old:
+        return err("Reconciliation not found", 404)
+    if period_is_closed(old["period_id"]):
+        return err("Period is closed; reopen it to edit", 423)
+    if user["role"] == "admin":
+        allowed = {"expected_balance", "variance_threshold", "notes", "status",
+                   "assignee_id", "account_number", "account_name"}
+    else:
+        allowed = {"expected_balance", "variance_threshold", "notes", "status"}
     updates = {k: v for k, v in b.items() if k in allowed}
     if not updates:
         return err("No valid fields")
+
+    # Auto-flip status when variance exceeds threshold (only if caller didn't
+    # explicitly set status in this request).
+    if "status" not in updates:
+        expected = updates.get("expected_balance", old["expected_balance"])
+        threshold = updates.get("variance_threshold", old["variance_threshold"])
+        qb_bal = old["qb_balance"]
+        if expected is not None and qb_bal is not None and threshold is not None:
+            variance = abs(qb_bal - expected)
+            if variance > threshold and old["status"] != "needs_attention":
+                updates["status"] = "needs_attention"
+            elif variance <= threshold and old["status"] == "needs_attention":
+                updates["status"] = "reconciled"
+
     updates["last_updated_at"] = datetime.utcnow().isoformat()
     set_clause = ", ".join(f"{k}=?" for k in updates)
     run(f"UPDATE reconciliations SET {set_clause} WHERE id=?", list(updates.values()) + [rid])
+
+    for k in ("status", "expected_balance", "variance_threshold", "notes"):
+        if k in updates and str(updates[k]) != str(old[k] or ""):
+            run("INSERT INTO recon_activity (recon_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
+                (rid, user["id"], k, None if old[k] is None else str(old[k]), None if updates[k] is None else str(updates[k])))
+
     return jsonify(dict(q1(RECON_SELECT + " WHERE r.id=?", (rid,))))
+
+@app.route("/api/reconciliations/<int:rid>/activity", methods=["GET", "OPTIONS"])
+@login_required
+def get_recon_activity(rid):
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q("""
+        SELECT a.id, a.action, a.old_value, a.new_value, a.created_at,
+               u.name AS user_name, u.initials AS user_initials, u.color AS user_color
+        FROM recon_activity a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.recon_id=?
+        ORDER BY a.created_at DESC, a.id DESC
+    """, (rid,))
+    return jsonify(rows_to_list(rows))
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
@@ -586,7 +809,18 @@ def server_error(e):
     traceback.print_exc()
     return jsonify({"error": "Internal server error"}), 500
 
+def _start_scheduler():
+    sched = BackgroundScheduler()
+    sched.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
+    sched.start()
+    return sched
+
+if os.getenv("RUN_SCHEDULER") == "1":
+    _start_scheduler()
+
 if __name__ == "__main__":
     from init_db import init
     init()
+    if os.getenv("RUN_SCHEDULER") != "1":
+        _start_scheduler()
     app.run(debug=True, port=5000, use_reloader=False)

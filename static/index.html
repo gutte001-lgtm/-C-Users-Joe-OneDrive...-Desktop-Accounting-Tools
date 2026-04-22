@@ -65,6 +65,40 @@ function ProgressBar({pct,color}){
   return <div style={{height:4,borderRadius:2,background:"#1e2d3d",overflow:"hidden",marginTop:6}}><div style={{height:"100%",width:Math.min(pct||0,100)+"%",background:color,borderRadius:2,transition:"width .6s ease"}}/></div>;
 }
 function Spinner(){return <div style={{color:"#64748b",padding:40,textAlign:"center",fontFamily:"'DM Mono',monospace"}}>Loading…</div>}
+function fmtDT(s){if(!s)return"";const d=new Date(s.endsWith("Z")||s.includes("T")?s:s.replace(" ","T")+"Z");return d.toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});}
+const ACTION_LABEL={
+  status_change:"changed status",
+  review_change:"changed review",
+  note:"updated notes",
+  status:"changed status",
+  expected_balance:"updated expected balance",
+  variance_threshold:"updated variance threshold",
+  notes:"updated notes",
+  created:"created",
+};
+function ActivityFeed({fetcher}){
+  const [items,setItems]=useState(null);
+  useEffect(()=>{let alive=true;fetcher().then(d=>{if(alive)setItems(d);}).catch(()=>{if(alive)setItems([]);});return()=>{alive=false};},[fetcher]);
+  if(items===null)return <div style={{color:"#475569",fontSize:12,fontFamily:"'DM Mono',monospace"}}>Loading activity…</div>;
+  if(!items.length)return <div style={{color:"#475569",fontSize:12,fontFamily:"'DM Mono',monospace"}}>No activity yet.</div>;
+  return(<div style={{display:"flex",flexDirection:"column",gap:8,maxHeight:180,overflow:"auto"}}>
+    {items.map(a=>(
+      <div key={a.id} style={{display:"flex",gap:10,alignItems:"flex-start",fontSize:12.5}}>
+        <Avatar user={{initials:a.user_initials,color:a.user_color}} size={22}/>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{color:"#cbd5e1"}}>
+            <span style={{fontWeight:600}}>{a.user_name}</span>{" "}
+            <span style={{color:"#64748b"}}>{ACTION_LABEL[a.action]||a.action}</span>
+            {a.old_value!=null&&a.new_value!=null&&<span style={{color:"#64748b"}}>{" "}from <span style={{color:"#94a3b8"}}>{a.old_value||"—"}</span> to <span style={{color:"#e2e8f0"}}>{a.new_value}</span></span>}
+            {a.old_value==null&&a.new_value!=null&&a.action!=="note"&&<span style={{color:"#64748b"}}>{" "}to <span style={{color:"#e2e8f0"}}>{a.new_value}</span></span>}
+          </div>
+          {a.action==="note"&&a.new_value&&<div style={{color:"#94a3b8",marginTop:2,whiteSpace:"pre-wrap",fontSize:12}}>"{a.new_value}"</div>}
+          <div style={{color:"#475569",fontSize:10.5,fontFamily:"'DM Mono',monospace",marginTop:1}}>{fmtDT(a.created_at)}</div>
+        </div>
+      </div>
+    ))}
+  </div>);
+}
 function Modal({title,onClose,children}){
   return <div className="modal-overlay" onClick={onClose}><div className="modal-box" onClick={e=>e.stopPropagation()}>
     <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
@@ -128,12 +162,16 @@ function CloseApp(){
   const [users,setUsers]=useState([]);
   const [cats,setCats]=useState([]);
   const [selectedTask,setSelectedTask]=useState(null);
+  const [selectedRecon,setSelectedRecon]=useState(null);
+  const [allPeriods,setAllPeriods]=useState([]);
+  const [qb,setQb]=useState({connected:false});
   const [filterUser,setFilterUser]=useState(null);
   const [filterCat,setFilterCat]=useState(null);
   const [syncing,setSyncing]=useState(false);
   const [loading,setLoading]=useState(true);
 
   const isAdmin=currentUser?.role==="admin";
+  const periodLocked=period?.status==="closed";
 
   useEffect(()=>{
     api("/api/auth/me").then(u=>{if(u.authenticated)setCurrentUser(u);setAuthChecked(true);}).catch(()=>setAuthChecked(true));
@@ -142,8 +180,11 @@ function CloseApp(){
   const loadAll=useCallback(async()=>{
     setLoading(true);
     try{
-      const [p,u,c]=await Promise.all([api("/api/periods/active"),api("/api/users"),api("/api/categories")]);
-      setPeriod(p);setUsers(u);setCats(c);
+      const [p,u,c,pl,qs]=await Promise.all([
+        api("/api/periods/active"),api("/api/users"),api("/api/categories"),
+        api("/api/periods"),api("/api/qb/status").catch(()=>({connected:false})),
+      ]);
+      setPeriod(p);setUsers(u);setCats(c);setAllPeriods(pl);setQb(qs);
       const [t,r,d]=await Promise.all([api(`/api/tasks?period_id=${p.id}`),api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
       setTasks(t);setRecons(r);setDash(d);
     }catch(e){console.error(e);}
@@ -162,8 +203,12 @@ function CloseApp(){
   }
 
   async function patchRecon(id,patch){
-    try{const updated=await api(`/api/reconciliations/${id}`,{method:"PATCH",body:JSON.stringify(patch)});setRecons(prev=>prev.map(r=>r.id===id?{...r,...updated}:r));}
-    catch(e){alert(e.message);}
+    try{
+      const updated=await api(`/api/reconciliations/${id}`,{method:"PATCH",body:JSON.stringify(patch)});
+      setRecons(prev=>prev.map(r=>r.id===id?{...r,...updated}:r));
+      if(selectedRecon?.id===id)setSelectedRecon(prev=>({...prev,...updated}));
+      return updated;
+    }catch(e){alert(e.message);throw e;}
   }
 
   async function syncQB(){
@@ -261,7 +306,7 @@ function CloseApp(){
   // ── Checklist ───────────────────────────────────────────────────────────────
   function Checklist(){
     if(loading)return <Spinner/>;
-    const canEdit=(t)=>isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+    const canEdit=(t)=>(isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id)&&!periodLocked;
     return(<div>
       <div style={S.filterBar}>
         <button style={S.filterBtn(!filterUser&&!filterCat)} onClick={()=>{setFilterUser(null);setFilterCat(null);}}>All</button>
@@ -312,27 +357,29 @@ function CloseApp(){
       <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
         <div>
           <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Account Reconciliations</div>
-          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Synced from QuickBooks Online</div>
+          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>
+            {qb.connected?`Connected · realm ${qb.realm_id||"?"} (${qb.environment||""})`:"Not connected to QuickBooks"}
+          </div>
         </div>
-        {isAdmin&&<button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>}
+        <div style={{display:"flex",gap:8}}>
+          {!qb.connected&&isAdmin&&<a href="/qb/connect" style={{padding:"6px 14px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:8,fontSize:12,textDecoration:"none",fontFamily:"'DM Mono',monospace"}}>↗ Connect QB</a>}
+          {qb.connected&&isAdmin&&<button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>}
+        </div>
       </div>
       <table style={{width:"100%",borderCollapse:"collapse"}}>
-        <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
+        <thead><tr>{["Account","QB Balance","Expected","Variance","Threshold","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=4?"right":"left"}}>{h}</th>)}</tr></thead>
         <tbody>{recons.map(r=>{
-          const variance=r.expected_balance!=null?r.qb_balance-r.expected_balance:null;
+          const variance=r.expected_balance!=null&&r.qb_balance!=null?r.qb_balance-r.expected_balance:null;
           const vc=variance===0?"#4fd9a0":variance!=null?"#f87171":"#475569";
-          return(<tr key={r.id}>
-            <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{r.account_number} – {r.account_name}</td>
+          return(<tr key={r.id} style={{cursor:"pointer"}} onClick={()=>setSelectedRecon(r)}>
+            <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{r.notes&&<span style={{color:"#f7c948",marginRight:6,fontSize:11}}>●</span>}{r.account_number} – {r.account_name}</td>
             <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.qb_balance)}</td>
-            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>
-              <input type="text" defaultValue={r.expected_balance!=null?r.expected_balance:""} placeholder="—"
-                onBlur={e=>{const v=parseFloat(e.target.value.replace(/[$,]/g,""));if(!isNaN(v))patchRecon(r.id,{expected_balance:v});}}
-                style={{background:"transparent",border:"none",color:"#e2e8f0",fontFamily:"'DM Mono',monospace",fontSize:12.5,textAlign:"right",width:110,outline:"none",borderBottom:"1px dashed #1e2d3d"}}/>
-            </td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.expected_balance)}</td>
             <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,color:vc,fontWeight:variance!==0&&variance!=null?700:400}}>{variance!=null?(variance===0?"—":fmt(Math.abs(variance))):"—"}</td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12,color:"#64748b"}}>{r.variance_threshold!=null?fmt(r.variance_threshold):"—"}</td>
             <td style={S.td}><Avatar user={{initials:r.assignee_initials,color:r.assignee_color}}/></td>
-            <td style={S.td}>
-              <select value={r.status} style={S.sel(XC[r.status]?.color||"#94a3b8")} onChange={e=>patchRecon(r.id,{status:e.target.value})}>
+            <td style={S.td} onClick={e=>e.stopPropagation()}>
+              <select value={r.status} disabled={periodLocked} style={{...S.sel(XC[r.status]?.color||"#94a3b8"),opacity:periodLocked?.6:1}} onChange={e=>patchRecon(r.id,{status:e.target.value})}>
                 <option value="open">Open</option><option value="needs_attention">Variance</option><option value="reconciled">Reconciled</option>
               </select>
             </td>
@@ -340,6 +387,75 @@ function CloseApp(){
           </tr>);
         })}</tbody>
       </table>
+    </div>);
+  }
+
+  // ── Reconciliation Modal ────────────────────────────────────────────────────
+  function ReconModal(){
+    const r=selectedRecon;
+    const [expected,setExpected]=useState("");
+    const [threshold,setThreshold]=useState("");
+    const [notes,setNotes]=useState("");
+    useEffect(()=>{setExpected(r?.expected_balance??"");setThreshold(r?.variance_threshold??"");setNotes(r?.notes||"");},[r?.id]);
+    const fetchActivity=useCallback(()=>r?api(`/api/reconciliations/${r.id}/activity`):Promise.resolve([]),[r?.id]);
+    if(!r)return null;
+    const canEdit=!periodLocked;
+    const variance=r.expected_balance!=null&&r.qb_balance!=null?r.qb_balance-r.expected_balance:null;
+    const vc=variance===0?"#4fd9a0":variance!=null?"#f87171":"#475569";
+    const parseNum=(s)=>{if(s===""||s==null)return null;const v=parseFloat(String(s).replace(/[$,]/g,""));return isNaN(v)?null:v;};
+    async function save(){
+      try{await patchRecon(r.id,{expected_balance:parseNum(expected),variance_threshold:parseNum(threshold),notes});setSelectedRecon(null);}catch(e){}
+    }
+    return(<div style={{position:"fixed",inset:0,background:"#0008",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setSelectedRecon(null)}>
+      <div style={{background:"#111827",border:"1px solid #1e2d3d",borderRadius:16,width:540,padding:28,maxHeight:"85vh",overflow:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
+          <div>
+            <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>ACCT {r.account_number}</div>
+            <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{r.account_name}</div>
+          </div>
+          <button onClick={()=>setSelectedRecon(null)} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">QB Balance</div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:14,color:"#e2e8f0"}}>{fmt(r.qb_balance)}</div>
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Variance</div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:14,color:vc,fontWeight:600}}>{variance!=null?fmt(Math.abs(variance)):"—"}</div>
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label className="form-label">Expected Balance</label>
+          <input className="form-input" value={expected} onChange={e=>setExpected(e.target.value)} placeholder="0.00" disabled={!canEdit}/>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Variance Threshold <span style={{color:"#475569",textTransform:"none",letterSpacing:0}}>(auto-flags when |variance| &gt; threshold)</span></label>
+          <input className="form-input" value={threshold} onChange={e=>setThreshold(e.target.value)} placeholder="e.g. 100" disabled={!canEdit}/>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Notes</label>
+          <textarea className="form-input" value={notes} onChange={e=>setNotes(e.target.value)} disabled={!canEdit} style={{minHeight:70,resize:"vertical"}}/>
+        </div>
+        <div className="form-group">
+          <label className="form-label">Status</label>
+          <select className="form-select" value={r.status} disabled={!canEdit} onChange={e=>patchRecon(r.id,{status:e.target.value})}>
+            <option value="open">Open</option><option value="needs_attention">Variance</option><option value="reconciled">Reconciled</option>
+          </select>
+        </div>
+
+        <div style={{marginTop:18,paddingTop:12,borderTop:"1px solid #1e2d3d"}}>
+          <div className="form-label">Activity</div>
+          <ActivityFeed fetcher={fetchActivity}/>
+        </div>
+
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:18}}>
+          <button className="btn btn-ghost" onClick={()=>setSelectedRecon(null)}>Close</button>
+          {canEdit&&<button className="btn btn-primary" onClick={save}>Save</button>}
+        </div>
+      </div>
     </div>);
   }
 
@@ -353,7 +469,8 @@ function CloseApp(){
     const t=selectedTask;
     const assignee=users.find(u=>u.id===t.assignee_id);
     const reviewer=users.find(u=>u.id===t.reviewer_id);
-    const canEdit=isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+    const canEdit=(isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id)&&!periodLocked;
+    const fetchActivity=useCallback(()=>api(`/api/tasks/${t.id}/activity`),[t.id]);
 
     async function saveEdit(){
       await patchTask(t.id,{...editData,notes});
@@ -406,6 +523,20 @@ function CloseApp(){
               </select>
               :<span style={{fontSize:13}}>{t.category_name}</span>}
           </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Frequency</div>
+            {editMode&&isAdmin
+              ?<select className="form-select" defaultValue={t.frequency||"Monthly"} onChange={e=>setEditData(p=>({...p,frequency:e.target.value}))}>
+                {["Monthly","Weekly","Daily","Bi-Weekly","Quarterly","Annually","As Needed"].map(f=><option key={f} value={f}>{f}</option>)}
+              </select>
+              :<span style={{fontSize:13,color:"#94a3b8"}}>{t.frequency||"—"}</span>}
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Due Offset</div>
+            {editMode&&isAdmin
+              ?<input type="number" className="form-input" placeholder="days from PE" defaultValue={t.due_offset??""} onChange={e=>setEditData(p=>({...p,due_offset:e.target.value===""?null:parseInt(e.target.value)}))}/>
+              :<span style={{fontFamily:"'DM Mono',monospace",fontSize:13,color:"#94a3b8"}}>{t.due_offset!=null?`${t.due_offset>=0?"+":""}${t.due_offset}d`:"—"}</span>}
+          </div>
           <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Status</div><Badge status={t.status}/></div>
           <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Review</div><Badge status={t.review_status} type="review"/></div>
         </div>
@@ -414,6 +545,11 @@ function CloseApp(){
           <div className="form-label">Notes</div>
           <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Add notes or comments…" disabled={!canEdit}
             style={{width:"100%",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:80,fontFamily:"'DM Sans',sans-serif",opacity:canEdit?1:.6}}/>
+        </div>
+
+        <div style={{marginBottom:14,paddingTop:12,borderTop:"1px solid #1e2d3d"}}>
+          <div className="form-label">Activity</div>
+          <ActivityFeed fetcher={fetchActivity}/>
         </div>
 
         <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
@@ -468,12 +604,18 @@ function CloseApp(){
     }
 
     // Add Task Form
-    const [newTask,setNewTask]=useState({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:""});
+    const emptyTask={name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:"",frequency:"Monthly",due_offset:""};
+    const [newTask,setNewTask]=useState(emptyTask);
     async function addTask(){
       if(!newTask.name||!newTask.category_id||!newTask.assignee_id||!newTask.reviewer_id){alert("Name, category, assignee, and reviewer are required.");return;}
       try{
-        await api("/api/tasks",{method:"POST",body:JSON.stringify({...newTask,period_id:period.id,category_id:parseInt(newTask.category_id),assignee_id:parseInt(newTask.assignee_id),reviewer_id:parseInt(newTask.reviewer_id)})});
-        await loadAll();setShowAddTask(false);setNewTask({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:""});
+        const body={
+          ...newTask,period_id:period.id,
+          category_id:parseInt(newTask.category_id),assignee_id:parseInt(newTask.assignee_id),reviewer_id:parseInt(newTask.reviewer_id),
+          due_offset:newTask.due_offset===""?null:parseInt(newTask.due_offset),
+        };
+        await api("/api/tasks",{method:"POST",body:JSON.stringify(body)});
+        await loadAll();setShowAddTask(false);setNewTask(emptyTask);
       }catch(e){alert(e.message);}
     }
     async function deleteTask(id){
@@ -481,7 +623,25 @@ function CloseApp(){
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
 
-    const stabs=["users","categories","tasks"];
+    // Period rollover form
+    const [showRollover,setShowRollover]=useState(false);
+    const [rollover,setRollover]=useState({label:"",start_date:"",end_date:"",source_period_id:"",activate:true});
+    async function doRollover(){
+      if(!rollover.label||!rollover.start_date||!rollover.end_date){alert("Label, start, and end dates required.");return;}
+      try{
+        const body={...rollover,source_period_id:rollover.source_period_id?parseInt(rollover.source_period_id):undefined};
+        const res=await api("/api/periods/rollover",{method:"POST",body:JSON.stringify(body)});
+        await loadAll();
+        setShowRollover(false);setRollover({label:"",start_date:"",end_date:"",source_period_id:"",activate:true});
+        alert(`Created period "${res.label}" with ${res.cloned_tasks} tasks and ${res.cloned_recons} reconciliations.`);
+      }catch(e){alert(e.message);}
+    }
+    async function activatePeriod(pid){try{await api(`/api/periods/${pid}/activate`,{method:"POST"});await loadAll();}catch(e){alert(e.message);}}
+    async function closePeriod(pid){if(!confirm("Close this period? Tasks and recons become read-only."))return;try{await api(`/api/periods/${pid}/close`,{method:"POST"});await loadAll();}catch(e){alert(e.message);}}
+    async function reopenPeriod(pid){try{await api(`/api/periods/${pid}/reopen`,{method:"POST"});await loadAll();}catch(e){alert(e.message);}}
+    async function disconnectQB(){if(!confirm("Disconnect from QuickBooks? You'll need to re-authorize."))return;try{await api("/api/qb/disconnect",{method:"POST"});await loadAll();}catch(e){alert(e.message);}}
+
+    const stabs=["users","categories","tasks","periods","integrations"];
     return(<div>
       <div style={{display:"flex",gap:0,marginBottom:24,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
         {stabs.map(t=><button key={t} onClick={()=>setSettingsTab(t)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:settingsTab===t?"#1e2d3d":"transparent",color:settingsTab===t?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:settingsTab===t?600:400,textTransform:"capitalize"}}>{t}</button>)}
@@ -555,7 +715,79 @@ function CloseApp(){
         </table>
       </div>}
 
+      {/* PERIODS */}
+      {settingsTab==="periods"&&<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Close Periods</div>
+            <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Create a new period by cloning tasks & recons from a prior period.</div>
+          </div>
+          <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowRollover(true)}>+ New Period (Rollover)</button>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Label","Start","End","Active","Status","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+          <tbody>{allPeriods.map(p=>(
+            <tr key={p.id}>
+              <td style={{...S.td,fontWeight:500}}>{p.label}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{p.start_date}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{p.end_date}</td>
+              <td style={S.td}>{p.is_active?<span className="tag tag-admin">active</span>:<span style={{color:"#475569",fontSize:11}}>—</span>}</td>
+              <td style={S.td}>{p.status==="closed"?<span style={{fontSize:10,padding:"1px 6px",borderRadius:3,background:"#f8717120",color:"#f87171",border:"1px solid #f8717140",fontFamily:"'DM Mono',monospace"}}>LOCKED</span>:<span style={{fontSize:10,padding:"1px 6px",borderRadius:3,background:"#4fd9a018",color:"#4fd9a0",border:"1px solid #4fd9a040",fontFamily:"'DM Mono',monospace"}}>OPEN</span>}</td>
+              <td style={S.td}><div style={{display:"flex",gap:6}}>
+                {!p.is_active&&<button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>activatePeriod(p.id)}>Activate</button>}
+                {p.status==="closed"
+                  ?<button className="btn btn-success" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>reopenPeriod(p.id)}>Reopen</button>
+                  :<button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>closePeriod(p.id)}>Close</button>}
+              </div></td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>}
+
+      {/* INTEGRATIONS */}
+      {settingsTab==="integrations"&&<div style={S.card}>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:16}}>QuickBooks Online</div>
+        <div style={{padding:"14px 16px",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontSize:13,color:"#e2e8f0",fontWeight:600}}>{qb.connected?"Connected":"Not connected"}</div>
+              <div style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace",marginTop:3}}>
+                {qb.connected
+                  ?`Realm ${qb.realm_id||"?"} · ${qb.environment||"?"} · token expires in ${Math.round((qb.token_expires_in||0)/60)}m`
+                  :"Authorize to sync account balances every 15 minutes."}
+              </div>
+            </div>
+            {qb.connected
+              ?<button className="btn btn-danger" style={{fontSize:12}} onClick={disconnectQB}>Disconnect</button>
+              :<a className="btn btn-primary" style={{fontSize:12,textDecoration:"none"}} href="/qb/connect">Connect to QuickBooks</a>}
+          </div>
+        </div>
+      </div>}
+
       {/* Modals */}
+      {showRollover&&<Modal title="New Period (Rollover)" onClose={()=>setShowRollover(false)}>
+        <div className="form-group"><label className="form-label">Label</label><input className="form-input" placeholder="e.g. May 2026 (Period 5)" value={rollover.label} onChange={e=>setRollover(p=>({...p,label:e.target.value}))}/></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div className="form-group"><label className="form-label">Start Date</label><input type="date" className="form-input" value={rollover.start_date} onChange={e=>setRollover(p=>({...p,start_date:e.target.value}))}/></div>
+          <div className="form-group"><label className="form-label">End Date</label><input type="date" className="form-input" value={rollover.end_date} onChange={e=>setRollover(p=>({...p,end_date:e.target.value}))}/></div>
+        </div>
+        <div className="form-group"><label className="form-label">Clone From</label>
+          <select className="form-select" value={rollover.source_period_id} onChange={e=>setRollover(p=>({...p,source_period_id:e.target.value}))}>
+            <option value="">Most recent period</option>
+            {allPeriods.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+        </div>
+        <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#94a3b8",marginBottom:14,cursor:"pointer"}}>
+          <input type="checkbox" checked={rollover.activate} onChange={e=>setRollover(p=>({...p,activate:e.target.checked}))}/>
+          Activate immediately
+        </label>
+        <div style={{fontSize:11,color:"#64748b",marginBottom:14,lineHeight:1.5}}>Each task's due date is recomputed from its <code style={{color:"#94a3b8"}}>due_offset</code> relative to the new period's end date. Statuses reset to open/pending. Reconciliation shells are cloned without balances.</div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+          <button className="btn btn-ghost" onClick={()=>setShowRollover(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={doRollover}>Create Period</button>
+        </div>
+      </Modal>}
+
       {showAddUser&&<Modal title="Add Team Member" onClose={()=>setShowAddUser(false)}>
         {[["Full Name","name","text"],["Initials (2-3 chars)","initials","text"],["Username","username","text"],["Email","email","email"],["Password","password","password"]].map(([label,key,type])=>(
           <div key={key} className="form-group"><label className="form-label">{label}</label><input type={type} className="form-input" value={newUser[key]} onChange={e=>setNewUser(p=>({...p,[key]:e.target.value}))}/></div>
@@ -623,7 +855,15 @@ function CloseApp(){
             <option value="">Select reviewer…</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
           </select>
         </div>
-        <div className="form-group"><label className="form-label">Due Date</label><input type="date" className="form-input" value={newTask.due_date} onChange={e=>setNewTask(p=>({...p,due_date:e.target.value}))}/></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div className="form-group"><label className="form-label">Due Date</label><input type="date" className="form-input" value={newTask.due_date} onChange={e=>setNewTask(p=>({...p,due_date:e.target.value}))}/></div>
+          <div className="form-group"><label className="form-label">Due Offset <span style={{color:"#475569",textTransform:"none",letterSpacing:0}}>(days from PE)</span></label><input type="number" className="form-input" placeholder="e.g. 5" value={newTask.due_offset} onChange={e=>setNewTask(p=>({...p,due_offset:e.target.value}))}/></div>
+        </div>
+        <div className="form-group"><label className="form-label">Frequency</label>
+          <select className="form-select" value={newTask.frequency} onChange={e=>setNewTask(p=>({...p,frequency:e.target.value}))}>
+            {["Monthly","Weekly","Daily","Bi-Weekly","Quarterly","Annually","As Needed"].map(f=><option key={f} value={f}>{f}</option>)}
+          </select>
+        </div>
         <div className="form-group"><label className="form-label">Notes</label><textarea className="form-input" value={newTask.notes} onChange={e=>setNewTask(p=>({...p,notes:e.target.value}))} style={{minHeight:60,resize:"vertical"}}/></div>
         <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
           <button className="btn btn-ghost" onClick={()=>setShowAddTask(false)}>Cancel</button>
@@ -647,10 +887,18 @@ function CloseApp(){
         <div style={{fontSize:11,color:"#475569",marginTop:4}}>{period?.label||"Loading…"}</div>
       </div>
       <div style={{margin:"0 12px 8px",padding:"8px 12px",background:"#1a2535",border:"1px solid #1e2d3d",borderRadius:8}}>
-        <div style={{fontSize:10,color:"#475569",marginBottom:2,fontFamily:"'DM Mono',monospace"}}>CLOSE PERIOD</div>
-        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>{period?.label}</div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:10,color:"#475569",fontFamily:"'DM Mono',monospace"}}>CLOSE PERIOD</div>
+          {periodLocked&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:3,background:"#f8717120",color:"#f87171",border:"1px solid #f8717140",fontFamily:"'DM Mono',monospace",letterSpacing:.5}}>LOCKED</span>}
+        </div>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginTop:2}}>{period?.label}</div>
         <div style={{marginTop:6,height:3,background:"#1e2d3d",borderRadius:2}}><div style={{height:"100%",width:(dash?.close_pct||0)+"%",background:"#4f8ef7",borderRadius:2}}/></div>
         <div style={{fontSize:10,color:"#4f8ef7",marginTop:3}}>{dash?.close_pct||0}% complete</div>
+        {isAdmin&&period&&<div style={{marginTop:8,display:"flex",gap:4}}>
+          {periodLocked
+            ?<button onClick={async()=>{await api(`/api/periods/${period.id}/reopen`,{method:"POST"});loadAll();}} style={{flex:1,padding:"4px 8px",fontSize:10,borderRadius:5,border:"1px solid #4fd9a040",background:"#4fd9a018",color:"#4fd9a0",cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>↻ Reopen</button>
+            :<button onClick={async()=>{if(!confirm("Lock this period? Tasks and reconciliations will become read-only."))return;await api(`/api/periods/${period.id}/close`,{method:"POST"});loadAll();}} style={{flex:1,padding:"4px 8px",fontSize:10,borderRadius:5,border:"1px solid #f8717140",background:"#f8717118",color:"#f87171",cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>✕ Close</button>}
+        </div>}
       </div>
       {navItems.map(n=><button key={n.id} style={S.navBtn(tab===n.id)} onClick={()=>setTab(n.id)}><span style={{fontSize:15}}>{n.icon}</span>{n.label}</button>)}
       <div style={{marginTop:"auto",padding:"16px 20px",borderTop:"1px solid #1e2d3d"}}>
@@ -666,6 +914,10 @@ function CloseApp(){
     </div>
 
     <div style={S.main}>
+      {periodLocked&&<div style={{padding:"10px 14px",background:"#f8717110",border:"1px solid #f8717130",borderRadius:8,marginBottom:16,display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:14,color:"#f87171"}}>🔒</span>
+        <div style={{flex:1,fontSize:12.5,color:"#f1b0b0"}}><strong>{period?.label}</strong> is closed. Tasks and reconciliations are read-only. {isAdmin&&"Reopen from the sidebar to edit."}</div>
+      </div>}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28}}>
         <div>
           <div style={{fontSize:22,fontWeight:700,color:"#f1f5f9",letterSpacing:-0.5}}>{navItems.find(n=>n.id===tab)?.label}</div>
@@ -673,7 +925,7 @@ function CloseApp(){
             {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}
             {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
-            {tab==="settings"&&"Admin only — manage team, categories, and tasks"}
+            {tab==="settings"&&"Admin only — manage team, categories, tasks, and periods"}
           </div>
         </div>
       </div>
@@ -683,6 +935,7 @@ function CloseApp(){
       {tab==="settings"&&isAdmin&&<Settings/>}
     </div>
     {selectedTask&&<TaskModal/>}
+    {selectedRecon&&<ReconModal/>}
   </div>);
 }
 
