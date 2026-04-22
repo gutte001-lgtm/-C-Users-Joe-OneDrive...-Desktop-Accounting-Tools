@@ -660,10 +660,130 @@ function CloseApp(){
     </div>);
   }
 
+  function Reports(){
+    const [rtype,setRtype]=useState("pl");
+    const [periods,setPeriods]=useState([]);
+    const [periodId,setPeriodId]=useState(null);
+    const [compareId,setCompareId]=useState(null);
+    const [data,setData]=useState(null);
+    const [busy,setBusy]=useState(false);
+    const [err,setErr]=useState(null);
+
+    useEffect(()=>{
+      api("/api/periods").then(ps=>{
+        setPeriods(ps);
+        if(ps.length){
+          const active=ps.find(p=>p.is_active)||ps[0];
+          setPeriodId(active.id);
+          const sorted=[...ps].sort((a,b)=>a.start_date.localeCompare(b.start_date));
+          const idx=sorted.findIndex(p=>p.id===active.id);
+          if(idx>0)setCompareId(sorted[idx-1].id);
+        }
+      }).catch(e=>setErr(e.message));
+    },[]);
+
+    async function loadReport(){
+      if(!periodId)return;
+      setBusy(true);setErr(null);
+      try{
+        const qs=new URLSearchParams({period_id:periodId});
+        if(compareId)qs.set("compare_to",compareId);else qs.set("auto_compare","0");
+        const r=await api(`/api/reports/${rtype}?${qs}`);
+        setData(r);
+      }catch(e){setErr(e.message);}
+      setBusy(false);
+    }
+    useEffect(()=>{loadReport();},[rtype,periodId,compareId]);
+
+    async function syncFromQB(){
+      if(!periodId)return;
+      setBusy(true);setErr(null);
+      try{
+        const r=await api("/api/qb/sync_reports",{method:"POST",body:JSON.stringify({period_id:periodId,types:[rtype]})});
+        if(!r.ok){setErr(JSON.stringify(r.results));}
+        await loadReport();
+      }catch(e){setErr(e.message);}
+      setBusy(false);
+    }
+
+    const lines=data?.lines||[];
+    const hasCompare=!!data?.compare;
+    const title=rtype==="pl"?"Profit & Loss":"Balance Sheet";
+
+    function varColor(v,name){
+      if(v==null||v===0)return "#64748b";
+      const isExpense=/expense|cost|cogs/i.test(name||"");
+      const favorable=isExpense?v<0:v>0;
+      return favorable?"#4fd9a0":"#f87171";
+    }
+
+    return(<div>
+      <div style={{display:"flex",gap:0,marginBottom:20,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
+        {[["pl","Profit & Loss"],["bs","Balance Sheet"]].map(([k,l])=>
+          <button key={k} onClick={()=>setRtype(k)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:rtype===k?"#1e2d3d":"transparent",color:rtype===k?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:rtype===k?600:400}}>{l}</button>
+        )}
+      </div>
+
+      <div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:12}}>
+          <div>
+            <div style={{fontSize:15,fontWeight:700,color:"#e2e8f0"}}>{title}</div>
+            <div style={{fontSize:11.5,color:"#64748b",marginTop:2,fontFamily:"'DM Mono',monospace"}}>
+              {data?.pulled_at?`Pulled from QB ${new Date(data.pulled_at).toLocaleString()}`:"Not yet synced from QuickBooks"}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>PERIOD</label>
+            <select value={periodId||""} onChange={e=>setPeriodId(parseInt(e.target.value))}
+              style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace"}}>
+              {periods.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+            </select>
+            <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>COMPARE</label>
+            <select value={compareId||""} onChange={e=>setCompareId(e.target.value?parseInt(e.target.value):null)}
+              style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace"}}>
+              <option value="">None</option>
+              {periods.filter(p=>p.id!==periodId).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+            </select>
+            {isAdmin&&<button onClick={syncFromQB} disabled={busy} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:busy?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{busy?"Syncing…":"↻ Sync from QB"}</button>}
+          </div>
+        </div>
+
+        {err&&<div style={{padding:10,background:"#f8717118",border:"1px solid #f8717140",color:"#f87171",borderRadius:8,fontSize:12,marginBottom:12,fontFamily:"'DM Mono',monospace"}}>{err}</div>}
+
+        {lines.length===0?<div style={{padding:40,textAlign:"center",color:"#64748b",fontFamily:"'DM Mono',monospace",fontSize:13}}>
+          {busy?"Loading…":"No data. Click ↻ Sync from QB to pull this report."}
+        </div>:
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>
+            <th style={{...S.th,textAlign:"left"}}>Account</th>
+            <th style={{...S.th,textAlign:"right"}}>{data?.period?.label||"Current"}</th>
+            {hasCompare&&<th style={{...S.th,textAlign:"right"}}>{data.compare.label}</th>}
+            {hasCompare&&<th style={{...S.th,textAlign:"right"}}>Variance $</th>}
+            {hasCompare&&<th style={{...S.th,textAlign:"right"}}>Variance %</th>}
+          </tr></thead>
+          <tbody>{lines.map((l,i)=>{
+            const isSub=l.is_subtotal===1;
+            const nameStyle={...S.td,paddingLeft:12+(l.depth||0)*14,fontWeight:isSub?700:400,color:isSub?"#e2e8f0":"#94a3b8",fontSize:12.5,borderTop:isSub?"1px solid #1e2d3d":"none"};
+            const numStyle={...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,fontWeight:isSub?700:400,color:isSub?"#e2e8f0":"#94a3b8",borderTop:isSub?"1px solid #1e2d3d":"none"};
+            const vc=varColor(l.variance,l.account_name);
+            return(<tr key={i} style={isSub?{background:"#0f172a55"}:{}}>
+              <td style={nameStyle}>{l.account_name}</td>
+              <td style={numStyle}>{fmt(l.amount)}</td>
+              {hasCompare&&<td style={numStyle}>{l.prior_amount!=null?fmt(l.prior_amount):"—"}</td>}
+              {hasCompare&&<td style={{...numStyle,color:l.variance!=null?vc:"#475569"}}>{l.variance!=null?fmt(l.variance):"—"}</td>}
+              {hasCompare&&<td style={{...numStyle,color:l.variance_pct!=null?vc:"#475569"}}>{l.variance_pct!=null?(l.variance_pct>0?"+":"")+l.variance_pct+"%":"—"}</td>}
+            </tr>);
+          })}</tbody>
+        </table>}
+      </div>
+    </div>);
+  }
+
   const navItems=[
     {id:"dashboard",label:"Dashboard",icon:"⬡"},
     {id:"checklist",label:"Close Checklist",icon:"☑"},
     {id:"recons",label:"Reconciliations",icon:"⇌"},
+    {id:"reports",label:"Reports",icon:"◨"},
     ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
   ];
 
@@ -704,6 +824,7 @@ function CloseApp(){
             {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}
             {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
+            {tab==="reports"&&"Financial reports pulled live from QuickBooks"}
             {tab==="settings"&&"Admin only — manage team, categories, and tasks"}
           </div>
         </div>
@@ -711,6 +832,7 @@ function CloseApp(){
       {tab==="dashboard"&&<Dashboard/>}
       {tab==="checklist"&&<Checklist/>}
       {tab==="recons"&&<Reconciliations/>}
+      {tab==="reports"&&<Reports/>}
       {tab==="settings"&&isAdmin&&<Settings/>}
     </div>
     {selectedTask&&<TaskModal/>}

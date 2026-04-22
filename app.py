@@ -152,16 +152,32 @@ QB_API_BASE      = (
     else "https://quickbooks.api.intuit.com/v3/company"
 )
 
+def _ensure_qb_tokens_table():
+    db = get_db()
+    db.execute("CREATE TABLE IF NOT EXISTS qb_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, access_token TEXT, refresh_token TEXT, expires_at REAL, realm_id TEXT)")
+    cols = {r[1] for r in db.execute("PRAGMA table_info(qb_tokens)").fetchall()}
+    if "realm_id" not in cols:
+        db.execute("ALTER TABLE qb_tokens ADD COLUMN realm_id TEXT")
+    db.commit()
+
 def get_tokens():
-    row = q1("SELECT access_token, refresh_token, expires_at FROM qb_tokens ORDER BY id DESC LIMIT 1")
+    _ensure_qb_tokens_table()
+    row = q1("SELECT access_token, refresh_token, expires_at, realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
     return dict(row) if row else {}
 
-def save_tokens(at, rt, ei):
+def save_tokens(at, rt, ei, realm_id=None):
+    _ensure_qb_tokens_table()
     ea = datetime.now(timezone.utc).timestamp() + ei
     db = get_db()
-    db.execute("CREATE TABLE IF NOT EXISTS qb_tokens (id INTEGER PRIMARY KEY AUTOINCREMENT, access_token TEXT, refresh_token TEXT, expires_at REAL)")
-    db.execute("INSERT INTO qb_tokens (access_token, refresh_token, expires_at) VALUES (?,?,?)", (at, rt, ea))
+    if realm_id is None:
+        prev = q1("SELECT realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
+        realm_id = prev["realm_id"] if prev else None
+    db.execute("INSERT INTO qb_tokens (access_token, refresh_token, expires_at, realm_id) VALUES (?,?,?,?)", (at, rt, ea, realm_id))
     db.commit()
+
+def get_realm_id():
+    tokens = get_tokens()
+    return tokens.get("realm_id") or os.getenv("QB_REALM_ID", "")
 
 def refresh_access_token():
     tokens = get_tokens()
@@ -180,6 +196,9 @@ def qb_get(path):
     tokens = get_tokens()
     if not tokens:
         return None, "Not connected"
+    realm = get_realm_id()
+    if not realm:
+        return None, "No realm_id — reconnect to QuickBooks"
     now = datetime.now(timezone.utc).timestamp()
     token = tokens["access_token"]
     if tokens.get("expires_at", 0) < now + 60:
@@ -187,9 +206,9 @@ def qb_get(path):
     if not token:
         return None, "Token refresh failed"
     resp = requests.get(
-        f"{QB_API_BASE}/{QB_REALM_ID}{path}",
+        f"{QB_API_BASE}/{realm}{path}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}")
+    return (resp.json(), None) if resp.ok else (None, f"QB error {resp.status_code}: {resp.text[:200]}")
 
 @app.route("/api/qb/connect")
 @login_required
@@ -220,9 +239,7 @@ def qb_callback():
     if not resp.ok:
         return redirect("/?qb=error")
     d = resp.json()
-    save_tokens(d["access_token"], d["refresh_token"], d["expires_in"])
-    if realm:
-        os.environ["QB_REALM_ID"] = realm
+    save_tokens(d["access_token"], d["refresh_token"], d["expires_in"], realm_id=realm)
     session.pop("qb_state", None)
     return redirect("/?qb=connected")
 
@@ -268,6 +285,183 @@ def manual_sync():
     if request.method == "OPTIONS":
         return "", 204
     return jsonify(sync_qb_balances())
+
+# ── QuickBooks Report Sync (P&L, Balance Sheet) ───────────────────────────────
+
+def _ensure_report_tables():
+    db = get_db()
+    db.execute("""CREATE TABLE IF NOT EXISTS qb_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period_id INTEGER NOT NULL REFERENCES periods(id),
+        report_type TEXT NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        raw_json TEXT NOT NULL,
+        pulled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(period_id, report_type)
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS qb_report_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period_id INTEGER NOT NULL REFERENCES periods(id),
+        report_type TEXT NOT NULL,
+        section TEXT,
+        account_name TEXT NOT NULL,
+        amount REAL NOT NULL DEFAULT 0,
+        is_subtotal INTEGER DEFAULT 0,
+        depth INTEGER DEFAULT 0,
+        sort_order INTEGER DEFAULT 0
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_rl_period_type ON qb_report_lines(period_id, report_type)")
+    db.commit()
+
+def _flatten_qb_rows(rows, report_type, out, section=None, depth=0):
+    """Recursively walk a QB Report Rows tree and emit flat line records."""
+    if not rows or not isinstance(rows, dict):
+        return
+    for row in rows.get("Row", []):
+        rtype = row.get("type", "Data")
+        if rtype == "Section":
+            header = row.get("Header", {}).get("ColData", [])
+            header_name = header[0].get("value", "") if header else ""
+            new_section = section or header_name or None
+            _flatten_qb_rows(row.get("Rows", {}), report_type, out, new_section, depth+1)
+            summary = row.get("Summary", {}).get("ColData", [])
+            if summary:
+                name = summary[0].get("value", "")
+                try:
+                    amt = float(summary[-1].get("value", 0) or 0)
+                except (TypeError, ValueError):
+                    amt = 0.0
+                out.append({
+                    "section": new_section, "account_name": name, "amount": amt,
+                    "is_subtotal": 1, "depth": depth, "sort_order": len(out),
+                })
+        else:
+            cd = row.get("ColData", [])
+            if not cd:
+                continue
+            name = cd[0].get("value", "")
+            try:
+                amt = float(cd[-1].get("value", 0) or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            out.append({
+                "section": section, "account_name": name, "amount": amt,
+                "is_subtotal": 0, "depth": depth, "sort_order": len(out),
+            })
+
+def sync_qb_report(period_id, report_type):
+    """report_type: 'pl' | 'bs'. Pulls from QB and caches into qb_reports + qb_report_lines."""
+    _ensure_report_tables()
+    period = q1("SELECT id, start_date, end_date FROM periods WHERE id=?", (period_id,))
+    if not period:
+        return {"ok": False, "error": "Period not found"}
+
+    if report_type == "pl":
+        path = f"/reports/ProfitAndLoss?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
+    elif report_type == "bs":
+        path = f"/reports/BalanceSheet?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
+    else:
+        return {"ok": False, "error": "Unknown report_type"}
+
+    data, error = qb_get(path)
+    if error:
+        return {"ok": False, "error": error}
+
+    import json
+    db = get_db()
+    db.execute("DELETE FROM qb_report_lines WHERE period_id=? AND report_type=?", (period_id, report_type))
+    db.execute("""INSERT INTO qb_reports (period_id, report_type, start_date, end_date, raw_json, pulled_at)
+                  VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                  ON CONFLICT(period_id, report_type) DO UPDATE SET
+                    start_date=excluded.start_date, end_date=excluded.end_date,
+                    raw_json=excluded.raw_json, pulled_at=CURRENT_TIMESTAMP""",
+               (period_id, report_type, period["start_date"], period["end_date"], json.dumps(data)))
+
+    lines = []
+    _flatten_qb_rows(data.get("Rows", {}), report_type, lines)
+    for ln in lines:
+        db.execute("""INSERT INTO qb_report_lines
+                      (period_id, report_type, section, account_name, amount, is_subtotal, depth, sort_order)
+                      VALUES (?,?,?,?,?,?,?,?)""",
+                   (period_id, report_type, ln["section"], ln["account_name"], ln["amount"],
+                    ln["is_subtotal"], ln["depth"], ln["sort_order"]))
+    db.commit()
+    return {"ok": True, "lines": len(lines)}
+
+@app.route("/api/qb/sync_reports", methods=["POST", "OPTIONS"])
+@login_required
+def sync_reports_endpoint():
+    if request.method == "OPTIONS":
+        return "", 204
+    body = request.get_json(silent=True) or {}
+    period_id = body.get("period_id")
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        return jsonify({"ok": False, "error": "No period selected and no active period"}), 400
+    types = body.get("types") or ["pl", "bs"]
+    results = {t: sync_qb_report(period_id, t) for t in types}
+    return jsonify({"ok": all(r.get("ok") for r in results.values()), "results": results})
+
+def _load_report_lines(period_id, report_type):
+    rows = q("""SELECT section, account_name, amount, is_subtotal, depth, sort_order
+                FROM qb_report_lines WHERE period_id=? AND report_type=?
+                ORDER BY sort_order""", (period_id, report_type))
+    return [dict(r) for r in rows]
+
+def _prior_period_id(period_id):
+    cur = q1("SELECT start_date FROM periods WHERE id=?", (period_id,))
+    if not cur:
+        return None
+    prior = q1("SELECT id FROM periods WHERE start_date < ? ORDER BY start_date DESC LIMIT 1",
+               (cur["start_date"],))
+    return prior["id"] if prior else None
+
+@app.route("/api/reports/<rtype>", methods=["GET", "OPTIONS"])
+@login_required
+def get_report(rtype):
+    if request.method == "OPTIONS":
+        return "", 204
+    if rtype not in ("pl", "bs"):
+        return jsonify({"error": "Unknown report type"}), 400
+    _ensure_report_tables()
+    period_id = request.args.get("period_id", type=int)
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        return jsonify({"error": "No period"}), 400
+
+    compare_id = request.args.get("compare_to", type=int)
+    if compare_id is None and request.args.get("auto_compare", "1") == "1":
+        compare_id = _prior_period_id(period_id)
+
+    cur_lines = _load_report_lines(period_id, rtype)
+    cmp_lines = _load_report_lines(compare_id, rtype) if compare_id else []
+    cmp_by_name = {(l["section"], l["account_name"]): l["amount"] for l in cmp_lines}
+
+    merged = []
+    for l in cur_lines:
+        prior_amt = cmp_by_name.get((l["section"], l["account_name"]))
+        var = None if prior_amt is None else (l["amount"] - prior_amt)
+        var_pct = None
+        if prior_amt not in (None, 0):
+            var_pct = round((l["amount"] - prior_amt) / abs(prior_amt) * 100, 2)
+        merged.append({**l, "prior_amount": prior_amt, "variance": var, "variance_pct": var_pct})
+
+    period_meta = q1("SELECT id, label, start_date, end_date FROM periods WHERE id=?", (period_id,))
+    compare_meta = q1("SELECT id, label, start_date, end_date FROM periods WHERE id=?", (compare_id,)) if compare_id else None
+    pulled = q1("SELECT pulled_at FROM qb_reports WHERE period_id=? AND report_type=?", (period_id, rtype))
+
+    return jsonify({
+        "report_type": rtype,
+        "period": dict(period_meta) if period_meta else None,
+        "compare": dict(compare_meta) if compare_meta else None,
+        "pulled_at": pulled["pulled_at"] if pulled else None,
+        "lines": merged,
+    })
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
