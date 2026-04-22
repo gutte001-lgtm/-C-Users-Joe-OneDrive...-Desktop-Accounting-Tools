@@ -95,6 +95,40 @@ CREATE TABLE IF NOT EXISTS reconciliations (
     created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- ─────────────────────────────────────────
+--  Reconciliation Attachments
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recon_attachments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recon_id     INTEGER NOT NULL REFERENCES reconciliations(id) ON DELETE CASCADE,
+    filename     TEXT NOT NULL,
+    stored_name  TEXT NOT NULL,
+    size_bytes   INTEGER,
+    uploader_id  INTEGER REFERENCES users(id),
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ─────────────────────────────────────────
+--  Checklist Templates
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS templates (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS template_items (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id         INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+    category_id         INTEGER REFERENCES categories(id),
+    name                TEXT NOT NULL,
+    default_assignee_id INTEGER REFERENCES users(id),
+    default_reviewer_id INTEGER REFERENCES users(id),
+    days_offset         INTEGER DEFAULT 0,
+    sort_order          INTEGER DEFAULT 0
+);
+
 -- Trigger: auto-update tasks.updated_at
 CREATE TRIGGER IF NOT EXISTS tasks_updated_at
 AFTER UPDATE ON tasks

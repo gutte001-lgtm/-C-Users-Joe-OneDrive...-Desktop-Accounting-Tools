@@ -132,6 +132,13 @@ function CloseApp(){
   const [filterCat,setFilterCat]=useState(null);
   const [syncing,setSyncing]=useState(false);
   const [loading,setLoading]=useState(true);
+  const [bulkSelected,setBulkSelected]=useState(new Set());
+  const [calendarMonth,setCalendarMonth]=useState(null);
+  const [activityLog,setActivityLog]=useState([]);
+  const [activityLoading,setActivityLoading]=useState(false);
+  const [templates,setTemplates]=useState([]);
+  const [attachRecon,setAttachRecon]=useState(null);
+  const [periodsAll,setPeriodsAll]=useState([]);
 
   const isAdmin=currentUser?.role==="admin";
 
@@ -142,13 +149,25 @@ function CloseApp(){
   const loadAll=useCallback(async()=>{
     setLoading(true);
     try{
-      const [p,u,c]=await Promise.all([api("/api/periods/active"),api("/api/users"),api("/api/categories")]);
-      setPeriod(p);setUsers(u);setCats(c);
+      const [p,u,c,pa]=await Promise.all([api("/api/periods/active"),api("/api/users"),api("/api/categories"),api("/api/periods").catch(()=>[])]);
+      setPeriod(p);setUsers(u);setCats(c);setPeriodsAll(pa);
+      if(!calendarMonth&&p?.start_date){setCalendarMonth(new Date(p.start_date+"T00:00:00"));}
       const [t,r,d]=await Promise.all([api(`/api/tasks?period_id=${p.id}`),api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
       setTasks(t);setRecons(r);setDash(d);
     }catch(e){console.error(e);}
     setLoading(false);
-  },[]);
+  },[calendarMonth]);
+
+  async function loadActivity(){
+    if(!period)return;
+    setActivityLoading(true);
+    try{const a=await api(`/api/activity?period_id=${period.id}&limit=500`);setActivityLog(a);}
+    catch(e){console.error(e);}
+    setActivityLoading(false);
+  }
+  async function loadTemplates(){
+    try{const t=await api("/api/templates");setTemplates(t);}catch(e){console.error(e);}
+  }
 
   useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
 
@@ -262,6 +281,16 @@ function CloseApp(){
   function Checklist(){
     if(loading)return <Spinner/>;
     const canEdit=(t)=>isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+    const selectedArr=Array.from(bulkSelected);
+    function toggleOne(id){const s=new Set(bulkSelected);s.has(id)?s.delete(id):s.add(id);setBulkSelected(s);}
+    function toggleGroup(ids,allSelected){const s=new Set(bulkSelected);if(allSelected)ids.forEach(id=>s.delete(id));else ids.forEach(id=>s.add(id));setBulkSelected(s);}
+    async function bulkPatch(patch){
+      if(selectedArr.length===0)return;
+      try{
+        await api("/api/tasks/bulk",{method:"POST",body:JSON.stringify({ids:selectedArr,patch})});
+        setBulkSelected(new Set());await loadAll();
+      }catch(e){alert(e.message);}
+    }
     return(<div>
       <div style={S.filterBar}>
         <button style={S.filterBtn(!filterUser&&!filterCat)} onClick={()=>{setFilterUser(null);setFilterCat(null);}}>All</button>
@@ -269,16 +298,49 @@ function CloseApp(){
         <span style={{width:1,background:"#1e2d3d",margin:"0 4px",height:20,display:"inline-block"}}/>
         {cats.map(c=><button key={c.id} style={S.filterBtn(filterCat===c.id)} onClick={()=>setFilterCat(filterCat===c.id?null:c.id)}>{c.name}</button>)}
       </div>
-      {Object.entries(groupedTasks).map(([catName,{tasks:ct}])=>(
-        <div key={catName} style={{...S.card,marginBottom:14}}>
+      {selectedArr.length>0&&
+        <div style={{...S.card,marginBottom:14,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",background:"#1a2535",borderColor:"#4f8ef740"}}>
+          <span style={{fontSize:12,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",fontWeight:700}}>{selectedArr.length} selected</span>
+          <span style={{fontSize:11,color:"#64748b"}}>Set status:</span>
+          {["open","in_progress","complete"].map(s=>
+            <button key={s} className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>bulkPatch({status:s})}>{SC[s].label}</button>
+          )}
+          {isAdmin&&<>
+            <span style={{fontSize:11,color:"#64748b",marginLeft:6}}>Assign to:</span>
+            <select className="form-select" style={{width:140,padding:"5px 8px",fontSize:12}} defaultValue="" onChange={e=>{if(e.target.value){bulkPatch({assignee_id:parseInt(e.target.value)});e.target.value="";}}}>
+              <option value="">— pick —</option>
+              {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+            <span style={{fontSize:11,color:"#64748b"}}>Reviewer:</span>
+            <select className="form-select" style={{width:140,padding:"5px 8px",fontSize:12}} defaultValue="" onChange={e=>{if(e.target.value){bulkPatch({reviewer_id:parseInt(e.target.value)});e.target.value="";}}}>
+              <option value="">— pick —</option>
+              {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+          </>}
+          <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px",marginLeft:"auto"}} onClick={()=>setBulkSelected(new Set())}>Clear</button>
+        </div>
+      }
+      {Object.entries(groupedTasks).map(([catName,{tasks:ct}])=>{
+        const allIds=ct.map(t=>t.id);
+        const allSelected=allIds.length>0&&allIds.every(id=>bulkSelected.has(id));
+        const someSelected=allIds.some(id=>bulkSelected.has(id));
+        return(<div key={catName} style={{...S.card,marginBottom:14}}>
           <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}>
             <span style={{fontSize:12,fontWeight:700,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase"}}>{catName}</span>
             <span style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{ct.filter(t=>t.status==="complete").length}/{ct.length} complete</span>
           </div>
           <table style={{width:"100%",borderCollapse:"collapse"}}>
-            <thead><tr>{["Task","Assignee","Due","Status","Reviewer","Review"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <thead><tr>
+              <th style={{...S.th,width:30}}>
+                <input type="checkbox" checked={allSelected} ref={el=>{if(el)el.indeterminate=someSelected&&!allSelected;}} onChange={()=>toggleGroup(allIds,allSelected)}/>
+              </th>
+              {["Task","Assignee","Due","Status","Reviewer","Review"].map(h=><th key={h} style={S.th}>{h}</th>)}
+            </tr></thead>
             <tbody>{ct.map(t=>(
-              <tr key={t.id} style={{cursor:"pointer"}} onClick={()=>setSelectedTask(t)}>
+              <tr key={t.id} style={{cursor:"pointer",background:bulkSelected.has(t.id)?"#1a2535":undefined}} onClick={()=>setSelectedTask(t)}>
+                <td style={S.td} onClick={e=>e.stopPropagation()}>
+                  <input type="checkbox" checked={bulkSelected.has(t.id)} onChange={()=>toggleOne(t.id)}/>
+                </td>
                 <td style={{...S.td,fontWeight:500}}>{t.notes&&<span style={{color:"#f7c948",marginRight:6,fontSize:11}}>●</span>}{t.name}</td>
                 <td style={S.td}><Avatar user={{initials:t.assignee_initials,color:t.assignee_color}}/></td>
                 <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{fmtDate(t.due_date)}</td>
@@ -300,8 +362,8 @@ function CloseApp(){
               </tr>
             ))}</tbody>
           </table>
-        </div>
-      ))}
+        </div>);
+      })}
     </div>);
   }
 
@@ -317,7 +379,7 @@ function CloseApp(){
         {isAdmin&&<button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>}
       </div>
       <table style={{width:"100%",borderCollapse:"collapse"}}>
-        <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
+        <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated","Files"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
         <tbody>{recons.map(r=>{
           const variance=r.expected_balance!=null?r.qb_balance-r.expected_balance:null;
           const vc=variance===0?"#4fd9a0":variance!=null?"#f87171":"#475569";
@@ -337,6 +399,9 @@ function CloseApp(){
               </select>
             </td>
             <td style={{...S.td,fontSize:12,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{r.last_updated_at?new Date(r.last_updated_at).toLocaleDateString("en-US",{month:"short",day:"numeric"}):"—"}</td>
+            <td style={S.td}>
+              <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>setAttachRecon(r)} title="Supporting documents">📎</button>
+            </td>
           </tr>);
         })}</tbody>
       </table>
@@ -348,7 +413,14 @@ function CloseApp(){
     const [notes,setNotes]=useState(selectedTask?.notes||"");
     const [editMode,setEditMode]=useState(false);
     const [editData,setEditData]=useState({});
-    useEffect(()=>{setNotes(selectedTask?.notes||"");setEditMode(false);},[selectedTask?.id]);
+    const [modalActivity,setModalActivity]=useState([]);
+    const [actLoading,setActLoading]=useState(false);
+    useEffect(()=>{
+      setNotes(selectedTask?.notes||"");setEditMode(false);
+      if(!selectedTask?.id)return;
+      setActLoading(true);
+      api(`/api/tasks/${selectedTask.id}/activity`).then(setModalActivity).catch(()=>{}).finally(()=>setActLoading(false));
+    },[selectedTask?.id]);
     if(!selectedTask)return null;
     const t=selectedTask;
     const assignee=users.find(u=>u.id===t.assignee_id);
@@ -416,6 +488,24 @@ function CloseApp(){
             style={{width:"100%",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:80,fontFamily:"'DM Sans',sans-serif",opacity:canEdit?1:.6}}/>
         </div>
 
+        <div style={{marginBottom:14}}>
+          <div className="form-label">Activity</div>
+          <div style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,maxHeight:180,overflow:"auto",padding:"6px 10px"}}>
+            {actLoading?<div style={{color:"#64748b",fontSize:12,padding:"8px 0"}}>Loading…</div>:
+             modalActivity.length===0?<div style={{color:"#475569",fontSize:12,padding:"8px 0"}}>No activity yet.</div>:
+             modalActivity.map(a=>(
+               <div key={a.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"1px solid #1a2535",fontSize:12}}>
+                 <Avatar user={{initials:a.user_initials,color:a.user_color}} size={20}/>
+                 <div style={{flex:1,minWidth:0}}>
+                   <div style={{color:"#cbd5e1"}}><span style={{fontWeight:600}}>{a.user_name}</span> <span style={{color:"#64748b"}}>{a.action==="note"?"added a note":a.action.startsWith("bulk_")?"bulk-updated "+a.action.slice(5).replace(/_/g," "):a.action.replace(/_/g," ")}</span>{a.action!=="note"&&a.old_value!==null&&<span style={{color:"#64748b",fontFamily:"'DM Mono',monospace",fontSize:11}}>: {a.old_value} → <span style={{color:"#4fd9a0"}}>{a.new_value}</span></span>}</div>
+                   {a.action==="note"&&<div style={{color:"#cbd5e1",fontStyle:"italic",fontSize:11.5,marginTop:2,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>"{a.new_value}"</div>}
+                   <div style={{fontSize:10,color:"#475569",fontFamily:"'DM Mono',monospace",marginTop:2}}>{new Date(a.created_at+"Z").toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</div>
+                 </div>
+               </div>
+             ))}
+          </div>
+        </div>
+
         <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
           {editMode&&isAdmin&&<><button onClick={()=>{setEditMode(false);setEditData({});}} className="btn btn-ghost">Cancel</button><button onClick={saveEdit} className="btn btn-primary">Save Changes</button></>}
           {!editMode&&canEdit&&<>
@@ -481,7 +571,82 @@ function CloseApp(){
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
 
-    const stabs=["users","categories","tasks"];
+    // Templates state
+    const [tmplDetail,setTmplDetail]=useState(null);
+    const [showAddTmpl,setShowAddTmpl]=useState(false);
+    const [newTmpl,setNewTmpl]=useState({name:"",description:""});
+    const [newItem,setNewItem]=useState({name:"",category_id:"",default_assignee_id:"",default_reviewer_id:"",days_offset:0});
+    const [showInstantiate,setShowInstantiate]=useState(false);
+    const [instOpts,setInstOpts]=useState({period_id:"",default_assignee_id:"",default_reviewer_id:""});
+    const [showSaveAsTmpl,setShowSaveAsTmpl]=useState(false);
+    const [saveTmplName,setSaveTmplName]=useState("");
+    const [showRollFwd,setShowRollFwd]=useState(false);
+    const [rollOpts,setRollOpts]=useState({source_period_id:"",target_period_id:"",shift_days:30});
+
+    async function createTmpl(){
+      if(!newTmpl.name.trim()){alert("Name required");return;}
+      try{await api("/api/templates",{method:"POST",body:JSON.stringify(newTmpl)});await loadTemplates();setShowAddTmpl(false);setNewTmpl({name:"",description:""});}
+      catch(e){alert(e.message);}
+    }
+    async function deleteTmpl(id){
+      if(!confirm("Delete this template and all its items?"))return;
+      try{await api(`/api/templates/${id}`,{method:"DELETE"});await loadTemplates();if(tmplDetail?.id===id)setTmplDetail(null);}
+      catch(e){alert(e.message);}
+    }
+    async function openTmpl(id){
+      try{const d=await api(`/api/templates/${id}`);setTmplDetail(d);}catch(e){alert(e.message);}
+    }
+    async function addItem(){
+      if(!newItem.name.trim()||!newItem.category_id){alert("Name and category required");return;}
+      try{
+        await api(`/api/templates/${tmplDetail.id}/items`,{method:"POST",body:JSON.stringify({
+          name:newItem.name,category_id:parseInt(newItem.category_id),
+          default_assignee_id:newItem.default_assignee_id?parseInt(newItem.default_assignee_id):null,
+          default_reviewer_id:newItem.default_reviewer_id?parseInt(newItem.default_reviewer_id):null,
+          days_offset:parseInt(newItem.days_offset||0),
+        })});
+        await openTmpl(tmplDetail.id);
+        setNewItem({name:"",category_id:"",default_assignee_id:"",default_reviewer_id:"",days_offset:0});
+      }catch(e){alert(e.message);}
+    }
+    async function delItem(iid){
+      try{await api(`/api/templates/${tmplDetail.id}/items/${iid}`,{method:"DELETE"});await openTmpl(tmplDetail.id);}
+      catch(e){alert(e.message);}
+    }
+    async function doInstantiate(){
+      if(!instOpts.period_id){alert("Pick a target period");return;}
+      try{
+        const res=await api(`/api/templates/${tmplDetail.id}/instantiate`,{method:"POST",body:JSON.stringify({
+          period_id:parseInt(instOpts.period_id),
+          default_assignee_id:instOpts.default_assignee_id?parseInt(instOpts.default_assignee_id):null,
+          default_reviewer_id:instOpts.default_reviewer_id?parseInt(instOpts.default_reviewer_id):null,
+        })});
+        alert(`Created ${res.created} tasks${res.skipped?` (${res.skipped} skipped — missing assignee/reviewer/category)`:""}`);
+        setShowInstantiate(false);await loadAll();
+      }catch(e){alert(e.message);}
+    }
+    async function doSaveAsTmpl(){
+      if(!saveTmplName.trim()){alert("Template name required");return;}
+      try{
+        const res=await api("/api/templates/from_period",{method:"POST",body:JSON.stringify({period_id:period.id,name:saveTmplName})});
+        alert(`Saved template with ${res.items} items`);
+        setShowSaveAsTmpl(false);setSaveTmplName("");await loadTemplates();
+      }catch(e){alert(e.message);}
+    }
+    async function doRollFwd(){
+      if(!rollOpts.source_period_id||!rollOpts.target_period_id){alert("Pick source and target periods");return;}
+      try{
+        const res=await api("/api/periods/rollforward",{method:"POST",body:JSON.stringify({
+          source_period_id:parseInt(rollOpts.source_period_id),
+          target_period_id:parseInt(rollOpts.target_period_id),
+          shift_days:parseInt(rollOpts.shift_days||30),
+        })});
+        alert(`Rolled forward ${res.created} tasks`);
+        setShowRollFwd(false);await loadAll();
+      }catch(e){alert(e.message);}
+    }
+
+    const stabs=["users","categories","tasks","templates"];
     return(<div>
       <div style={{display:"flex",gap:0,marginBottom:24,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
         {stabs.map(t=><button key={t} onClick={()=>setSettingsTab(t)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:settingsTab===t?"#1e2d3d":"transparent",color:settingsTab===t?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:settingsTab===t?600:400,textTransform:"capitalize"}}>{t}</button>)}
@@ -533,9 +698,13 @@ function CloseApp(){
 
       {/* TASKS */}
       {settingsTab==="tasks"&&<div style={S.card}>
-        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,alignItems:"center",flexWrap:"wrap",gap:8}}>
           <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>All Tasks — {period?.label}</div>
-          <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddTask(true)}>+ Add Task</button>
+          <div style={{display:"flex",gap:6}}>
+            <button className="btn btn-ghost" style={{fontSize:12,padding:"6px 12px"}} onClick={()=>setShowSaveAsTmpl(true)}>⇣ Save as Template</button>
+            <button className="btn btn-ghost" style={{fontSize:12,padding:"6px 12px"}} onClick={()=>{setRollOpts({source_period_id:period?.id||"",target_period_id:"",shift_days:30});setShowRollFwd(true);}}>⇆ Roll Forward</button>
+            <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddTask(true)}>+ Add Task</button>
+          </div>
         </div>
         <table style={{width:"100%",borderCollapse:"collapse"}}>
           <thead><tr>{["Task","Category","Assignee","Due","Status","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
@@ -606,6 +775,139 @@ function CloseApp(){
         </div>
       </Modal>}
 
+      {/* TEMPLATES */}
+      {settingsTab==="templates"&&<div>
+        {!tmplDetail&&<div style={S.card}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Checklist Templates</div>
+              <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Save reusable task lists and spin them up into new periods in one click.</div>
+            </div>
+            <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>setShowAddTmpl(true)}>+ New Template</button>
+          </div>
+          {templates.length===0?<div style={{color:"#475569",fontSize:13,padding:"20px 0"}}>No templates yet. Create one, or use "Save as Template" from the Tasks tab.</div>:
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{["Template","Items","Created","Actions"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <tbody>{templates.map(t=>(
+              <tr key={t.id}>
+                <td style={{...S.td,fontWeight:500}}>{t.name}<div style={{fontSize:11,color:"#64748b",marginTop:2}}>{t.description}</div></td>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{t.item_count}</td>
+                <td style={{...S.td,fontSize:12,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>{new Date(t.created_at+"Z").toLocaleDateString("en-US",{month:"short",day:"numeric"})}</td>
+                <td style={S.td}><div style={{display:"flex",gap:6}}>
+                  <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>openTmpl(t.id)}>Open</button>
+                  <button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>deleteTmpl(t.id)}>Delete</button>
+                </div></td>
+              </tr>
+            ))}</tbody>
+          </table>}
+        </div>}
+        {tmplDetail&&<div style={S.card}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,alignItems:"center"}}>
+            <div>
+              <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px",marginBottom:6}} onClick={()=>setTmplDetail(null)}>‹ Back</button>
+              <div style={{fontSize:15,fontWeight:700,color:"#f1f5f9"}}>{tmplDetail.name}</div>
+              <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>{tmplDetail.description||"No description"}</div>
+            </div>
+            <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={()=>{setInstOpts({period_id:period?.id||"",default_assignee_id:"",default_reviewer_id:""});setShowInstantiate(true);}}>↪ Instantiate into Period</button>
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse",marginBottom:14}}>
+            <thead><tr>{["Task","Category","Assignee","Reviewer","Day Offset",""].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <tbody>{(tmplDetail.items||[]).map(it=>(
+              <tr key={it.id}>
+                <td style={{...S.td,fontWeight:500}}>{it.name}</td>
+                <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{it.category_name||"—"}</td>
+                <td style={S.td}>{it.assignee_initials?<Avatar user={{initials:it.assignee_initials,color:it.assignee_color}} size={22}/>:<span style={{fontSize:11,color:"#64748b"}}>any</span>}</td>
+                <td style={S.td}>{it.reviewer_initials?<Avatar user={{initials:it.reviewer_initials,color:"#64748b"}} size={22}/>:<span style={{fontSize:11,color:"#64748b"}}>any</span>}</td>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>+{it.days_offset}d</td>
+                <td style={S.td}><button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>delItem(it.id)}>×</button></td>
+              </tr>
+            ))}</tbody>
+          </table>
+          <div style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,padding:12}}>
+            <div style={{fontSize:12,color:"#94a3b8",marginBottom:8,fontWeight:600}}>Add item</div>
+            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr .6fr auto",gap:8,alignItems:"end"}}>
+              <div><label className="form-label">Task name</label><input className="form-input" value={newItem.name} onChange={e=>setNewItem(p=>({...p,name:e.target.value}))}/></div>
+              <div><label className="form-label">Category</label>
+                <select className="form-select" value={newItem.category_id} onChange={e=>setNewItem(p=>({...p,category_id:e.target.value}))}>
+                  <option value="">—</option>{cats.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              </div>
+              <div><label className="form-label">Assignee</label>
+                <select className="form-select" value={newItem.default_assignee_id} onChange={e=>setNewItem(p=>({...p,default_assignee_id:e.target.value}))}>
+                  <option value="">default</option>{users.map(u=><option key={u.id} value={u.id}>{u.initials}</option>)}
+                </select>
+              </div>
+              <div><label className="form-label">Reviewer</label>
+                <select className="form-select" value={newItem.default_reviewer_id} onChange={e=>setNewItem(p=>({...p,default_reviewer_id:e.target.value}))}>
+                  <option value="">default</option>{users.map(u=><option key={u.id} value={u.id}>{u.initials}</option>)}
+                </select>
+              </div>
+              <div><label className="form-label">Days</label><input type="number" className="form-input" value={newItem.days_offset} onChange={e=>setNewItem(p=>({...p,days_offset:e.target.value}))}/></div>
+              <button className="btn btn-primary" style={{fontSize:12,padding:"9px 14px"}} onClick={addItem}>+ Add</button>
+            </div>
+          </div>
+        </div>}
+      </div>}
+
+      {/* Template Modals */}
+      {showAddTmpl&&<Modal title="New Template" onClose={()=>setShowAddTmpl(false)}>
+        <div className="form-group"><label className="form-label">Name</label><input className="form-input" value={newTmpl.name} onChange={e=>setNewTmpl(p=>({...p,name:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Description</label><input className="form-input" value={newTmpl.description} onChange={e=>setNewTmpl(p=>({...p,description:e.target.value}))}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowAddTmpl(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={createTmpl}>Create</button>
+        </div>
+      </Modal>}
+      {showInstantiate&&<Modal title={`Instantiate "${tmplDetail?.name}"`} onClose={()=>setShowInstantiate(false)}>
+        <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>Creates a task for each item in the selected period. Due dates are computed as period start + days offset.</div>
+        <div className="form-group"><label className="form-label">Target period</label>
+          <select className="form-select" value={instOpts.period_id} onChange={e=>setInstOpts(p=>({...p,period_id:e.target.value}))}>
+            <option value="">— pick —</option>
+            {periodsAll.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Fallback assignee (used if item has no default)</label>
+          <select className="form-select" value={instOpts.default_assignee_id} onChange={e=>setInstOpts(p=>({...p,default_assignee_id:e.target.value}))}>
+            <option value="">— none —</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Fallback reviewer</label>
+          <select className="form-select" value={instOpts.default_reviewer_id} onChange={e=>setInstOpts(p=>({...p,default_reviewer_id:e.target.value}))}>
+            <option value="">— none —</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowInstantiate(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={doInstantiate}>Instantiate</button>
+        </div>
+      </Modal>}
+      {showSaveAsTmpl&&<Modal title="Save Current Period as Template" onClose={()=>setShowSaveAsTmpl(false)}>
+        <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>Snapshots every task in <b style={{color:"#cbd5e1"}}>{period?.label}</b> into a reusable template. Due dates become day-offsets from the period start.</div>
+        <div className="form-group"><label className="form-label">Template name</label><input className="form-input" value={saveTmplName} onChange={e=>setSaveTmplName(e.target.value)} placeholder="e.g. Standard Monthly Close"/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowSaveAsTmpl(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={doSaveAsTmpl}>Save</button>
+        </div>
+      </Modal>}
+      {showRollFwd&&<Modal title="Roll Forward Tasks" onClose={()=>setShowRollFwd(false)}>
+        <div style={{fontSize:12,color:"#64748b",marginBottom:14}}>Copies all tasks from the source period into the target period, shifting due dates by the given number of days.</div>
+        <div className="form-group"><label className="form-label">Source period</label>
+          <select className="form-select" value={rollOpts.source_period_id} onChange={e=>setRollOpts(p=>({...p,source_period_id:e.target.value}))}>
+            <option value="">— pick —</option>{periodsAll.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Target period</label>
+          <select className="form-select" value={rollOpts.target_period_id} onChange={e=>setRollOpts(p=>({...p,target_period_id:e.target.value}))}>
+            <option value="">— pick —</option>{periodsAll.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+        </div>
+        <div className="form-group"><label className="form-label">Shift due dates by (days)</label><input type="number" className="form-input" value={rollOpts.shift_days} onChange={e=>setRollOpts(p=>({...p,shift_days:e.target.value}))}/></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowRollFwd(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={doRollFwd}>Roll Forward</button>
+        </div>
+      </Modal>}
+
       {showAddTask&&<Modal title="Add Task" onClose={()=>setShowAddTask(false)}>
         <div className="form-group"><label className="form-label">Task Name</label><input className="form-input" value={newTask.name} onChange={e=>setNewTask(p=>({...p,name:e.target.value}))}/></div>
         <div className="form-group"><label className="form-label">Category</label>
@@ -633,12 +935,166 @@ function CloseApp(){
     </div>);
   }
 
+  // ── Calendar View ───────────────────────────────────────────────────────────
+  function CalendarView(){
+    const month=calendarMonth||new Date();
+    const y=month.getFullYear(),m=month.getMonth();
+    const first=new Date(y,m,1),last=new Date(y,m+1,0);
+    const startPad=first.getDay();
+    const days=[];
+    for(let i=0;i<startPad;i++)days.push(null);
+    for(let d=1;d<=last.getDate();d++)days.push(new Date(y,m,d));
+    while(days.length%7!==0)days.push(null);
+    const byDay={};
+    tasks.forEach(t=>{if(t.due_date){const k=t.due_date;if(!byDay[k])byDay[k]=[];byDay[k].push(t);}});
+    const todayISO=new Date().toISOString().slice(0,10);
+    const monthLabel=month.toLocaleDateString("en-US",{month:"long",year:"numeric"});
+    function shift(n){const d=new Date(y,m+n,1);setCalendarMonth(d);}
+    return(<div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{monthLabel}</div>
+        <div style={{display:"flex",gap:6}}>
+          <button className="btn btn-ghost" style={{fontSize:12,padding:"5px 12px"}} onClick={()=>shift(-1)}>‹ Prev</button>
+          <button className="btn btn-ghost" style={{fontSize:12,padding:"5px 12px"}} onClick={()=>{const p=period?.start_date?new Date(period.start_date+"T00:00:00"):new Date();setCalendarMonth(p);}}>Period</button>
+          <button className="btn btn-ghost" style={{fontSize:12,padding:"5px 12px"}} onClick={()=>shift(1)}>Next ›</button>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:6,marginBottom:6}}>
+        {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d=>
+          <div key={d} style={{fontSize:10,color:"#64748b",fontFamily:"'DM Mono',monospace",textTransform:"uppercase",letterSpacing:.5,textAlign:"center",padding:"4px 0"}}>{d}</div>
+        )}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:6}}>
+        {days.map((d,i)=>{
+          if(!d)return <div key={i} style={{minHeight:90,background:"#0b0f15",borderRadius:8,border:"1px solid #111827"}}/>;
+          const iso=d.toISOString().slice(0,10);
+          const dayTasks=byDay[iso]||[];
+          const isToday=iso===todayISO;
+          return(<div key={i} style={{minHeight:90,background:"#0d1117",border:`1px solid ${isToday?"#4f8ef7":"#1e2d3d"}`,borderRadius:8,padding:8,display:"flex",flexDirection:"column",gap:4}}>
+            <div style={{fontSize:11,fontFamily:"'DM Mono',monospace",color:isToday?"#4f8ef7":"#64748b",fontWeight:isToday?700:400}}>{d.getDate()}</div>
+            {dayTasks.slice(0,3).map(t=>{
+              const col=SC[t.status]?.color||"#94a3b8";
+              return(<div key={t.id} onClick={()=>setSelectedTask(t)}
+                style={{fontSize:11,background:col+"15",color:col,border:`1px solid ${col}30`,borderRadius:5,padding:"2px 6px",cursor:"pointer",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={t.name}>
+                {t.assignee_initials} · {t.name}
+              </div>);
+            })}
+            {dayTasks.length>3&&<div style={{fontSize:10,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>+{dayTasks.length-3} more</div>}
+          </div>);
+        })}
+      </div>
+    </div>);
+  }
+
+  // ── Activity Log ────────────────────────────────────────────────────────────
+  function ActivityLog(){
+    const actionLabel={status_change:"Status",review_change:"Review",note:"Note",created:"Created",bulk_status:"Bulk Status",bulk_review_status:"Bulk Review",bulk_assignee_id:"Bulk Assignee",bulk_reviewer_id:"Bulk Reviewer",bulk_due_date:"Bulk Due",bulk_category_id:"Bulk Category"};
+    return(<div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Task Activity — {period?.label}</div>
+          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Full audit trail of changes and reviews for this period</div>
+        </div>
+        <div style={{display:"flex",gap:6}}>
+          <button className="btn btn-ghost" style={{fontSize:12,padding:"6px 12px"}} onClick={loadActivity} disabled={activityLoading}>{activityLoading?"Loading…":"↻ Refresh"}</button>
+          <a href={`/api/activity/export.csv?period_id=${period?.id||""}`} className="btn btn-primary" style={{fontSize:12,padding:"6px 12px",textDecoration:"none",display:"inline-flex",alignItems:"center"}}>⇣ Export CSV</a>
+        </div>
+      </div>
+      {activityLoading?<Spinner/>:activityLog.length===0?<div style={{color:"#475569",fontSize:13,padding:"20px 0"}}>No activity yet.</div>:
+      <table style={{width:"100%",borderCollapse:"collapse"}}>
+        <thead><tr>{["When","Who","Category","Task","Action","Change"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+        <tbody>{activityLog.map(a=>(
+          <tr key={a.id} style={{cursor:"pointer"}} onClick={()=>{const full=tasks.find(t=>t.id===a.task_id);if(full){setSelectedTask(full);setTab("checklist");}}}>
+            <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:11.5,color:"#94a3b8",whiteSpace:"nowrap"}}>{new Date(a.created_at+"Z").toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
+            <td style={S.td}><div style={{display:"flex",alignItems:"center",gap:6}}><Avatar user={{initials:a.user_initials,color:a.user_color}} size={22}/><span style={{fontSize:12}}>{a.user_name}</span></div></td>
+            <td style={{...S.td,fontSize:12,color:"#64748b"}}>{a.category_name}</td>
+            <td style={{...S.td,fontSize:12.5,maxWidth:260,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.task_name}</td>
+            <td style={S.td}><span style={{fontSize:11,padding:"2px 8px",borderRadius:4,background:"#1e2d3d",color:"#94a3b8",fontFamily:"'DM Mono',monospace"}}>{actionLabel[a.action]||a.action}</span></td>
+            <td style={{...S.td,fontSize:12}}>
+              {a.action==="note"?<span style={{color:"#cbd5e1",fontStyle:"italic",maxWidth:260,display:"inline-block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",verticalAlign:"middle"}}>"{a.new_value}"</span>
+              :<span style={{color:"#94a3b8",fontFamily:"'DM Mono',monospace",fontSize:11.5}}>{a.old_value||"—"} → <span style={{color:"#4fd9a0"}}>{a.new_value||"—"}</span></span>}
+            </td>
+          </tr>
+        ))}</tbody>
+      </table>}
+    </div>);
+  }
+
+  // ── Attachments Modal ───────────────────────────────────────────────────────
+  function AttachmentsModal({recon,onClose}){
+    const [files,setFiles]=useState([]);
+    const [loading,setLoading]=useState(true);
+    const [uploading,setUploading]=useState(false);
+    const inputRef=useRef(null);
+    async function load(){
+      setLoading(true);
+      try{const rows=await api(`/api/reconciliations/${recon.id}/attachments`);setFiles(rows);}
+      catch(e){console.error(e);}
+      setLoading(false);
+    }
+    useEffect(()=>{load();},[recon.id]);
+    async function upload(e){
+      const f=e.target.files?.[0];if(!f)return;
+      setUploading(true);
+      const fd=new FormData();fd.append("file",f);
+      try{
+        const res=await fetch(`/api/reconciliations/${recon.id}/attachments`,{method:"POST",body:fd,credentials:"include"});
+        if(!res.ok){const j=await res.json().catch(()=>({}));throw new Error(j.error||"Upload failed");}
+        await load();
+      }catch(err){alert(err.message);}
+      setUploading(false);
+      if(inputRef.current)inputRef.current.value="";
+    }
+    async function remove(id){
+      if(!confirm("Delete this attachment?"))return;
+      try{await api(`/api/reconciliations/${recon.id}/attachments/${id}`,{method:"DELETE"});await load();}
+      catch(e){alert(e.message);}
+    }
+    function fmtSize(b){if(b==null)return"";if(b<1024)return b+" B";if(b<1048576)return(b/1024).toFixed(1)+" KB";return(b/1048576).toFixed(1)+" MB";}
+    return(<div className="modal-overlay" onClick={onClose}><div className="modal-box" style={{width:540}} onClick={e=>e.stopPropagation()}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+        <div>
+          <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>{recon.account_number}</div>
+          <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{recon.account_name} — Attachments</div>
+        </div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+      </div>
+      <div style={{fontSize:11.5,color:"#64748b",marginBottom:16}}>Bank statements, screenshots, or supporting docs. Max 25 MB per file.</div>
+      <div style={{marginBottom:14}}>
+        <input ref={inputRef} type="file" onChange={upload} style={{display:"none"}}/>
+        <button className="btn btn-primary" style={{width:"100%"}} onClick={()=>inputRef.current?.click()} disabled={uploading}>
+          {uploading?"Uploading…":"+ Upload File"}
+        </button>
+      </div>
+      {loading?<Spinner/>:files.length===0?
+        <div style={{fontSize:13,color:"#475569",textAlign:"center",padding:"20px 0"}}>No attachments yet.</div>:
+        <div>{files.map(f=>(
+          <div key={f.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,marginBottom:6}}>
+            <div style={{flex:1,minWidth:0}}>
+              <a href={`/api/reconciliations/${recon.id}/attachments/${f.id}`} style={{fontSize:13,color:"#e2e8f0",textDecoration:"none",fontWeight:500,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.filename}</a>
+              <div style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace",marginTop:2}}>
+                {fmtSize(f.size_bytes)} · {f.uploader_initials||"—"} · {new Date(f.created_at+"Z").toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+              </div>
+            </div>
+            <button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>remove(f.id)}>Delete</button>
+          </div>
+        ))}</div>}
+    </div></div>);
+  }
+
   const navItems=[
     {id:"dashboard",label:"Dashboard",icon:"⬡"},
     {id:"checklist",label:"Close Checklist",icon:"☑"},
+    {id:"calendar",label:"Calendar",icon:"▦"},
     {id:"recons",label:"Reconciliations",icon:"⇌"},
+    {id:"activity",label:"Activity Log",icon:"◷"},
     ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
   ];
+
+  useEffect(()=>{
+    if(tab==="activity"&&period)loadActivity();
+    if(tab==="settings"&&isAdmin)loadTemplates();
+  },[tab,period?.id]);
 
   return(<div style={S.app}>
     <div style={S.sidebar}>
@@ -672,17 +1128,22 @@ function CloseApp(){
           <div style={{fontSize:13,color:"#64748b",marginTop:3}}>
             {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}
             {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
+            {tab==="calendar"&&`${tasks.filter(t=>t.due_date).length} tasks with due dates`}
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
-            {tab==="settings"&&"Admin only — manage team, categories, and tasks"}
+            {tab==="activity"&&`${activityLog.length} events · period ${period?.label||""}`}
+            {tab==="settings"&&"Admin only — manage team, categories, templates, and tasks"}
           </div>
         </div>
       </div>
       {tab==="dashboard"&&<Dashboard/>}
       {tab==="checklist"&&<Checklist/>}
+      {tab==="calendar"&&<CalendarView/>}
       {tab==="recons"&&<Reconciliations/>}
+      {tab==="activity"&&<ActivityLog/>}
       {tab==="settings"&&isAdmin&&<Settings/>}
     </div>
     {selectedTask&&<TaskModal/>}
+    {attachRecon&&<AttachmentsModal recon={attachRecon} onClose={()=>setAttachRecon(null)}/>}
   </div>);
 }
 

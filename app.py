@@ -1,20 +1,24 @@
-import os, sqlite3, traceback
-from datetime import datetime, timezone
+import os, sqlite3, traceback, io, csv, uuid
+from datetime import datetime, timezone, timedelta
 from functools import wraps
-from flask import Flask, jsonify, request, g, send_from_directory, session
+from flask import Flask, jsonify, request, g, send_from_directory, session, Response
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
 load_dotenv()
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(BASE_DIR, "closeapp.db")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder=None)
 app.secret_key = os.getenv("SECRET_KEY", "closetool2026secret")
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB cap on uploads
 
 @app.after_request
 def add_cors(response):
@@ -563,6 +567,319 @@ def dashboard():
         "by_category":    cats,
         "attention":      attention,
     })
+
+# ── Activity (Audit Trail) ────────────────────────────────────────────────────
+
+ACTIVITY_SELECT = """
+    SELECT a.id, a.task_id, a.action, a.old_value, a.new_value, a.created_at,
+           u.id AS user_id, u.name AS user_name, u.initials AS user_initials, u.color AS user_color,
+           t.name AS task_name, t.period_id AS period_id,
+           c.name AS category_name
+    FROM task_activity a
+    JOIN users u ON u.id = a.user_id
+    JOIN tasks t ON t.id = a.task_id
+    JOIN categories c ON c.id = t.category_id
+"""
+
+@app.route("/api/tasks/<int:tid>/activity", methods=["GET", "OPTIONS"])
+@login_required
+def task_activity_feed(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q(ACTIVITY_SELECT + " WHERE a.task_id=? ORDER BY a.created_at DESC", (tid,))
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/activity", methods=["GET", "OPTIONS"])
+@login_required
+def activity_feed():
+    if request.method == "OPTIONS":
+        return "", 204
+    period_id = request.args.get("period_id")
+    limit = int(request.args.get("limit", 500))
+    if period_id:
+        rows = q(ACTIVITY_SELECT + " WHERE t.period_id=? ORDER BY a.created_at DESC LIMIT ?", (period_id, limit))
+    else:
+        rows = q(ACTIVITY_SELECT + " ORDER BY a.created_at DESC LIMIT ?", (limit,))
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/activity/export.csv", methods=["GET", "OPTIONS"])
+@login_required
+def activity_export():
+    if request.method == "OPTIONS":
+        return "", 204
+    period_id = request.args.get("period_id")
+    if period_id:
+        rows = q(ACTIVITY_SELECT + " WHERE t.period_id=? ORDER BY a.created_at DESC", (period_id,))
+    else:
+        rows = q(ACTIVITY_SELECT + " ORDER BY a.created_at DESC")
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Timestamp", "User", "Category", "Task", "Action", "Old Value", "New Value"])
+    for r in rows:
+        w.writerow([r["created_at"], r["user_name"], r["category_name"], r["task_name"],
+                    r["action"], r["old_value"] or "", r["new_value"] or ""])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=close_activity.csv"})
+
+# ── Bulk Task Actions + Roll-Forward ──────────────────────────────────────────
+
+@app.route("/api/tasks/bulk", methods=["POST", "OPTIONS"])
+@login_required
+def bulk_tasks():
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    ids = b.get("ids") or []
+    patch = b.get("patch") or {}
+    if not ids or not isinstance(ids, list) or not patch:
+        return err("ids (list) and patch required")
+    user = get_current_user()
+    if user["role"] == "admin":
+        allowed = {"status", "review_status", "assignee_id", "reviewer_id", "due_date", "category_id"}
+    else:
+        allowed = {"status", "review_status"}
+    updates = {k: v for k, v in patch.items() if k in allowed}
+    if not updates:
+        return err("No valid fields in patch")
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    affected = 0
+    for tid in ids:
+        t = q1("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not t:
+            continue
+        if user["role"] != "admin" and t["assignee_id"] != user["id"] and t["reviewer_id"] != user["id"]:
+            continue
+        run(f"UPDATE tasks SET {set_clause} WHERE id=?", list(updates.values()) + [tid])
+        for k, v in updates.items():
+            run("INSERT INTO task_activity (task_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
+                (tid, user["id"], "bulk_" + k, str(t[k]) if t[k] is not None else None, str(v)))
+        affected += 1
+    return jsonify({"updated": affected})
+
+@app.route("/api/periods/rollforward", methods=["POST", "OPTIONS"])
+@admin_required
+def roll_forward():
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    src = b.get("source_period_id")
+    dst = b.get("target_period_id")
+    shift_days = int(b.get("shift_days", 30))
+    if not src or not dst:
+        return err("source_period_id and target_period_id required")
+    if not q1("SELECT 1 FROM periods WHERE id=?", (dst,)):
+        return err("Target period not found", 404)
+    src_tasks = q("SELECT * FROM tasks WHERE period_id=?", (src,))
+    created = 0
+    for t in src_tasks:
+        new_due = None
+        if t["due_date"]:
+            try:
+                new_due = (datetime.fromisoformat(t["due_date"]) + timedelta(days=shift_days)).date().isoformat()
+            except Exception:
+                new_due = t["due_date"]
+        run("INSERT INTO tasks (period_id,category_id,name,assignee_id,reviewer_id,due_date) VALUES (?,?,?,?,?,?)",
+            (dst, t["category_id"], t["name"], t["assignee_id"], t["reviewer_id"], new_due))
+        created += 1
+    return jsonify({"created": created})
+
+# ── Reconciliation Attachments ────────────────────────────────────────────────
+
+@app.route("/api/reconciliations/<int:rid>/attachments", methods=["GET", "POST", "OPTIONS"])
+@login_required
+def recon_attachments(rid):
+    if request.method == "OPTIONS":
+        return "", 204
+    if not q1("SELECT 1 FROM reconciliations WHERE id=?", (rid,)):
+        return err("Reconciliation not found", 404)
+    if request.method == "GET":
+        rows = q("""SELECT a.id, a.recon_id, a.filename, a.size_bytes, a.created_at, a.uploader_id,
+                           u.name AS uploader_name, u.initials AS uploader_initials, u.color AS uploader_color
+                    FROM recon_attachments a
+                    LEFT JOIN users u ON u.id = a.uploader_id
+                    WHERE a.recon_id=? ORDER BY a.created_at DESC""", (rid,))
+        return jsonify(rows_to_list(rows))
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return err("No file uploaded")
+    safe = secure_filename(f.filename) or "upload"
+    stored = f"{uuid.uuid4().hex}_{safe}"
+    path = os.path.join(UPLOAD_DIR, stored)
+    f.save(path)
+    size = os.path.getsize(path)
+    user = get_current_user()
+    cur = run("INSERT INTO recon_attachments (recon_id,filename,stored_name,size_bytes,uploader_id) VALUES (?,?,?,?,?)",
+              (rid, safe, stored, size, user["id"]))
+    return jsonify({"id": cur.lastrowid, "filename": safe, "size_bytes": size}), 201
+
+@app.route("/api/reconciliations/<int:rid>/attachments/<int:aid>", methods=["GET", "DELETE", "OPTIONS"])
+@login_required
+def recon_attachment(rid, aid):
+    if request.method == "OPTIONS":
+        return "", 204
+    row = q1("SELECT * FROM recon_attachments WHERE id=? AND recon_id=?", (aid, rid))
+    if not row:
+        return err("Attachment not found", 404)
+    if request.method == "DELETE":
+        user = get_current_user()
+        if user["role"] != "admin" and row["uploader_id"] != user["id"]:
+            return err("Only uploader or admin can delete", 403)
+        path = os.path.join(UPLOAD_DIR, row["stored_name"])
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        run("DELETE FROM recon_attachments WHERE id=?", (aid,))
+        return jsonify({"deleted": aid})
+    return send_from_directory(UPLOAD_DIR, row["stored_name"], as_attachment=True, download_name=row["filename"])
+
+# ── Checklist Templates ───────────────────────────────────────────────────────
+
+@app.route("/api/templates", methods=["GET", "POST", "OPTIONS"])
+@login_required
+def templates_list():
+    if request.method == "OPTIONS":
+        return "", 204
+    if request.method == "GET":
+        rows = q("""SELECT t.*, (SELECT COUNT(*) FROM template_items WHERE template_id=t.id) AS item_count
+                    FROM templates t ORDER BY t.name""")
+        return jsonify(rows_to_list(rows))
+    user = get_current_user()
+    if user["role"] != "admin":
+        return err("Admin required", 403)
+    b = request.json or {}
+    name = (b.get("name") or "").strip()
+    if not name:
+        return err("name required")
+    try:
+        cur = run("INSERT INTO templates (name, description) VALUES (?,?)", (name, b.get("description", "")))
+    except sqlite3.IntegrityError:
+        return err("Template name already exists")
+    return jsonify({"id": cur.lastrowid, "name": name}), 201
+
+@app.route("/api/templates/<int:tid>", methods=["GET", "DELETE", "OPTIONS"])
+@login_required
+def template_detail(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    t = q1("SELECT * FROM templates WHERE id=?", (tid,))
+    if not t:
+        return err("Template not found", 404)
+    if request.method == "DELETE":
+        user = get_current_user()
+        if user["role"] != "admin":
+            return err("Admin required", 403)
+        run("DELETE FROM template_items WHERE template_id=?", (tid,))
+        run("DELETE FROM templates WHERE id=?", (tid,))
+        return jsonify({"deleted": tid})
+    items = q("""SELECT ti.*, c.name AS category_name,
+                        u1.name AS assignee_name, u1.initials AS assignee_initials, u1.color AS assignee_color,
+                        u2.name AS reviewer_name, u2.initials AS reviewer_initials
+                 FROM template_items ti
+                 LEFT JOIN categories c ON c.id = ti.category_id
+                 LEFT JOIN users u1 ON u1.id = ti.default_assignee_id
+                 LEFT JOIN users u2 ON u2.id = ti.default_reviewer_id
+                 WHERE ti.template_id=? ORDER BY ti.sort_order, ti.id""", (tid,))
+    return jsonify({**dict(t), "items": rows_to_list(items)})
+
+@app.route("/api/templates/<int:tid>/items", methods=["POST", "OPTIONS"])
+@admin_required
+def add_template_item(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    if not q1("SELECT 1 FROM templates WHERE id=?", (tid,)):
+        return err("Template not found", 404)
+    b = request.json or {}
+    name = (b.get("name") or "").strip()
+    if not name:
+        return err("name required")
+    cur = run("""INSERT INTO template_items
+                 (template_id,category_id,name,default_assignee_id,default_reviewer_id,days_offset,sort_order)
+                 VALUES (?,?,?,?,?,?,?)""",
+              (tid, b.get("category_id"), name, b.get("default_assignee_id"), b.get("default_reviewer_id"),
+               int(b.get("days_offset", 0)), int(b.get("sort_order", 0))))
+    return jsonify({"id": cur.lastrowid}), 201
+
+@app.route("/api/templates/<int:tid>/items/<int:iid>", methods=["DELETE", "OPTIONS"])
+@admin_required
+def delete_template_item(tid, iid):
+    if request.method == "OPTIONS":
+        return "", 204
+    run("DELETE FROM template_items WHERE id=? AND template_id=?", (iid, tid))
+    return jsonify({"deleted": iid})
+
+@app.route("/api/templates/<int:tid>/instantiate", methods=["POST", "OPTIONS"])
+@admin_required
+def instantiate_template(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    period_id = b.get("period_id")
+    if not period_id:
+        return err("period_id required")
+    period = q1("SELECT * FROM periods WHERE id=?", (period_id,))
+    if not period:
+        return err("Period not found", 404)
+    items = q("SELECT * FROM template_items WHERE template_id=? ORDER BY sort_order, id", (tid,))
+    if not items:
+        return err("Template has no items")
+    try:
+        start = datetime.fromisoformat(period["start_date"])
+    except Exception:
+        return err("Invalid period start_date")
+    fallback_assignee = b.get("default_assignee_id")
+    fallback_reviewer = b.get("default_reviewer_id")
+    created, skipped = 0, 0
+    for it in items:
+        assignee_id = it["default_assignee_id"] or fallback_assignee
+        reviewer_id = it["default_reviewer_id"] or fallback_reviewer
+        if not assignee_id or not reviewer_id or not it["category_id"]:
+            skipped += 1
+            continue
+        due = (start + timedelta(days=int(it["days_offset"] or 0))).date().isoformat()
+        run("""INSERT INTO tasks (period_id,category_id,name,assignee_id,reviewer_id,due_date)
+               VALUES (?,?,?,?,?,?)""",
+            (period_id, it["category_id"], it["name"], assignee_id, reviewer_id, due))
+        created += 1
+    return jsonify({"created": created, "skipped": skipped})
+
+@app.route("/api/templates/from_period", methods=["POST", "OPTIONS"])
+@admin_required
+def template_from_period():
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    pid = b.get("period_id")
+    name = (b.get("name") or "").strip()
+    if not pid or not name:
+        return err("period_id and name required")
+    period = q1("SELECT * FROM periods WHERE id=?", (pid,))
+    if not period:
+        return err("Period not found", 404)
+    try:
+        cur = run("INSERT INTO templates (name, description) VALUES (?,?)",
+                  (name, b.get("description") or f"Created from {period['label']}"))
+    except sqlite3.IntegrityError:
+        return err("Template name already exists")
+    tid = cur.lastrowid
+    try:
+        start = datetime.fromisoformat(period["start_date"])
+    except Exception:
+        start = None
+    tasks_in_period = q("SELECT * FROM tasks WHERE period_id=? ORDER BY category_id, id", (pid,))
+    for i, t in enumerate(tasks_in_period):
+        offset = 0
+        if t["due_date"] and start:
+            try:
+                offset = (datetime.fromisoformat(t["due_date"]) - start).days
+            except Exception:
+                offset = 0
+        run("""INSERT INTO template_items
+               (template_id,category_id,name,default_assignee_id,default_reviewer_id,days_offset,sort_order)
+               VALUES (?,?,?,?,?,?,?)""",
+            (tid, t["category_id"], t["name"], t["assignee_id"], t["reviewer_id"], offset, i))
+    return jsonify({"id": tid, "items": len(tasks_in_period)}), 201
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 
