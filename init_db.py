@@ -129,6 +129,31 @@ CREATE TABLE IF NOT EXISTS template_items (
     sort_order          INTEGER DEFAULT 0
 );
 
+-- ─────────────────────────────────────────
+--  Trial Balance Snapshots
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS tb_snapshots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_id       INTEGER NOT NULL REFERENCES periods(id),
+    label           TEXT NOT NULL,
+    notes           TEXT DEFAULT '',
+    snapshotted_by  INTEGER REFERENCES users(id),
+    snapshotted_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS tb_snapshot_rows (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL REFERENCES tb_snapshots(id) ON DELETE CASCADE,
+    account_number  TEXT,
+    account_name    TEXT NOT NULL,
+    account_type    TEXT,
+    account_subtype TEXT,
+    classification  TEXT,
+    balance         REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tb_rows_snapshot ON tb_snapshot_rows(snapshot_id);
+
 -- Trigger: auto-update tasks.updated_at
 CREATE TRIGGER IF NOT EXISTS tasks_updated_at
 AFTER UPDATE ON tasks

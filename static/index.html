@@ -139,6 +139,10 @@ function CloseApp(){
   const [templates,setTemplates]=useState([]);
   const [attachRecon,setAttachRecon]=useState(null);
   const [periodsAll,setPeriodsAll]=useState([]);
+  const [tbSnapshots,setTbSnapshots]=useState([]);
+  const [tbDetail,setTbDetail]=useState(null);
+  const [tbLoading,setTbLoading]=useState(false);
+  const [tbTaking,setTbTaking]=useState(false);
 
   const isAdmin=currentUser?.role==="admin";
 
@@ -167,6 +171,32 @@ function CloseApp(){
   }
   async function loadTemplates(){
     try{const t=await api("/api/templates");setTemplates(t);}catch(e){console.error(e);}
+  }
+  async function loadTbSnapshots(){
+    if(!period)return;
+    setTbLoading(true);
+    try{const s=await api(`/api/periods/${period.id}/tb_snapshots`);setTbSnapshots(s);}
+    catch(e){console.error(e);}
+    setTbLoading(false);
+  }
+  async function takeTbSnapshot(){
+    if(!period)return;
+    if(!confirm(`Take a trial balance snapshot for ${period.label}? This pulls current account balances from QuickBooks and freezes them.`))return;
+    setTbTaking(true);
+    try{
+      const res=await api(`/api/periods/${period.id}/tb_snapshots`,{method:"POST",body:JSON.stringify({})});
+      await loadTbSnapshots();
+      alert(`Snapshot created with ${res.rows} accounts.`);
+    }catch(e){alert(e.message);}
+    setTbTaking(false);
+  }
+  async function openTbSnapshot(sid){
+    try{const d=await api(`/api/tb_snapshots/${sid}`);setTbDetail(d);}catch(e){alert(e.message);}
+  }
+  async function deleteTbSnapshot(sid){
+    if(!confirm("Delete this snapshot?"))return;
+    try{await api(`/api/tb_snapshots/${sid}`,{method:"DELETE"});await loadTbSnapshots();if(tbDetail?.id===sid)setTbDetail(null);}
+    catch(e){alert(e.message);}
   }
 
   useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
@@ -1082,11 +1112,87 @@ function CloseApp(){
     </div></div>);
   }
 
+  // ── Trial Balance ───────────────────────────────────────────────────────────
+  function TrialBalance(){
+    if(tbDetail){
+      const total=(tbDetail.rows||[]).reduce((s,r)=>s+(r.balance||0),0);
+      const byCls=tbDetail.totals_by_classification||{};
+      return(<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,alignItems:"center"}}>
+          <div>
+            <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px",marginBottom:6}} onClick={()=>setTbDetail(null)}>‹ Back to snapshots</button>
+            <div style={{fontSize:15,fontWeight:700,color:"#f1f5f9"}}>{tbDetail.label}</div>
+            <div style={{fontSize:11.5,color:"#64748b",marginTop:2,fontFamily:"'DM Mono',monospace"}}>{tbDetail.period_label} · {new Date(tbDetail.snapshotted_at+"Z").toLocaleString()} · {tbDetail.user_name||"—"} · {(tbDetail.rows||[]).length} accounts</div>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <a className="btn btn-ghost" href={`/api/tb_snapshots/${tbDetail.id}/export.csv`} style={{fontSize:12,padding:"6px 12px",textDecoration:"none"}}>⇣ CSV</a>
+            {isAdmin&&<button className="btn btn-danger" style={{fontSize:12,padding:"6px 12px"}} onClick={()=>deleteTbSnapshot(tbDetail.id)}>Delete</button>}
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8,marginBottom:16}}>
+          {["Asset","Liability","Equity","Revenue","Expense"].map(c=>(
+            <div key={c} style={{background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,padding:"10px 12px"}}>
+              <div style={{fontSize:10,color:"#64748b",fontFamily:"'DM Mono',monospace",textTransform:"uppercase",letterSpacing:.5}}>{c}</div>
+              <div style={{fontSize:14,fontWeight:700,color:"#f1f5f9",fontFamily:"'DM Mono',monospace",marginTop:3}}>{fmt(byCls[c]||0)}</div>
+            </div>
+          ))}
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Account","Name","Type","Classification","Balance"].map((h,i)=><th key={h} style={{...S.th,textAlign:i===4?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{(tbDetail.rows||[]).map(r=>(
+            <tr key={r.id}>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{r.account_number||"—"}</td>
+              <td style={{...S.td,fontWeight:500}}>{r.account_name}</td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{r.account_type}{r.account_subtype?` / ${r.account_subtype}`:""}</td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{r.classification||"—"}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.balance)}</td>
+            </tr>
+          ))}
+          <tr>
+            <td style={{...S.td,fontWeight:700}} colSpan={4}>Total (sum of all rows)</td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:13,fontWeight:700,color:"#4f8ef7"}}>{fmt(total)}</td>
+          </tr>
+          </tbody>
+        </table>
+      </div>);
+    }
+    return(<div style={S.card}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Trial Balance Snapshots — {period?.label}</div>
+          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Freeze QB account balances at close so period-over-period comparisons stay stable.</div>
+        </div>
+        {isAdmin&&<button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={takeTbSnapshot} disabled={tbTaking}>{tbTaking?"Snapshotting…":"+ Take Snapshot"}</button>}
+      </div>
+      {tbLoading?<Spinner/>:tbSnapshots.length===0?
+        <div style={{color:"#475569",fontSize:13,padding:"20px 0"}}>No snapshots yet. Connect to QuickBooks and click "Take Snapshot" to capture current balances.</div>:
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Label","When","By","Accounts","Assets","Actions"].map((h,i)=><th key={h} style={{...S.th,textAlign:i===4?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{tbSnapshots.map(s=>(
+            <tr key={s.id} style={{cursor:"pointer"}} onClick={()=>openTbSnapshot(s.id)}>
+              <td style={{...S.td,fontWeight:500}}>{s.label}</td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8",fontFamily:"'DM Mono',monospace"}}>{new Date(s.snapshotted_at+"Z").toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}</td>
+              <td style={S.td}><Avatar user={{initials:s.user_initials,color:"#64748b"}} size={22}/></td>
+              <td style={{...S.td,fontSize:12,fontFamily:"'DM Mono',monospace",color:"#94a3b8"}}>{s.row_count}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(s.total_assets||0)}</td>
+              <td style={S.td} onClick={e=>e.stopPropagation()}>
+                <div style={{display:"flex",gap:6}}>
+                  <a className="btn btn-ghost" href={`/api/tb_snapshots/${s.id}/export.csv`} style={{fontSize:11,padding:"4px 10px",textDecoration:"none"}}>CSV</a>
+                  {isAdmin&&<button className="btn btn-danger" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>deleteTbSnapshot(s.id)}>×</button>}
+                </div>
+              </td>
+            </tr>
+          ))}</tbody>
+        </table>}
+    </div>);
+  }
+
   const navItems=[
     {id:"dashboard",label:"Dashboard",icon:"⬡"},
     {id:"checklist",label:"Close Checklist",icon:"☑"},
     {id:"calendar",label:"Calendar",icon:"▦"},
     {id:"recons",label:"Reconciliations",icon:"⇌"},
+    {id:"tb",label:"Trial Balance",icon:"Σ"},
     {id:"activity",label:"Activity Log",icon:"◷"},
     ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
   ];
@@ -1094,6 +1200,7 @@ function CloseApp(){
   useEffect(()=>{
     if(tab==="activity"&&period)loadActivity();
     if(tab==="settings"&&isAdmin)loadTemplates();
+    if(tab==="tb"&&period){loadTbSnapshots();setTbDetail(null);}
   },[tab,period?.id]);
 
   return(<div style={S.app}>
@@ -1126,10 +1233,12 @@ function CloseApp(){
         <div>
           <div style={{fontSize:22,fontWeight:700,color:"#f1f5f9",letterSpacing:-0.5}}>{navItems.find(n=>n.id===tab)?.label}</div>
           <div style={{fontSize:13,color:"#64748b",marginTop:3}}>
-            {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}
+            {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}{"  "}
+            {tab==="dashboard"&&period&&<a href={`/api/periods/${period.id}/report.pdf`} style={{marginLeft:10,color:"#4f8ef7",fontSize:12,fontFamily:"'DM Mono',monospace",textDecoration:"none"}}>⇣ Export Close Report (PDF)</a>}
             {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
             {tab==="calendar"&&`${tasks.filter(t=>t.due_date).length} tasks with due dates`}
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
+            {tab==="tb"&&`${tbSnapshots.length} snapshot${tbSnapshots.length===1?"":"s"} for ${period?.label||""}`}
             {tab==="activity"&&`${activityLog.length} events · period ${period?.label||""}`}
             {tab==="settings"&&"Admin only — manage team, categories, templates, and tasks"}
           </div>
@@ -1139,6 +1248,7 @@ function CloseApp(){
       {tab==="checklist"&&<Checklist/>}
       {tab==="calendar"&&<CalendarView/>}
       {tab==="recons"&&<Reconciliations/>}
+      {tab==="tb"&&<TrialBalance/>}
       {tab==="activity"&&<ActivityLog/>}
       {tab==="settings"&&isAdmin&&<Settings/>}
     </div>

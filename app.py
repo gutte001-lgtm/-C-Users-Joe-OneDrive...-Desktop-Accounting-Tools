@@ -881,6 +881,294 @@ def template_from_period():
             (tid, t["category_id"], t["name"], t["assignee_id"], t["reviewer_id"], offset, i))
     return jsonify({"id": tid, "items": len(tasks_in_period)}), 201
 
+# ── Trial Balance Snapshots ───────────────────────────────────────────────────
+
+def fetch_qb_accounts():
+    data, error = qb_get("/query?query=SELECT%20*%20FROM%20Account%20MAXRESULTS%201000")
+    if error:
+        return None, error
+    return data.get("QueryResponse", {}).get("Account", []), None
+
+@app.route("/api/periods/<int:pid>/tb_snapshots", methods=["GET", "POST", "OPTIONS"])
+@login_required
+def period_tb_snapshots(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    if not q1("SELECT 1 FROM periods WHERE id=?", (pid,)):
+        return err("Period not found", 404)
+    if request.method == "GET":
+        rows = q("""SELECT s.*, u.name AS user_name, u.initials AS user_initials,
+                           (SELECT COUNT(*) FROM tb_snapshot_rows WHERE snapshot_id=s.id) AS row_count,
+                           (SELECT ROUND(SUM(CASE WHEN classification='Asset' THEN balance ELSE 0 END),2)
+                              FROM tb_snapshot_rows WHERE snapshot_id=s.id) AS total_assets
+                    FROM tb_snapshots s LEFT JOIN users u ON u.id=s.snapshotted_by
+                    WHERE s.period_id=? ORDER BY s.snapshotted_at DESC""", (pid,))
+        return jsonify(rows_to_list(rows))
+    user = get_current_user()
+    if user["role"] != "admin":
+        return err("Admin required", 403)
+    b = request.json or {}
+    accounts, error = fetch_qb_accounts()
+    if error:
+        return err(f"QB fetch failed: {error}", 502)
+    period = q1("SELECT * FROM periods WHERE id=?", (pid,))
+    default_label = f"{period['label']} close snapshot"
+    label = (b.get("label") or "").strip() or default_label
+    cur = run("INSERT INTO tb_snapshots (period_id,label,notes,snapshotted_by) VALUES (?,?,?,?)",
+              (pid, label, b.get("notes", ""), user["id"]))
+    sid = cur.lastrowid
+    inserted = 0
+    for a in accounts:
+        if not a.get("Active", True):
+            continue
+        run("""INSERT INTO tb_snapshot_rows
+               (snapshot_id,account_number,account_name,account_type,account_subtype,classification,balance)
+               VALUES (?,?,?,?,?,?,?)""",
+            (sid, (a.get("AcctNum") or "").strip(), a.get("Name", ""),
+             a.get("AccountType"), a.get("AccountSubType"), a.get("Classification"),
+             float(a.get("CurrentBalance") or 0)))
+        inserted += 1
+    return jsonify({"id": sid, "label": label, "rows": inserted}), 201
+
+@app.route("/api/tb_snapshots/<int:sid>", methods=["GET", "DELETE", "OPTIONS"])
+@login_required
+def tb_snapshot_detail(sid):
+    if request.method == "OPTIONS":
+        return "", 204
+    s = q1("""SELECT s.*, u.name AS user_name, u.initials AS user_initials, p.label AS period_label
+              FROM tb_snapshots s LEFT JOIN users u ON u.id=s.snapshotted_by
+              JOIN periods p ON p.id=s.period_id WHERE s.id=?""", (sid,))
+    if not s:
+        return err("Snapshot not found", 404)
+    if request.method == "DELETE":
+        user = get_current_user()
+        if user["role"] != "admin":
+            return err("Admin required", 403)
+        run("DELETE FROM tb_snapshot_rows WHERE snapshot_id=?", (sid,))
+        run("DELETE FROM tb_snapshots WHERE id=?", (sid,))
+        return jsonify({"deleted": sid})
+    rows = q("""SELECT * FROM tb_snapshot_rows WHERE snapshot_id=?
+                ORDER BY classification, account_number, account_name""", (sid,))
+    rows_list = rows_to_list(rows)
+    totals = {}
+    for r in rows_list:
+        c = r.get("classification") or "Other"
+        totals[c] = totals.get(c, 0) + (r.get("balance") or 0)
+    return jsonify({**dict(s), "rows": rows_list, "totals_by_classification": totals})
+
+@app.route("/api/tb_snapshots/<int:sid>/export.csv", methods=["GET", "OPTIONS"])
+@login_required
+def tb_snapshot_csv(sid):
+    if request.method == "OPTIONS":
+        return "", 204
+    s = q1("SELECT s.*, p.label AS period_label FROM tb_snapshots s JOIN periods p ON p.id=s.period_id WHERE s.id=?", (sid,))
+    if not s:
+        return err("Snapshot not found", 404)
+    rows = q("SELECT * FROM tb_snapshot_rows WHERE snapshot_id=? ORDER BY classification, account_number", (sid,))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([f"Trial Balance — {s['period_label']}", s['label']])
+    w.writerow(["Snapshotted", s['snapshotted_at']])
+    w.writerow([])
+    w.writerow(["Account #", "Account Name", "Type", "Sub-type", "Classification", "Balance"])
+    for r in rows:
+        w.writerow([r["account_number"], r["account_name"], r["account_type"],
+                    r["account_subtype"], r["classification"], f"{r['balance']:.2f}"])
+    fname = f"tb_snapshot_{sid}.csv"
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+# ── Close Report PDF ──────────────────────────────────────────────────────────
+
+def build_close_report_pdf(period_id):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+    from reportlab.lib.enums import TA_LEFT
+
+    period = q1("SELECT * FROM periods WHERE id=?", (period_id,))
+    if not period:
+        return None, "Period not found"
+
+    tasks_all = q("""SELECT t.*, c.name AS category_name,
+                            u1.name AS assignee_name, u1.initials AS assignee_initials,
+                            u2.name AS reviewer_name, u2.initials AS reviewer_initials
+                     FROM tasks t
+                     JOIN categories c ON c.id=t.category_id
+                     JOIN users u1 ON u1.id=t.assignee_id
+                     JOIN users u2 ON u2.id=t.reviewer_id
+                     WHERE t.period_id=? ORDER BY c.sort_order, t.id""", (period_id,))
+    recons_all = q("""SELECT r.*, u.name AS assignee_name, u.initials AS assignee_initials,
+                             CASE WHEN r.expected_balance IS NOT NULL
+                                  THEN r.qb_balance - r.expected_balance ELSE NULL END AS variance
+                      FROM reconciliations r JOIN users u ON u.id=r.assignee_id
+                      WHERE r.period_id=? ORDER BY r.account_number""", (period_id,))
+    cats = q("SELECT * FROM categories ORDER BY sort_order")
+    users = q("SELECT * FROM users")
+
+    total = len(tasks_all)
+    complete = sum(1 for t in tasks_all if t["status"] == "complete")
+    approved = sum(1 for t in tasks_all if t["review_status"] == "approved")
+    recon_done = sum(1 for r in recons_all if r["status"] == "reconciled")
+    close_pct = round(complete / total * 100) if total else 0
+    apv_pct = round(approved / total * 100) if total else 0
+    recon_pct = round(recon_done / len(recons_all) * 100) if recons_all else 0
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, rightMargin=48, leftMargin=48, topMargin=54, bottomMargin=54)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=20, textColor=colors.HexColor("#0f172a"), spaceAfter=4)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=13, textColor=colors.HexColor("#334155"), spaceBefore=14, spaceAfter=6)
+    meta = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9, textColor=colors.HexColor("#64748b"))
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=9.5, alignment=TA_LEFT)
+
+    story = []
+    story.append(Paragraph("Month-End Close Report", h1))
+    story.append(Paragraph(period["label"], ParagraphStyle("sub", parent=styles["Normal"], fontSize=12, textColor=colors.HexColor("#475569"), spaceAfter=4)))
+    story.append(Paragraph(f"Generated {datetime.utcnow().strftime('%b %d, %Y %H:%M UTC')}", meta))
+    story.append(Spacer(1, 12))
+
+    kpi_data = [
+        ["Close Progress", f"{close_pct}%", f"{complete} / {total} tasks"],
+        ["Reviewer Approval", f"{apv_pct}%", f"{approved} / {total} approved"],
+        ["Reconciliations", f"{recon_pct}%", f"{recon_done} / {len(recons_all)} complete"],
+    ]
+    kpi = Table(kpi_data, colWidths=[1.9*inch, 1.2*inch, 2.4*inch])
+    kpi.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e2e8f0")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor("#2563eb")),
+        ("TEXTCOLOR", (2, 0), (2, -1), colors.HexColor("#64748b")),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(kpi)
+
+    story.append(Paragraph("Progress by Category", h2))
+    cat_rows = [["Category", "Complete", "Total", "%"]]
+    for c in cats:
+        ct = [t for t in tasks_all if t["category_id"] == c["id"]]
+        if not ct:
+            continue
+        cdone = sum(1 for t in ct if t["status"] == "complete")
+        cat_rows.append([c["name"], str(cdone), str(len(ct)), f"{round(cdone/len(ct)*100)}%"])
+    tbl = Table(cat_rows, colWidths=[3.2*inch, 1*inch, 1*inch, 1*inch])
+    tbl.setStyle(_basic_table_style())
+    story.append(tbl)
+
+    story.append(Paragraph("Progress by Team Member", h2))
+    u_rows = [["Team Member", "Complete", "Total", "%"]]
+    for u in users:
+        ut = [t for t in tasks_all if t["assignee_id"] == u["id"]]
+        if not ut:
+            continue
+        udone = sum(1 for t in ut if t["status"] == "complete")
+        u_rows.append([u["name"], str(udone), str(len(ut)), f"{round(udone/len(ut)*100)}%"])
+    tbl = Table(u_rows, colWidths=[3.2*inch, 1*inch, 1*inch, 1*inch])
+    tbl.setStyle(_basic_table_style())
+    story.append(tbl)
+
+    open_items = [t for t in tasks_all if t["status"] != "complete" or t["review_status"] == "needs_revision"]
+    if open_items:
+        story.append(Paragraph(f"Open / Needs Attention ({len(open_items)})", h2))
+        rows = [["Task", "Category", "Assignee", "Due", "Status", "Review"]]
+        for t in open_items[:50]:
+            rows.append([
+                Paragraph(t["name"], body),
+                t["category_name"],
+                t["assignee_initials"] or "",
+                t["due_date"] or "",
+                t["status"].replace("_", " "),
+                t["review_status"].replace("_", " "),
+            ])
+        tbl = Table(rows, colWidths=[2.4*inch, 1.1*inch, 0.7*inch, 0.8*inch, 0.9*inch, 1.0*inch])
+        tbl.setStyle(_basic_table_style())
+        story.append(tbl)
+        if len(open_items) > 50:
+            story.append(Paragraph(f"…and {len(open_items) - 50} more.", meta))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Account Reconciliations", h2))
+    rrows = [["Account", "QB Balance", "Expected", "Variance", "Status"]]
+    for r in recons_all:
+        var = r["variance"]
+        var_str = "—" if var is None else (f"${var:,.2f}" if abs(var) > 0.005 else "—")
+        rrows.append([
+            f"{r['account_number']} {r['account_name']}",
+            f"${r['qb_balance']:,.2f}" if r["qb_balance"] is not None else "—",
+            f"${r['expected_balance']:,.2f}" if r["expected_balance"] is not None else "—",
+            var_str,
+            r["status"].replace("_", " "),
+        ])
+    tbl = Table(rrows, colWidths=[2.4*inch, 1.2*inch, 1.2*inch, 1.0*inch, 1.1*inch])
+    tbl.setStyle(_basic_table_style())
+    story.append(tbl)
+
+    variance_items = [r for r in recons_all if r["variance"] is not None and abs(r["variance"]) > 0.005]
+    if variance_items:
+        story.append(Paragraph("Variances Requiring Attention", h2))
+        vrows = [["Account", "Variance", "Assignee", "Status"]]
+        for r in variance_items:
+            vrows.append([
+                f"{r['account_number']} {r['account_name']}",
+                f"${r['variance']:,.2f}",
+                r["assignee_initials"] or "",
+                r["status"].replace("_", " "),
+            ])
+        tbl = Table(vrows, colWidths=[2.8*inch, 1.2*inch, 1*inch, 1.4*inch])
+        tbl.setStyle(_basic_table_style())
+        story.append(tbl)
+
+    story.append(Spacer(1, 24))
+    story.append(Paragraph("Signoff", h2))
+    signoff = [["Role", "Name", "Signature / Date"],
+               ["Controller", "", ""],
+               ["CFO", "", ""]]
+    tbl = Table(signoff, colWidths=[1.2*inch, 2.4*inch, 2.6*inch], rowHeights=[0.3*inch, 0.55*inch, 0.55*inch])
+    tbl.setStyle(_basic_table_style())
+    story.append(tbl)
+
+    doc.build(story)
+    return buf.getvalue(), None
+
+def _basic_table_style():
+    from reportlab.lib import colors
+    from reportlab.platypus import TableStyle
+    return TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e2e8f0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ])
+
+@app.route("/api/periods/<int:pid>/report.pdf", methods=["GET", "OPTIONS"])
+@login_required
+def close_report_pdf(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    pdf, error = build_close_report_pdf(pid)
+    if error:
+        return err(error, 404)
+    period = q1("SELECT * FROM periods WHERE id=?", (pid,))
+    fname = f"close_report_{period['label'].replace(' ', '_')}.pdf"
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
 # ── Frontend ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
