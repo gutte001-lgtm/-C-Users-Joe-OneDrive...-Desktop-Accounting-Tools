@@ -233,6 +233,31 @@ function CloseApp(){
   async function loadQbStatus(){
     try{const s=await api("/api/qb/status");setQbStatus(s);}catch(e){setQbStatus(null);}
   }
+  const [qbSyncState,setQbSyncState]=useState([]);
+  const [syncingEntity,setSyncingEntity]=useState(null);
+  const [fullBackfilling,setFullBackfilling]=useState(false);
+  async function loadQbSyncState(){
+    try{const s=await api("/api/qb/sync_state");setQbSyncState(s);}catch(e){console.error(e);}
+  }
+  async function syncOneEntity(entity,forceFull=false){
+    setSyncingEntity(entity);
+    try{
+      const r=await api(`/api/qb/sync/${entity}`,{method:"POST",body:JSON.stringify({force_full:forceFull})});
+      await loadQbSyncState();
+      if(r.error)alert(`Sync failed: ${r.error}`);
+    }catch(e){alert(e.message);}
+    setSyncingEntity(null);
+  }
+  async function fullBackfillAll(){
+    if(!confirm("Full resync pulls the last 3 years of all entities from QuickBooks. This can take 10-30 minutes. Continue?"))return;
+    setFullBackfilling(true);
+    try{
+      await api("/api/qb/sync_all",{method:"POST",body:JSON.stringify({force_full:true})});
+      await loadQbSyncState();
+      alert("Full backfill complete. See entity table for counts.");
+    }catch(e){alert(e.message);}
+    setFullBackfilling(false);
+  }
 
   useEffect(()=>{if(currentUser)loadAll();},[currentUser,loadAll]);
 
@@ -915,7 +940,40 @@ function CloseApp(){
       </div>}
 
       {/* INTEGRATIONS */}
-      {settingsTab==="integrations"&&<div style={S.card}>
+      {settingsTab==="integrations"&&<div>
+      {qbStatus?.connected&&<div style={{...S.card,marginBottom:14}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:14,alignItems:"center",flexWrap:"wrap",gap:8}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>QuickBooks Data Sync</div>
+            <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Read-only. Auto-refreshes every 15 min. Initial backfill covers last 3 years of transactions.</div>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <button className="btn btn-ghost" style={{fontSize:12,padding:"6px 12px"}} onClick={loadQbSyncState}>↻ Refresh</button>
+            <button className="btn btn-primary" style={{fontSize:12,padding:"6px 14px"}} onClick={fullBackfillAll} disabled={fullBackfilling}>{fullBackfilling?"Backfilling…":"⇣ Full Backfill (3 yr)"}</button>
+          </div>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Entity","Type","Records","Last Sync","Last Run","Status",""].map((h,i)=><th key={h} style={{...S.th,textAlign:i===2?"right":"left"}}>{h}</th>)}</tr></thead>
+          <tbody>{qbSyncState.map(s=>{
+            const sc=s.last_status==="idle"?"#4fd9a0":s.last_status==="syncing"?"#f7c948":s.last_status==="error"?"#f87171":"#94a3b8";
+            return(<tr key={s.entity}>
+              <td style={{...S.td,fontWeight:500}}>{s.qb_name}</td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{s.kind}</td>
+              <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{(s.record_count||0).toLocaleString()}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#64748b"}}>{s.last_sync_time?new Date(s.last_sync_time).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"never"}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:11,color:"#64748b"}}>{s.last_run_at?new Date(s.last_run_at+"Z").toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}):"—"}</td>
+              <td style={S.td}>
+                <span style={{fontSize:10.5,padding:"2px 8px",borderRadius:20,color:sc,border:`1px solid ${sc}40`,background:sc+"15",fontFamily:"'DM Mono',monospace"}}>{s.last_status||"never"}</span>
+                {s.last_error&&<div style={{fontSize:10,color:"#f87171",marginTop:3,fontFamily:"'DM Mono',monospace",maxWidth:240,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={s.last_error}>{s.last_error}</div>}
+              </td>
+              <td style={S.td}>
+                <button className="btn btn-ghost" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>syncOneEntity(s.entity,false)} disabled={syncingEntity===s.entity}>{syncingEntity===s.entity?"…":"Resync"}</button>
+              </td>
+            </tr>);
+          })}</tbody>
+        </table>
+      </div>}
+      <div style={S.card}>
         <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>Integrations</div>
         <div style={{fontSize:11.5,color:"#64748b",marginBottom:16}}>Connect external systems so the close tracker can read balances and post journal entries, invoices, bills, and payments.</div>
         <div style={{display:"grid",gap:10}}>
@@ -939,6 +997,7 @@ function CloseApp(){
             </div>
           ))}
         </div>
+      </div>
       </div>}
 
       {/* Template Modals */}
@@ -1411,7 +1470,7 @@ function CloseApp(){
 
   useEffect(()=>{
     if(tab==="activity"&&period)loadActivity();
-    if(tab==="settings"&&isAdmin){loadTemplates();loadQbStatus();}
+    if(tab==="settings"&&isAdmin){loadTemplates();loadQbStatus();loadQbSyncState();}
     if(tab==="tb"&&period){
       if(tbMode==="snapshots"){loadTbSnapshots();setTbDetail(null);}
       if(tbMode==="flux"){loadAllSnapshots();}

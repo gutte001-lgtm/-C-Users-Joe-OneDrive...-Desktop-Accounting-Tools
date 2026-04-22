@@ -179,6 +179,336 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_external
     ON pending_posts(source, external_id) WHERE external_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_posts(status);
 
+-- ─────────────────────────────────────────
+--  QuickBooks Sync State
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS qb_sync_state (
+    entity            TEXT PRIMARY KEY,
+    last_sync_time    DATETIME,         -- most recent Metadata.LastUpdatedTime seen
+    last_backfill_at  DATETIME,
+    record_count      INTEGER DEFAULT 0,
+    last_status       TEXT DEFAULT 'idle',   -- idle | syncing | error
+    last_error        TEXT,
+    last_run_at       DATETIME
+);
+
+-- ─────────────────────────────────────────
+--  QuickBooks Reference Data
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS qb_accounts (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    acct_num          TEXT,
+    account_type      TEXT,
+    account_subtype   TEXT,
+    classification    TEXT,
+    current_balance   REAL,
+    active            INTEGER DEFAULT 1,
+    parent_id         TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_accounts_acctnum ON qb_accounts(acct_num);
+CREATE INDEX IF NOT EXISTS idx_qb_accounts_class ON qb_accounts(classification);
+
+CREATE TABLE IF NOT EXISTS qb_customers (
+    id                TEXT PRIMARY KEY,
+    display_name      TEXT NOT NULL,
+    company_name      TEXT,
+    email             TEXT,
+    phone             TEXT,
+    balance           REAL,
+    active            INTEGER DEFAULT 1,
+    parent_id         TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_customers_name ON qb_customers(display_name);
+CREATE INDEX IF NOT EXISTS idx_qb_customers_email ON qb_customers(email);
+
+CREATE TABLE IF NOT EXISTS qb_vendors (
+    id                TEXT PRIMARY KEY,
+    display_name      TEXT NOT NULL,
+    company_name      TEXT,
+    email             TEXT,
+    phone             TEXT,
+    balance           REAL,
+    active            INTEGER DEFAULT 1,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_vendors_name ON qb_vendors(display_name);
+
+CREATE TABLE IF NOT EXISTS qb_items (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    sku               TEXT,
+    type              TEXT,             -- Service | Inventory | NonInventory | Bundle
+    description       TEXT,
+    unit_price        REAL,
+    income_account_id TEXT,
+    expense_account_id TEXT,
+    asset_account_id  TEXT,
+    active            INTEGER DEFAULT 1,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_items_sku ON qb_items(sku);
+
+-- ─────────────────────────────────────────
+--  QuickBooks Transactions
+-- ─────────────────────────────────────────
+-- Common pattern: headers + lines, with jira_epic_id pulled out of the
+-- CustomField array on both header and line where present.
+
+CREATE TABLE IF NOT EXISTS qb_invoices (
+    id                TEXT PRIMARY KEY,
+    doc_number        TEXT,
+    txn_date          DATE,
+    due_date          DATE,
+    customer_id       TEXT,
+    customer_name     TEXT,
+    total_amt         REAL,
+    balance           REAL,
+    deposit           REAL,
+    currency          TEXT,
+    email_status      TEXT,
+    print_status      TEXT,
+    private_note      TEXT,
+    memo              TEXT,
+    jira_epic_id      TEXT,
+    class_id          TEXT,
+    department_id     TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_date ON qb_invoices(txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_customer ON qb_invoices(customer_id);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_epic ON qb_invoices(jira_epic_id);
+CREATE INDEX IF NOT EXISTS idx_qb_invoices_balance ON qb_invoices(balance);
+
+CREATE TABLE IF NOT EXISTS qb_invoice_lines (
+    id                TEXT PRIMARY KEY,   -- invoice_id + ":" + line_id
+    invoice_id        TEXT NOT NULL REFERENCES qb_invoices(id) ON DELETE CASCADE,
+    line_num          INTEGER,
+    description       TEXT,
+    amount            REAL,
+    item_id           TEXT,
+    item_name         TEXT,
+    qty               REAL,
+    unit_price        REAL,
+    account_id        TEXT,
+    tax_code          TEXT,
+    class_id          TEXT,
+    jira_epic_id      TEXT,
+    raw_json          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qb_invoice_lines_inv ON qb_invoice_lines(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_qb_invoice_lines_item ON qb_invoice_lines(item_id);
+CREATE INDEX IF NOT EXISTS idx_qb_invoice_lines_epic ON qb_invoice_lines(jira_epic_id);
+
+CREATE TABLE IF NOT EXISTS qb_bills (
+    id                TEXT PRIMARY KEY,
+    doc_number        TEXT,
+    txn_date          DATE,
+    due_date          DATE,
+    vendor_id         TEXT,
+    vendor_name       TEXT,
+    total_amt         REAL,
+    balance           REAL,
+    currency          TEXT,
+    private_note      TEXT,
+    memo              TEXT,
+    jira_epic_id      TEXT,
+    class_id          TEXT,
+    department_id     TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_bills_date ON qb_bills(txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_bills_vendor ON qb_bills(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_qb_bills_epic ON qb_bills(jira_epic_id);
+
+CREATE TABLE IF NOT EXISTS qb_bill_lines (
+    id                TEXT PRIMARY KEY,
+    bill_id           TEXT NOT NULL REFERENCES qb_bills(id) ON DELETE CASCADE,
+    line_num          INTEGER,
+    description       TEXT,
+    amount            REAL,
+    account_id        TEXT,
+    item_id           TEXT,
+    qty               REAL,
+    unit_price        REAL,
+    class_id          TEXT,
+    jira_epic_id      TEXT,
+    raw_json          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qb_bill_lines_bill ON qb_bill_lines(bill_id);
+
+CREATE TABLE IF NOT EXISTS qb_payments (
+    id                TEXT PRIMARY KEY,
+    txn_date          DATE,
+    customer_id       TEXT,
+    customer_name     TEXT,
+    total_amt         REAL,
+    unapplied_amt     REAL,
+    payment_method    TEXT,
+    deposit_to_id     TEXT,
+    currency          TEXT,
+    private_note      TEXT,
+    jira_epic_id      TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_payments_date ON qb_payments(txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_payments_customer ON qb_payments(customer_id);
+
+CREATE TABLE IF NOT EXISTS qb_payment_lines (
+    id                TEXT PRIMARY KEY,
+    payment_id        TEXT NOT NULL REFERENCES qb_payments(id) ON DELETE CASCADE,
+    amount            REAL,
+    applied_txn_type  TEXT,   -- Invoice | CreditMemo | etc.
+    applied_txn_id    TEXT,
+    raw_json          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qb_payment_lines_pay ON qb_payment_lines(payment_id);
+CREATE INDEX IF NOT EXISTS idx_qb_payment_lines_applied ON qb_payment_lines(applied_txn_type, applied_txn_id);
+
+CREATE TABLE IF NOT EXISTS qb_bill_payments (
+    id                TEXT PRIMARY KEY,
+    doc_number        TEXT,
+    txn_date          DATE,
+    vendor_id         TEXT,
+    vendor_name       TEXT,
+    total_amt         REAL,
+    payment_type      TEXT,   -- Check | CreditCard
+    bank_account_id   TEXT,
+    cc_account_id     TEXT,
+    check_number      TEXT,
+    currency          TEXT,
+    private_note      TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_bill_payments_date ON qb_bill_payments(txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_bill_payments_vendor ON qb_bill_payments(vendor_id);
+
+CREATE TABLE IF NOT EXISTS qb_bill_payment_lines (
+    id                TEXT PRIMARY KEY,
+    bill_payment_id   TEXT NOT NULL REFERENCES qb_bill_payments(id) ON DELETE CASCADE,
+    amount            REAL,
+    applied_txn_type  TEXT,
+    applied_txn_id    TEXT,
+    raw_json          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qb_bp_lines_bp ON qb_bill_payment_lines(bill_payment_id);
+CREATE INDEX IF NOT EXISTS idx_qb_bp_lines_applied ON qb_bill_payment_lines(applied_txn_type, applied_txn_id);
+
+CREATE TABLE IF NOT EXISTS qb_sales_receipts (
+    id                TEXT PRIMARY KEY,
+    doc_number        TEXT,
+    txn_date          DATE,
+    customer_id       TEXT,
+    customer_name     TEXT,
+    total_amt         REAL,
+    payment_method    TEXT,
+    deposit_to_id     TEXT,
+    currency          TEXT,
+    private_note      TEXT,
+    memo              TEXT,
+    jira_epic_id      TEXT,
+    class_id          TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_sr_date ON qb_sales_receipts(txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_sr_customer ON qb_sales_receipts(customer_id);
+CREATE INDEX IF NOT EXISTS idx_qb_sr_epic ON qb_sales_receipts(jira_epic_id);
+
+CREATE TABLE IF NOT EXISTS qb_sales_receipt_lines (
+    id                TEXT PRIMARY KEY,
+    sales_receipt_id  TEXT NOT NULL REFERENCES qb_sales_receipts(id) ON DELETE CASCADE,
+    line_num          INTEGER,
+    description       TEXT,
+    amount            REAL,
+    item_id           TEXT,
+    item_name         TEXT,
+    qty               REAL,
+    unit_price        REAL,
+    account_id        TEXT,
+    tax_code          TEXT,
+    class_id          TEXT,
+    jira_epic_id      TEXT,
+    raw_json          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qb_sr_lines_sr ON qb_sales_receipt_lines(sales_receipt_id);
+
+CREATE TABLE IF NOT EXISTS qb_journal_entries (
+    id                TEXT PRIMARY KEY,
+    doc_number        TEXT,
+    txn_date          DATE,
+    total_amt         REAL,
+    adjustment        INTEGER DEFAULT 0,
+    currency          TEXT,
+    private_note      TEXT,
+    memo              TEXT,
+    jira_epic_id      TEXT,
+    sync_token        TEXT,
+    last_updated_at   DATETIME,
+    raw_json          TEXT,
+    first_synced_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_qb_je_date ON qb_journal_entries(txn_date);
+CREATE INDEX IF NOT EXISTS idx_qb_je_epic ON qb_journal_entries(jira_epic_id);
+
+CREATE TABLE IF NOT EXISTS qb_journal_entry_lines (
+    id                TEXT PRIMARY KEY,
+    journal_entry_id  TEXT NOT NULL REFERENCES qb_journal_entries(id) ON DELETE CASCADE,
+    line_num          INTEGER,
+    posting_type      TEXT,            -- Debit | Credit
+    amount            REAL,
+    account_id        TEXT,
+    account_name      TEXT,
+    entity_type       TEXT,            -- Customer | Vendor | Employee
+    entity_id         TEXT,
+    class_id          TEXT,
+    department_id     TEXT,
+    description       TEXT,
+    jira_epic_id      TEXT,
+    raw_json          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_qb_je_lines_je ON qb_journal_entry_lines(journal_entry_id);
+CREATE INDEX IF NOT EXISTS idx_qb_je_lines_acct ON qb_journal_entry_lines(account_id);
+CREATE INDEX IF NOT EXISTS idx_qb_je_lines_epic ON qb_journal_entry_lines(jira_epic_id);
+
 -- Trigger: auto-update tasks.updated_at
 CREATE TRIGGER IF NOT EXISTS tasks_updated_at
 AFTER UPDATE ON tasks
