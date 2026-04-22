@@ -227,14 +227,52 @@ make it impossible to tell what's real. Rules:
 
 ---
 
+### 4c. Security posture (as of 2026-04-22 hardening pass)
+
+The app runs on `127.0.0.1:5000` as a single-user local tool, but defense
+in depth is still cheap:
+
+- **`SECRET_KEY`** (Flask session signing) is required. If not set in
+  `.env`, `app.py` auto-generates one on first run and appends it to
+  `.env`. The hardcoded fallback is gone.
+- **`TOKEN_ENCRYPTION_KEY`** (Fernet, `cryptography>=42`) encrypts
+  QuickBooks access/refresh tokens at rest in `closeapp.db`. Same
+  auto-generate-and-persist behaviour as `SECRET_KEY`. Legacy plaintext
+  rows are read transparently — no migration needed.
+- **CORS**: `add_cors()` only emits ACAO for origins in
+  `ALLOWED_ORIGINS` (default includes `http://127.0.0.1:5000` and
+  `http://localhost:5000`). Cross-origin wildcards + credentials are
+  gone.
+- **Session cookies**: `HttpOnly`, `SameSite=Lax`, and `Secure` via
+  `SESSION_COOKIE_SECURE=1` if you ever expose over HTTPS.
+- **CSRF**: `/api/auth/me` issues a per-session `csrf_token`. Every
+  POST/PATCH/PUT/DELETE route is decorated with `@csrf_protect` and
+  verifies the `X-CSRF-Token` header. The frontend `api()` helper in
+  `static/index.html` captures the token from any response that
+  includes one and attaches it automatically. Do **not** remove
+  `@csrf_protect` from a mutating endpoint; add it to any new one.
+- **SQL**: dynamic `UPDATE` statements go through `safe_update(table,
+  pk_col, allowed_cols, updates, pk_value)` which whitelists every
+  column name. Do not reintroduce raw `f"UPDATE ... SET {k}=?"` builders.
+
+What deliberately was **not** ported from
+`claude/review-close-tool-dG5XJ`:
+
+- Rate-limit on `/api/auth/login` — the endpoint is gone (see §1).
+- `setup_auth.py` password hardening — the file is gone (see §1).
+
 ## 5. Quick sanity checklist for the next agent
 
-Before you push anything that touches auth or the index page:
+Before you push anything that touches auth, security, or the index page:
 
 - [ ] `grep -n "LoginScreen\|handleLogin\|handleLogout\|/api/auth/login\|/api/auth/logout" static/index.html` returns nothing.
-- [ ] `grep -n "check_password_hash\|session\[" app.py` returns nothing.
-- [ ] `curl -s http://127.0.0.1:5000/api/auth/me` returns `"authenticated": true` with no cookie sent.
+- [ ] `grep -n "check_password_hash" app.py` returns nothing.
+- [ ] `grep -n 'f"UPDATE' app.py` shows only the one line inside `safe_update()`.
+- [ ] Every `POST`/`PATCH`/`DELETE` route in `app.py` has both its auth
+      decorator (`@login_required`/`@admin_required`) and `@csrf_protect`.
+- [ ] `curl -s http://127.0.0.1:5000/api/auth/me` returns `"authenticated": true` and a `csrf_token`.
 - [ ] `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/api/dashboard` returns `200`, not `401`.
+- [ ] A POST without `X-CSRF-Token` returns `403`, with the right token returns `200/201`.
 - [ ] `git log origin/<your-branch> --oneline` shows your new commit.
 
 If any of those fail, the task is not done.
@@ -280,10 +318,15 @@ After the "8 parallel branches" cleanup, the state of the repo is:
 - **`claude/close-tool-next-steps-8Y8oZ`** — *not* merged. Period
   rollover, period close/reopen, SMTP + Slack notifications, activity
   timeline.
-- **`claude/review-close-tool-dG5XJ`** — *not* merged. Security
-  hardening: CSRF tokens, login rate-limit, SQL column whitelist, Fernet
-  token encryption, CORS origin whitelist. Self-contained; a candidate
-  for the next consolidation pass.
+- **`claude/review-close-tool-dG5XJ`** — *consumed* (2026-04-22). The
+  branch was built on pre-login-removal master and could not be merged
+  directly. Five of its seven items were ported into `master`:
+  `SECRET_KEY` enforcement (auto-generated into `.env`), `safe_update`
+  SQL column whitelist, CORS origin allowlist, session-cookie hardening,
+  CSRF tokens on all mutating routes, Fernet encryption of QB tokens.
+  Two items were dropped because the code they targeted is gone: login
+  rate-limit and `setup_auth.py` password hardening. See §4c for the
+  current security posture. Branch can be deleted once Joe confirms.
 - **`claude/organize-files-JGYzh`** — *not* merged. Moves the tool into
   a `close-tool/` subfolder for multi-project workspace layout.
   Conflicts with every other branch.

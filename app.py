@@ -5,6 +5,7 @@ from flask import Flask, jsonify, request, g, send_from_directory, session, redi
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 
 load_dotenv()
 
@@ -23,15 +24,58 @@ BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(BASE_DIR, "closeapp.db")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
+_ENV_PATH = os.path.join(BASE_DIR, ".env")
+
+def _persist_env(key, value):
+    """Append KEY=VALUE to .env so subsequent runs reuse the same secret.
+    Silent no-op on filesystem errors — the generated value still works
+    for this process; next run will just generate a new one."""
+    try:
+        with open(_ENV_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n{key}={value}\n")
+        print(f"[security] generated {key} and saved to {_ENV_PATH}", flush=True)
+    except OSError as e:
+        print(f"[security] generated {key} in-memory (could not write {_ENV_PATH}: {e})", flush=True)
+
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_hex(32)
+    _persist_env("SECRET_KEY", SECRET_KEY)
+
+# Fernet-encrypts QB access/refresh tokens at rest. Auto-generates a key on
+# first run and writes it to .env. Legacy plaintext token rows are read back
+# transparently by decrypt_token(), so rolling this out does not break an
+# existing qb_tokens table.
+_TOKEN_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "").strip()
+if not _TOKEN_KEY:
+    _TOKEN_KEY = Fernet.generate_key().decode()
+    _persist_env("TOKEN_ENCRYPTION_KEY", _TOKEN_KEY)
+_FERNET = Fernet(_TOKEN_KEY.encode())
+
+# Cross-origin requests are denied unless the Origin matches this whitelist.
+# Defaults cover the local Flask server; add more via ALLOWED_ORIGINS=a,b,c.
+_DEFAULT_ORIGINS = {"http://127.0.0.1:5000", "http://localhost:5000"}
+ALLOWED_ORIGINS = _DEFAULT_ORIGINS | {
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
+}
+
 app = Flask(__name__, static_folder=None)
-app.secret_key = os.getenv("SECRET_KEY", "closetool2026secret")
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "0") == "1",
+)
 
 @app.after_request
 def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,DELETE,OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
+    origin = request.headers.get("Origin")
+    if origin and origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,DELETE,OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type,X-CSRF-Token"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
 def get_db():
@@ -64,6 +108,52 @@ def rows_to_list(rows):
 def err(msg, code=400):
     return jsonify({"error": msg}), code
 
+def safe_update(table, pk_col, allowed_cols, updates, pk_value):
+    """UPDATE <table> SET k=? ... WHERE <pk_col>=? with every column name
+    validated against a whitelist. Prevents f-string SQL injection if an
+    upstream filter is ever loosened."""
+    if not table.isidentifier() or not pk_col.isidentifier():
+        raise ValueError("Invalid table/column identifier")
+    if not updates:
+        raise ValueError("No updates provided")
+    invalid = set(updates) - set(allowed_cols)
+    if invalid:
+        raise ValueError(f"Disallowed column(s): {sorted(invalid)}")
+    for k in updates:
+        if not k.isidentifier():
+            raise ValueError(f"Invalid column identifier: {k}")
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    return run(
+        f"UPDATE {table} SET {set_clause} WHERE {pk_col}=?",
+        list(updates.values()) + [pk_value],
+    )
+
+def encrypt_token(plain):
+    if plain is None or not _FERNET:
+        return plain
+    return _FERNET.encrypt(plain.encode()).decode()
+
+def decrypt_token(stored):
+    if stored is None or not _FERNET:
+        return stored
+    try:
+        return _FERNET.decrypt(stored.encode()).decode()
+    except InvalidToken:
+        return stored  # legacy plaintext row — leave alone
+
+def csrf_protect(f):
+    """Reject POST/PATCH/PUT/DELETE without a valid X-CSRF-Token header.
+    The token is seeded by /api/auth/me and lives in the session cookie."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method in ("POST", "PATCH", "PUT", "DELETE"):
+            sent = request.headers.get("X-CSRF-Token", "")
+            expected = session.get("csrf_token", "")
+            if not expected or not sent or not secrets.compare_digest(sent, expected):
+                return jsonify({"error": "Invalid CSRF token"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
 # ── Auth disabled ─────────────────────────────────────────────────────────────
 # Login screen intentionally removed. The app runs as the seeded admin
 # (user id 1 — "Joe G.") for every request. See AGENTS.md §1 before touching.
@@ -86,16 +176,21 @@ def admin_required(f):
 def me():
     if request.method == "OPTIONS":
         return "", 204
+    if not session.get("csrf_token"):
+        session["csrf_token"] = secrets.token_urlsafe(32)
+        session.permanent = True
+    csrf_token = session["csrf_token"]
     user = get_current_user()
     if not user:
-        return jsonify({"authenticated": True, "id": 0, "name": "Guest", "initials": "?", "role": "admin", "color": "#4f8ef7"})
+        return jsonify({"authenticated": True, "id": 0, "name": "Guest", "initials": "?", "role": "admin", "color": "#4f8ef7", "csrf_token": csrf_token})
     return jsonify({
         "authenticated": True,
         "id": user["id"],
         "name": user["name"],
         "initials": user["initials"],
         "role": user["role"],
-        "color": user["color"]
+        "color": user["color"],
+        "csrf_token": csrf_token,
     })
 
 # ── QuickBooks ────────────────────────────────────────────────────────────────
@@ -124,7 +219,14 @@ def _ensure_qb_tokens_table():
 def get_tokens():
     _ensure_qb_tokens_table()
     row = q1("SELECT access_token, refresh_token, expires_at, realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
-    return dict(row) if row else {}
+    if not row:
+        return {}
+    return {
+        "access_token": decrypt_token(row["access_token"]),
+        "refresh_token": decrypt_token(row["refresh_token"]),
+        "expires_at": row["expires_at"],
+        "realm_id": row["realm_id"],
+    }
 
 def save_tokens(at, rt, ei, realm_id=None):
     _ensure_qb_tokens_table()
@@ -133,7 +235,10 @@ def save_tokens(at, rt, ei, realm_id=None):
     if realm_id is None:
         prev = q1("SELECT realm_id FROM qb_tokens ORDER BY id DESC LIMIT 1")
         realm_id = prev["realm_id"] if prev else None
-    db.execute("INSERT INTO qb_tokens (access_token, refresh_token, expires_at, realm_id) VALUES (?,?,?,?)", (at, rt, ea, realm_id))
+    db.execute(
+        "INSERT INTO qb_tokens (access_token, refresh_token, expires_at, realm_id) VALUES (?,?,?,?)",
+        (encrypt_token(at), encrypt_token(rt), ea, realm_id),
+    )
     db.commit()
 
 def get_realm_id():
@@ -242,6 +347,7 @@ def sync_qb_balances():
 
 @app.route("/api/qb/sync", methods=["POST", "OPTIONS"])
 @login_required
+@csrf_protect
 def manual_sync():
     if request.method == "OPTIONS":
         return "", 204
@@ -393,6 +499,7 @@ def sync_qb_report(period_id, report_type):
 
 @app.route("/api/qb/sync_reports", methods=["POST", "OPTIONS"])
 @login_required
+@csrf_protect
 def sync_reports_endpoint():
     if request.method == "OPTIONS":
         return "", 204
@@ -598,6 +705,7 @@ def qb_transactions():
 
 @app.route("/api/flux_notes", methods=["GET", "POST", "OPTIONS"])
 @login_required
+@csrf_protect
 def flux_notes():
     if request.method == "OPTIONS":
         return "", 204
@@ -635,6 +743,7 @@ def flux_notes():
 
 @app.route("/api/report_groups", methods=["GET", "POST", "OPTIONS"])
 @login_required
+@csrf_protect
 def report_groups():
     if request.method == "OPTIONS":
         return "", 204
@@ -667,6 +776,7 @@ def report_groups():
 
 @app.route("/api/report_groups/<int:gid>", methods=["PATCH", "DELETE", "OPTIONS"])
 @login_required
+@csrf_protect
 def report_group_detail(gid):
     if request.method == "OPTIONS":
         return "", 204
@@ -996,6 +1106,7 @@ def sync_qb_all_reports():
 
 @app.route("/api/calendar/reseed", methods=["POST", "OPTIONS"])
 @login_required
+@csrf_protect
 def reseed_calendar():
     if request.method == "OPTIONS":
         return "", 204
@@ -1039,6 +1150,7 @@ def get_active_period():
 
 @app.route("/api/periods", methods=["POST", "OPTIONS"])
 @admin_required
+@csrf_protect
 def create_period():
     if request.method == "OPTIONS":
         return "", 204
@@ -1053,6 +1165,7 @@ def create_period():
 
 @app.route("/api/periods/<int:pid>/activate", methods=["POST", "OPTIONS"])
 @admin_required
+@csrf_protect
 def activate_period(pid):
     if request.method == "OPTIONS":
         return "", 204
@@ -1071,6 +1184,7 @@ def get_users():
 
 @app.route("/api/users", methods=["POST", "OPTIONS"])
 @admin_required
+@csrf_protect
 def create_user():
     if request.method == "OPTIONS":
         return "", 204
@@ -1084,6 +1198,7 @@ def create_user():
 
 @app.route("/api/users/<int:uid>", methods=["PATCH", "DELETE", "OPTIONS"])
 @admin_required
+@csrf_protect
 def manage_user(uid):
     if request.method == "OPTIONS":
         return "", 204
@@ -1105,8 +1220,7 @@ def manage_user(uid):
     updates = {k: v for k, v in b.items() if k in allowed}
     if not updates:
         return err("No valid fields")
-    set_clause = ", ".join(f"{k}=?" for k in updates)
-    run(f"UPDATE users SET {set_clause} WHERE id=?", list(updates.values()) + [uid])
+    safe_update("users", "id", allowed, updates, uid)
     return jsonify({"updated": uid})
 
 # ── Categories ────────────────────────────────────────────────────────────────
@@ -1120,6 +1234,7 @@ def get_categories():
 
 @app.route("/api/categories", methods=["POST", "OPTIONS"])
 @admin_required
+@csrf_protect
 def create_category():
     if request.method == "OPTIONS":
         return "", 204
@@ -1132,6 +1247,7 @@ def create_category():
 
 @app.route("/api/categories/<int:cid>", methods=["PATCH", "DELETE", "OPTIONS"])
 @admin_required
+@csrf_protect
 def manage_category(cid):
     if request.method == "OPTIONS":
         return "", 204
@@ -1146,8 +1262,7 @@ def manage_category(cid):
     updates = {k: v for k, v in b.items() if k in allowed}
     if not updates:
         return err("No valid fields")
-    set_clause = ", ".join(f"{k}=?" for k in updates)
-    run(f"UPDATE categories SET {set_clause} WHERE id=?", list(updates.values()) + [cid])
+    safe_update("categories", "id", allowed, updates, cid)
     return jsonify({"updated": cid})
 
 # ── Tasks ─────────────────────────────────────────────────────────────────────
@@ -1177,6 +1292,7 @@ def get_tasks():
 
 @app.route("/api/tasks", methods=["POST", "OPTIONS"])
 @admin_required
+@csrf_protect
 def create_task():
     if request.method == "OPTIONS":
         return "", 204
@@ -1191,6 +1307,7 @@ def create_task():
 
 @app.route("/api/tasks/<int:tid>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
 @login_required
+@csrf_protect
 def manage_task(tid):
     if request.method == "OPTIONS":
         return "", 204
@@ -1220,11 +1337,10 @@ def manage_task(tid):
     if not updates:
         return err("No valid fields")
     if updates.get("status") == "complete" and old["status"] != "complete":
-        updates["completed_at"] = datetime.utcnow().isoformat()
+        updates["completed_at"] = datetime.now(timezone.utc).isoformat()
     if updates.get("review_status") == "approved" and old["review_status"] != "approved":
-        updates["approved_at"] = datetime.utcnow().isoformat()
-    set_clause = ", ".join(f"{k}=?" for k in updates)
-    run(f"UPDATE tasks SET {set_clause} WHERE id=?", list(updates.values()) + [tid])
+        updates["approved_at"] = datetime.now(timezone.utc).isoformat()
+    safe_update("tasks", "id", allowed | {"completed_at", "approved_at"}, updates, tid)
     actor_id = user["id"]
     if "status" in updates:
         run("INSERT INTO task_activity (task_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
@@ -1263,6 +1379,7 @@ def get_reconciliations():
 
 @app.route("/api/reconciliations", methods=["POST", "OPTIONS"])
 @admin_required
+@csrf_protect
 def create_reconciliation():
     if request.method == "OPTIONS":
         return "", 204
@@ -1277,6 +1394,7 @@ def create_reconciliation():
 
 @app.route("/api/reconciliations/<int:rid>", methods=["PATCH", "DELETE", "OPTIONS"])
 @login_required
+@csrf_protect
 def manage_reconciliation(rid):
     if request.method == "OPTIONS":
         return "", 204
@@ -1292,9 +1410,8 @@ def manage_reconciliation(rid):
     updates = {k: v for k, v in b.items() if k in allowed}
     if not updates:
         return err("No valid fields")
-    updates["last_updated_at"] = datetime.utcnow().isoformat()
-    set_clause = ", ".join(f"{k}=?" for k in updates)
-    run(f"UPDATE reconciliations SET {set_clause} WHERE id=?", list(updates.values()) + [rid])
+    updates["last_updated_at"] = datetime.now(timezone.utc).isoformat()
+    safe_update("reconciliations", "id", allowed | {"last_updated_at"}, updates, rid)
     return jsonify(dict(q1(RECON_SELECT + " WHERE r.id=?", (rid,))))
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
