@@ -1550,6 +1550,320 @@ def _map_journal_entry_lines(je):
         })
     return out
 
+# ── Phase 2 mappers ──
+
+def _map_employee(e):
+    email = (e.get("PrimaryEmailAddr") or {}).get("Address")
+    phone = (e.get("PrimaryPhone") or {}).get("FreeFormNumber")
+    return {
+        "id": e["Id"], "display_name": e.get("DisplayName"), "email": email, "phone": phone,
+        "active": 1 if e.get("Active", True) else 0,
+        "sync_token": e.get("SyncToken"),
+        "last_updated_at": (e.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(e),
+    }
+
+def _map_class(c):
+    return {
+        "id": c["Id"], "name": c.get("Name"),
+        "fully_qualified_name": c.get("FullyQualifiedName"),
+        "parent_id": (c.get("ParentRef") or {}).get("value"),
+        "active": 1 if c.get("Active", True) else 0,
+        "sync_token": c.get("SyncToken"),
+        "last_updated_at": (c.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(c),
+    }
+
+def _map_department(d):
+    return {
+        "id": d["Id"], "name": d.get("Name"),
+        "fully_qualified_name": d.get("FullyQualifiedName"),
+        "parent_id": (d.get("ParentRef") or {}).get("value"),
+        "active": 1 if d.get("Active", True) else 0,
+        "sync_token": d.get("SyncToken"),
+        "last_updated_at": (d.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(d),
+    }
+
+def _map_tax_code(t):
+    return {
+        "id": t["Id"], "name": t.get("Name"), "description": t.get("Description"),
+        "taxable": 1 if t.get("Taxable") else 0,
+        "active": 1 if t.get("Active", True) else 0,
+        "sync_token": t.get("SyncToken"),
+        "last_updated_at": (t.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(t),
+    }
+
+def _map_term(t):
+    return {
+        "id": t["Id"], "name": t.get("Name"), "type": t.get("Type"),
+        "due_days": t.get("DueDays"), "discount_days": t.get("DiscountDays"),
+        "discount_percent": t.get("DiscountPercent"),
+        "active": 1 if t.get("Active", True) else 0,
+        "sync_token": t.get("SyncToken"),
+        "last_updated_at": (t.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(t),
+    }
+
+def _map_payment_method(pm):
+    return {
+        "id": pm["Id"], "name": pm.get("Name"), "type": pm.get("Type"),
+        "active": 1 if pm.get("Active", True) else 0,
+        "sync_token": pm.get("SyncToken"),
+        "last_updated_at": (pm.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(pm),
+    }
+
+def _map_credit_memo(x):
+    cid, cname = _qb_ref(x, "CustomerRef")
+    cls_id, _ = _qb_ref(x, "ClassRef")
+    dept_id, _ = _qb_ref(x, "DepartmentRef")
+    return {
+        "id": x["Id"], "doc_number": x.get("DocNumber"),
+        "txn_date": _to_date(x.get("TxnDate")),
+        "customer_id": cid, "customer_name": cname,
+        "total_amt": x.get("TotalAmt"), "remaining_credit": x.get("RemainingCredit"),
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"),
+        "memo": x.get("CustomerMemo", {}).get("value") if isinstance(x.get("CustomerMemo"), dict) else None,
+        "jira_epic_id": _jira_epic(x), "class_id": cls_id, "department_id": dept_id,
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_credit_memo_lines(cm):
+    out = []
+    for ln in cm.get("Line", []) or []:
+        if ln.get("DetailType") != "SalesItemLineDetail":
+            continue
+        d = ln.get("SalesItemLineDetail") or {}
+        item_id, item_name = _qb_ref(d, "ItemRef")
+        acct_id, _ = _qb_ref(d, "AccountRef")
+        cls_id, _ = _qb_ref(d, "ClassRef")
+        out.append({
+            "id": f"{cm['Id']}:{ln.get('Id') or len(out)}",
+            "credit_memo_id": cm["Id"], "line_num": ln.get("LineNum"),
+            "description": ln.get("Description"), "amount": ln.get("Amount"),
+            "item_id": item_id, "item_name": item_name,
+            "qty": d.get("Qty"), "unit_price": d.get("UnitPrice"),
+            "account_id": acct_id, "tax_code": (d.get("TaxCodeRef") or {}).get("value"),
+            "class_id": cls_id, "jira_epic_id": _jira_epic(ln),
+            "raw_json": json.dumps(ln),
+        })
+    return out
+
+def _map_vendor_credit(x):
+    vid, vname = _qb_ref(x, "VendorRef")
+    cls_id, _ = _qb_ref(x, "ClassRef")
+    dept_id, _ = _qb_ref(x, "DepartmentRef")
+    return {
+        "id": x["Id"], "doc_number": x.get("DocNumber"),
+        "txn_date": _to_date(x.get("TxnDate")),
+        "vendor_id": vid, "vendor_name": vname,
+        "total_amt": x.get("TotalAmt"),
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"), "memo": x.get("Memo"),
+        "jira_epic_id": _jira_epic(x), "class_id": cls_id, "department_id": dept_id,
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_vendor_credit_lines(vc):
+    out = []
+    for ln in vc.get("Line", []) or []:
+        d = ln.get("AccountBasedExpenseLineDetail") or ln.get("ItemBasedExpenseLineDetail") or {}
+        acct_id, _ = _qb_ref(d, "AccountRef")
+        item_id, _ = _qb_ref(d, "ItemRef")
+        cls_id, _ = _qb_ref(d, "ClassRef")
+        out.append({
+            "id": f"{vc['Id']}:{ln.get('Id') or len(out)}",
+            "vendor_credit_id": vc["Id"], "line_num": ln.get("LineNum"),
+            "description": ln.get("Description"), "amount": ln.get("Amount"),
+            "account_id": acct_id, "item_id": item_id,
+            "qty": d.get("Qty"), "unit_price": d.get("UnitPrice"),
+            "class_id": cls_id, "jira_epic_id": _jira_epic(ln),
+            "raw_json": json.dumps(ln),
+        })
+    return out
+
+def _map_refund_receipt(x):
+    cid, cname = _qb_ref(x, "CustomerRef")
+    dep_id, _ = _qb_ref(x, "DepositToAccountRef")
+    cls_id, _ = _qb_ref(x, "ClassRef")
+    return {
+        "id": x["Id"], "doc_number": x.get("DocNumber"),
+        "txn_date": _to_date(x.get("TxnDate")),
+        "customer_id": cid, "customer_name": cname,
+        "total_amt": x.get("TotalAmt"),
+        "payment_method": (x.get("PaymentMethodRef") or {}).get("name"),
+        "deposit_account_id": dep_id,
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"),
+        "memo": x.get("CustomerMemo", {}).get("value") if isinstance(x.get("CustomerMemo"), dict) else None,
+        "jira_epic_id": _jira_epic(x), "class_id": cls_id,
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_refund_receipt_lines(rr):
+    out = []
+    for ln in rr.get("Line", []) or []:
+        if ln.get("DetailType") != "SalesItemLineDetail":
+            continue
+        d = ln.get("SalesItemLineDetail") or {}
+        item_id, item_name = _qb_ref(d, "ItemRef")
+        acct_id, _ = _qb_ref(d, "AccountRef")
+        cls_id, _ = _qb_ref(d, "ClassRef")
+        out.append({
+            "id": f"{rr['Id']}:{ln.get('Id') or len(out)}",
+            "refund_receipt_id": rr["Id"], "line_num": ln.get("LineNum"),
+            "description": ln.get("Description"), "amount": ln.get("Amount"),
+            "item_id": item_id, "item_name": item_name,
+            "qty": d.get("Qty"), "unit_price": d.get("UnitPrice"),
+            "account_id": acct_id, "tax_code": (d.get("TaxCodeRef") or {}).get("value"),
+            "class_id": cls_id, "jira_epic_id": _jira_epic(ln),
+            "raw_json": json.dumps(ln),
+        })
+    return out
+
+def _map_deposit(x):
+    dep_id, _ = _qb_ref(x, "DepositToAccountRef")
+    cls_id, _ = _qb_ref(x, "ClassRef")
+    dept_id, _ = _qb_ref(x, "DepartmentRef")
+    return {
+        "id": x["Id"], "doc_number": x.get("DocNumber"),
+        "txn_date": _to_date(x.get("TxnDate")),
+        "deposit_account_id": dep_id,
+        "total_amt": x.get("TotalAmt"),
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"),
+        "memo": x.get("CustomerMemo", {}).get("value") if isinstance(x.get("CustomerMemo"), dict) else None,
+        "jira_epic_id": _jira_epic(x), "class_id": cls_id, "department_id": dept_id,
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_deposit_lines(dep):
+    out = []
+    for ln in dep.get("Line", []) or []:
+        d = ln.get("DepositLineDetail") or {}
+        acct_id, _ = _qb_ref(d, "AccountRef")
+        entity = d.get("Entity") or {}
+        ent_id = entity.get("value")
+        cls_id, _ = _qb_ref(d, "ClassRef")
+        applied_type = applied_id = None
+        for lt in (ln.get("LinkedTxn") or []):
+            applied_type = lt.get("TxnType"); applied_id = lt.get("TxnId"); break
+        out.append({
+            "id": f"{dep['Id']}:{ln.get('Id') or len(out)}",
+            "deposit_id": dep["Id"], "line_num": ln.get("LineNum"),
+            "description": ln.get("Description"), "amount": ln.get("Amount"),
+            "account_id": acct_id, "entity_type": entity.get("type"),
+            "entity_id": ent_id,
+            "applied_txn_type": applied_type, "applied_txn_id": applied_id,
+            "class_id": cls_id, "raw_json": json.dumps(ln),
+        })
+    return out
+
+def _map_purchase(x):
+    acct_id, acct_name = _qb_ref(x, "AccountRef")
+    entity = x.get("EntityRef") or {}
+    cls_id, _ = _qb_ref(x, "ClassRef")
+    dept_id, _ = _qb_ref(x, "DepartmentRef")
+    return {
+        "id": x["Id"], "doc_number": x.get("DocNumber"),
+        "txn_date": _to_date(x.get("TxnDate")),
+        "payment_type": x.get("PaymentType"),
+        "account_id": acct_id, "account_name": acct_name,
+        "entity_type": entity.get("type"), "entity_id": entity.get("value"), "entity_name": entity.get("name"),
+        "total_amt": x.get("TotalAmt"),
+        "credit": 1 if x.get("Credit") else 0,
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"),
+        "memo": x.get("Memo"),
+        "jira_epic_id": _jira_epic(x), "class_id": cls_id, "department_id": dept_id,
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_purchase_lines(pur):
+    out = []
+    for ln in pur.get("Line", []) or []:
+        d = ln.get("AccountBasedExpenseLineDetail") or ln.get("ItemBasedExpenseLineDetail") or {}
+        acct_id, _ = _qb_ref(d, "AccountRef")
+        item_id, _ = _qb_ref(d, "ItemRef")
+        cls_id, _ = _qb_ref(d, "ClassRef")
+        out.append({
+            "id": f"{pur['Id']}:{ln.get('Id') or len(out)}",
+            "purchase_id": pur["Id"], "line_num": ln.get("LineNum"),
+            "description": ln.get("Description"), "amount": ln.get("Amount"),
+            "account_id": acct_id, "item_id": item_id,
+            "qty": d.get("Qty"), "unit_price": d.get("UnitPrice"),
+            "class_id": cls_id, "jira_epic_id": _jira_epic(ln),
+            "raw_json": json.dumps(ln),
+        })
+    return out
+
+def _map_transfer(x):
+    from_id, _ = _qb_ref(x, "FromAccountRef")
+    to_id, _ = _qb_ref(x, "ToAccountRef")
+    return {
+        "id": x["Id"], "txn_date": _to_date(x.get("TxnDate")),
+        "from_account_id": from_id, "to_account_id": to_id,
+        "amount": x.get("Amount"),
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"),
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_estimate(x):
+    cid, cname = _qb_ref(x, "CustomerRef")
+    cls_id, _ = _qb_ref(x, "ClassRef")
+    dept_id, _ = _qb_ref(x, "DepartmentRef")
+    return {
+        "id": x["Id"], "doc_number": x.get("DocNumber"),
+        "txn_date": _to_date(x.get("TxnDate")),
+        "expiration_date": _to_date(x.get("ExpirationDate")),
+        "customer_id": cid, "customer_name": cname,
+        "total_amt": x.get("TotalAmt"), "status": x.get("TxnStatus"),
+        "currency": (x.get("CurrencyRef") or {}).get("value"),
+        "private_note": x.get("PrivateNote"),
+        "memo": x.get("CustomerMemo", {}).get("value") if isinstance(x.get("CustomerMemo"), dict) else None,
+        "jira_epic_id": _jira_epic(x), "class_id": cls_id, "department_id": dept_id,
+        "sync_token": x.get("SyncToken"),
+        "last_updated_at": (x.get("MetaData") or {}).get("LastUpdatedTime"),
+        "raw_json": json.dumps(x),
+    }
+
+def _map_estimate_lines(est):
+    out = []
+    for ln in est.get("Line", []) or []:
+        if ln.get("DetailType") != "SalesItemLineDetail":
+            continue
+        d = ln.get("SalesItemLineDetail") or {}
+        item_id, item_name = _qb_ref(d, "ItemRef")
+        acct_id, _ = _qb_ref(d, "AccountRef")
+        cls_id, _ = _qb_ref(d, "ClassRef")
+        out.append({
+            "id": f"{est['Id']}:{ln.get('Id') or len(out)}",
+            "estimate_id": est["Id"], "line_num": ln.get("LineNum"),
+            "description": ln.get("Description"), "amount": ln.get("Amount"),
+            "item_id": item_id, "item_name": item_name,
+            "qty": d.get("Qty"), "unit_price": d.get("UnitPrice"),
+            "account_id": acct_id, "tax_code": (d.get("TaxCodeRef") or {}).get("value"),
+            "class_id": cls_id, "jira_epic_id": _jira_epic(ln),
+            "raw_json": json.dumps(ln),
+        })
+    return out
+
 # Register Phase 1 entities
 _register_entity("accounts",        "Account",        "reference",   "qb_accounts",        _map_account)
 _register_entity("customers",       "Customer",       "reference",   "qb_customers",       _map_customer)
@@ -1561,6 +1875,21 @@ _register_entity("payments",        "Payment",        "transaction", "qb_payment
 _register_entity("bill_payments",   "BillPayment",    "transaction", "qb_bill_payments",   _map_bill_payment,   "qb_bill_payment_lines",   _map_bill_payment_lines)
 _register_entity("sales_receipts",  "SalesReceipt",   "transaction", "qb_sales_receipts",  _map_sales_receipt,  "qb_sales_receipt_lines",  _map_sales_receipt_lines)
 _register_entity("journal_entries", "JournalEntry",   "transaction", "qb_journal_entries", _map_journal_entry,  "qb_journal_entry_lines",  _map_journal_entry_lines)
+
+# Register Phase 2 entities
+_register_entity("employees",       "Employee",       "reference",   "qb_employees",       _map_employee)
+_register_entity("classes",         "Class",          "reference",   "qb_classes",         _map_class)
+_register_entity("departments",     "Department",     "reference",   "qb_departments",     _map_department)
+_register_entity("tax_codes",       "TaxCode",        "reference",   "qb_tax_codes",       _map_tax_code)
+_register_entity("terms",           "Term",           "reference",   "qb_terms",           _map_term)
+_register_entity("payment_methods", "PaymentMethod",  "reference",   "qb_payment_methods", _map_payment_method)
+_register_entity("credit_memos",    "CreditMemo",     "transaction", "qb_credit_memos",    _map_credit_memo,    "qb_credit_memo_lines",    _map_credit_memo_lines)
+_register_entity("vendor_credits",  "VendorCredit",   "transaction", "qb_vendor_credits",  _map_vendor_credit,  "qb_vendor_credit_lines",  _map_vendor_credit_lines)
+_register_entity("refund_receipts", "RefundReceipt",  "transaction", "qb_refund_receipts", _map_refund_receipt, "qb_refund_receipt_lines", _map_refund_receipt_lines)
+_register_entity("deposits",        "Deposit",        "transaction", "qb_deposits",        _map_deposit,        "qb_deposit_lines",        _map_deposit_lines)
+_register_entity("purchases",       "Purchase",       "transaction", "qb_purchases",       _map_purchase,       "qb_purchase_lines",       _map_purchase_lines)
+_register_entity("transfers",       "Transfer",       "transaction", "qb_transfers",       _map_transfer)
+_register_entity("estimates",       "Estimate",       "transaction", "qb_estimates",       _map_estimate,       "qb_estimate_lines",       _map_estimate_lines)
 
 def _upsert(db, table, row, touch_synced=True):
     cols = list(row.keys())
