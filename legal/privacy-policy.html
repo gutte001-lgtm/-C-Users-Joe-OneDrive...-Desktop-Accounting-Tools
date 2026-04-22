@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Privacy Policy — CloseTool</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 20px; color: #1f2937; line-height: 1.6; }
+  h1 { font-size: 28px; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; }
+  h2 { font-size: 18px; margin-top: 28px; color: #111827; }
+  p, li { font-size: 15px; }
+  .meta { color: #6b7280; font-size: 13px; margin-bottom: 20px; }
+  code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Privacy Policy</h1>
+<div class="meta">CloseTool · Last updated: April 2026</div>
+
+<h2>1. Overview</h2>
+<p>
+  CloseTool (the "Application") is a private, internally-developed accounting workflow tool
+  built and operated by <strong>Healthcare Markets DBA</strong> ("we," "us," "our") for its own
+  internal month-end close process. The Application is not offered to the public and is
+  used exclusively by Healthcare Markets DBA personnel.
+</p>
+
+<h2>2. Information We Access</h2>
+<p>The Application connects to QuickBooks Online via Intuit's OAuth 2.0 API and accesses:</p>
+<ul>
+  <li>General ledger accounts, balances, and chart of accounts</li>
+  <li>Profit &amp; Loss, Balance Sheet, and Cash Flow reports</li>
+  <li>Transaction-level detail for reconciliation and variance analysis</li>
+</ul>
+<p>
+  The Application only retrieves financial data from the QuickBooks company explicitly
+  authorized by Healthcare Markets DBA. No personal, customer, or vendor personally
+  identifiable information (PII) is collected, displayed, or stored beyond what is already
+  maintained in the authorized QuickBooks Online company file.
+</p>
+
+<h2>3. How We Use the Information</h2>
+<p>Accessed financial data is used solely to:</p>
+<ul>
+  <li>Generate internal management reports (P&amp;L, Balance Sheet, Cash Flow)</li>
+  <li>Track and coordinate month-end close tasks among authorized accounting staff</li>
+  <li>Support reconciliation and variance commentary workflows</li>
+</ul>
+<p>We do not sell, lease, share, or otherwise disclose accessed data to any third party.</p>
+
+<h2>4. Data Storage</h2>
+<p>
+  Cached report data and internal workflow records are stored in a local SQLite database
+  on devices controlled by Healthcare Markets DBA. OAuth access and refresh tokens are
+  stored locally and are used only to refresh data from QuickBooks Online. No data is
+  transmitted to any server outside of Intuit's API endpoints.
+</p>
+
+<h2>5. Security</h2>
+<p>
+  Access to the Application is restricted by per-user authentication. OAuth credentials
+  are stored with standard file-system permissions on authorized devices.
+  The Application uses TLS (HTTPS) for all communication with Intuit's servers.
+</p>
+
+<h2>6. Data Retention and Deletion</h2>
+<p>
+  Cached QuickBooks data is retained for internal reporting and audit purposes.
+  Authorized personnel may request deletion of cached data or revoke the application's
+  QuickBooks access at any time via Intuit's "Apps" settings in QuickBooks Online.
+</p>
+
+<h2>7. Changes to This Policy</h2>
+<p>
+  We may update this policy from time to time. Material changes will be communicated to
+  authorized users prior to taking effect.
+</p>
+
+<h2>8. Contact</h2>
+<p>
+  For questions about this policy or the Application, contact
+  <a href="mailto:joe@healthcaremarkets.com">joe@healthcaremarkets.com</a>.
+</p>
+
+</body>
+</html>
