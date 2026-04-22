@@ -452,12 +452,25 @@ def _load_report_lines(period_id, report_type):
                 ORDER BY sort_order""", (period_id, report_type))
     return [dict(r) for r in rows]
 
-def _prior_period_id(period_id):
-    cur = q1("SELECT start_date FROM periods WHERE id=?", (period_id,))
+def _prior_period_id(period_id, mode="prev"):
+    """mode='prev' — immediately prior period of same type;
+       mode='yoy'  — same type + period_number in previous fiscal year."""
+    cur = q1("SELECT start_date, period_type, period_number, fiscal_year FROM periods WHERE id=?", (period_id,))
     if not cur:
         return None
-    prior = q1("SELECT id FROM periods WHERE start_date < ? ORDER BY start_date DESC LIMIT 1",
-               (cur["start_date"],))
+    ptype = cur["period_type"] or "month"
+    if mode == "yoy" and cur["fiscal_year"]:
+        pn_match = "period_number IS NULL" if cur["period_number"] is None else "period_number=?"
+        params = [ptype, cur["fiscal_year"] - 1]
+        if cur["period_number"] is not None:
+            params.append(cur["period_number"])
+        row = q1(f"""SELECT id FROM periods
+                     WHERE period_type=? AND fiscal_year=? AND {pn_match}
+                     LIMIT 1""", tuple(params))
+        if row:
+            return row["id"]
+    prior = q1("""SELECT id FROM periods WHERE period_type=? AND start_date < ?
+                  ORDER BY start_date DESC LIMIT 1""", (ptype, cur["start_date"]))
     return prior["id"] if prior else None
 
 def _build_report_payload(period_id, rtype, compare_id=None, view="native"):
@@ -548,7 +561,7 @@ def get_report(rtype):
 
     compare_id = request.args.get("compare_to", type=int)
     if compare_id is None and request.args.get("auto_compare", "1") == "1":
-        compare_id = _prior_period_id(period_id)
+        compare_id = _prior_period_id(period_id, request.args.get("compare_mode", "prev"))
 
     view = request.args.get("view", "native")
     merged = _build_report_payload(period_id, rtype, compare_id, view)
@@ -793,7 +806,7 @@ def export_report(rtype):
         return "No period", 400
     compare_id = request.args.get("compare_to", type=int)
     if compare_id is None and request.args.get("auto_compare", "1") == "1":
-        compare_id = _prior_period_id(period_id)
+        compare_id = _prior_period_id(period_id, request.args.get("compare_mode", "prev"))
     view = request.args.get("view", "native")
     fmt = (request.args.get("format") or "xlsx").lower()
 
@@ -881,9 +894,166 @@ def export_report(rtype):
                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f'attachment; filename="{rtype}_{period_id}.xlsx"'})
 
+# ── Fiscal Calendar (4-4-5) ───────────────────────────────────────────────────
+
+from datetime import date, timedelta
+
+_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"]
+
+def _iso_week1_monday(year):
+    """Monday of ISO week 1 for given year (the week containing Jan 4)."""
+    jan4 = date(year, 1, 4)
+    return jan4 - timedelta(days=jan4.weekday())
+
+def _generate_445_year(year):
+    """Yields (period_type, period_number, label, start, end) for one 4-4-5 fiscal year."""
+    w1_mon = _iso_week1_monday(year)
+    pattern = [4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4, 5]
+    out, month_ranges, week_idx = [], [], 0
+    for i, weeks in enumerate(pattern):
+        start = w1_mon + timedelta(days=week_idx * 7)
+        end = start + timedelta(days=weeks * 7 - 1)
+        mnum = i + 1
+        if year == 2023 and mnum == 1:
+            start = date(2023, 1, 1)
+        month_ranges.append((start, end))
+        out.append(("month", mnum, f"{_MONTH_NAMES[i]} {year}", start, end))
+        week_idx += weeks
+    for q in range(4):
+        qstart = month_ranges[q * 3][0]
+        qend = month_ranges[q * 3 + 2][1]
+        out.append(("quarter", q + 1, f"Q{q+1} {year}", qstart, qend))
+    out.append(("year", None, f"FY {year}", month_ranges[0][0], month_ranges[11][1]))
+    return out
+
+def _generate_gregorian_year(year):
+    """Yields standard-calendar periods for one year (used pre-2023)."""
+    out, month_ranges = [], []
+    for m in range(1, 13):
+        start = date(year, m, 1)
+        end = (date(year, m + 1, 1) - timedelta(days=1)) if m < 12 else date(year, 12, 31)
+        month_ranges.append((start, end))
+        out.append(("month", m, f"{_MONTH_NAMES[m-1]} {year}", start, end))
+    for q in range(4):
+        out.append(("quarter", q + 1, f"Q{q+1} {year}",
+                    month_ranges[q * 3][0], month_ranges[q * 3 + 2][1]))
+    out.append(("year", None, f"FY {year}", date(year, 1, 1), date(year, 12, 31)))
+    return out
+
+def _ensure_fiscal_calendar():
+    """Idempotent: adds fiscal columns to periods, seeds 2022-2030 hierarchy."""
+    db = get_db()
+    cols = {r[1] for r in db.execute("PRAGMA table_info(periods)").fetchall()}
+    for col, ddl in [
+        ("period_type", "ALTER TABLE periods ADD COLUMN period_type TEXT DEFAULT 'month'"),
+        ("fiscal_year", "ALTER TABLE periods ADD COLUMN fiscal_year INTEGER"),
+        ("period_number", "ALTER TABLE periods ADD COLUMN period_number INTEGER"),
+        ("parent_id", "ALTER TABLE periods ADD COLUMN parent_id INTEGER"),
+        ("calendar_type", "ALTER TABLE periods ADD COLUMN calendar_type TEXT DEFAULT 'gregorian'"),
+    ]:
+        if col not in cols:
+            db.execute(ddl)
+    db.commit()
+
+    have_q = q1("SELECT COUNT(*) c FROM periods WHERE period_type='quarter'")
+    if have_q and have_q["c"] > 0:
+        return  # already seeded
+
+    for year in range(2022, 2031):
+        cal_type = "gregorian" if year < 2023 else "4-4-5"
+        gen = _generate_gregorian_year if year < 2023 else _generate_445_year
+        periods_for_year = gen(year)
+
+        year_p = next(p for p in periods_for_year if p[0] == "year")
+        quarter_ps = [p for p in periods_for_year if p[0] == "quarter"]
+        month_ps = [p for p in periods_for_year if p[0] == "month"]
+
+        cur = db.execute("""INSERT INTO periods
+            (label, start_date, end_date, is_active, period_type, fiscal_year,
+             period_number, parent_id, calendar_type)
+            VALUES (?,?,?,0,?,?,?,?,?)""",
+            (year_p[2], year_p[3].isoformat(), year_p[4].isoformat(),
+             "year", year, None, None, cal_type))
+        year_id = cur.lastrowid
+
+        quarter_ids = {}
+        for qp in quarter_ps:
+            cur = db.execute("""INSERT INTO periods
+                (label, start_date, end_date, is_active, period_type, fiscal_year,
+                 period_number, parent_id, calendar_type)
+                VALUES (?,?,?,0,?,?,?,?,?)""",
+                (qp[2], qp[3].isoformat(), qp[4].isoformat(),
+                 "quarter", year, qp[1], year_id, cal_type))
+            quarter_ids[qp[1]] = cur.lastrowid
+
+        for mp in month_ps:
+            mnum = mp[1]
+            qnum = (mnum - 1) // 3 + 1
+            parent_q_id = quarter_ids[qnum]
+            existing = q1("SELECT id FROM periods WHERE label=? AND period_type='month'", (mp[2],))
+            if existing:
+                db.execute("""UPDATE periods SET start_date=?, end_date=?,
+                              period_type='month', fiscal_year=?, period_number=?,
+                              parent_id=?, calendar_type=? WHERE id=?""",
+                           (mp[3].isoformat(), mp[4].isoformat(), year, mnum,
+                            parent_q_id, cal_type, existing["id"]))
+            else:
+                db.execute("""INSERT INTO periods
+                    (label, start_date, end_date, is_active, period_type, fiscal_year,
+                     period_number, parent_id, calendar_type)
+                    VALUES (?,?,?,0,?,?,?,?,?)""",
+                    (mp[2], mp[3].isoformat(), mp[4].isoformat(),
+                     "month", year, mnum, parent_q_id, cal_type))
+    db.commit()
+
+# ── Auto-sync all reports every 15 min ────────────────────────────────────────
+
+def sync_qb_all_reports():
+    """Background: refresh P&L / BS / CF for active month, its quarter, and its year."""
+    with app.app_context():
+        if not get_tokens():
+            return
+        _ensure_fiscal_calendar()
+        active = q1("SELECT id, parent_id, fiscal_year FROM periods WHERE is_active=1 AND period_type='month'")
+        if not active:
+            return
+        targets = [active["id"]]
+        if active["parent_id"]:
+            targets.append(active["parent_id"])
+        year_row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=?",
+                      (active["fiscal_year"],))
+        if year_row:
+            targets.append(year_row["id"])
+        for pid in targets:
+            for rtype in ("pl", "bs", "cf"):
+                try:
+                    sync_qb_report(pid, rtype)
+                except Exception:
+                    pass
+
+@app.route("/api/calendar/reseed", methods=["POST", "OPTIONS"])
+@login_required
+def reseed_calendar():
+    if request.method == "OPTIONS":
+        return "", 204
+    u = get_current_user()
+    if not u or u["role"] != "admin":
+        return jsonify({"error": "Admin only"}), 403
+    _ensure_fiscal_calendar()
+    return jsonify({"ok": True})
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
+scheduler.add_job(sync_qb_all_reports, "interval", minutes=15, id="qb_reports_sync")
 scheduler.start()
+
+# Run calendar setup on module load (wrapped so it doesn't crash imports)
+try:
+    with app.app_context():
+        _ensure_fiscal_calendar()
+except Exception:
+    pass
 
 # ── Periods ───────────────────────────────────────────────────────────────────
 

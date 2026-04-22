@@ -737,6 +737,8 @@ function CloseApp(){
   function Reports(){
     const [rtype,setRtype]=useState("pl");
     const [view,setView]=useState("native");
+    const [periodType,setPeriodType]=useState("month");
+    const [compareMode,setCompareMode]=useState("prev");
     const [periods,setPeriods]=useState([]);
     const [periodId,setPeriodId]=useState(null);
     const [compareId,setCompareId]=useState(null);
@@ -750,15 +752,40 @@ function CloseApp(){
     useEffect(()=>{
       api("/api/periods").then(ps=>{
         setPeriods(ps);
-        if(ps.length){
-          const active=ps.find(p=>p.is_active)||ps[0];
-          setPeriodId(active.id);
-          const sorted=[...ps].sort((a,b)=>a.start_date.localeCompare(b.start_date));
-          const idx=sorted.findIndex(p=>p.id===active.id);
-          if(idx>0)setCompareId(sorted[idx-1].id);
+        const activeMonth=ps.find(p=>p.is_active&&p.period_type==="month")||ps.find(p=>p.is_active)||ps[0];
+        if(activeMonth){
+          setPeriodId(activeMonth.id);
+          setPeriodType(activeMonth.period_type||"month");
         }
       }).catch(e=>setErr(e.message));
     },[]);
+
+    // Filter periods by selected type and auto-pick first on type change
+    const periodsOfType=periods.filter(p=>(p.period_type||"month")===periodType)
+                               .sort((a,b)=>b.start_date.localeCompare(a.start_date));
+    useEffect(()=>{
+      if(!periodsOfType.length)return;
+      if(!periodsOfType.find(p=>p.id===periodId)){
+        const active=periodsOfType.find(p=>p.is_active)||periodsOfType[0];
+        setPeriodId(active.id);
+      }
+    },[periodType,periods.length]);
+    // Auto-compute compare_id when compareMode or periodId changes (unless user overrides)
+    useEffect(()=>{
+      if(!periodId||compareMode==="none"){setCompareId(null);return;}
+      const cur=periods.find(p=>p.id===periodId);
+      if(!cur)return;
+      let target=null;
+      if(compareMode==="yoy"&&cur.fiscal_year){
+        target=periods.find(p=>p.period_type===cur.period_type&&p.fiscal_year===cur.fiscal_year-1
+          &&((cur.period_number==null&&p.period_number==null)||p.period_number===cur.period_number));
+      }else if(compareMode==="prev"){
+        const sameType=periods.filter(p=>p.period_type===cur.period_type&&p.start_date<cur.start_date)
+          .sort((a,b)=>b.start_date.localeCompare(a.start_date));
+        target=sameType[0];
+      }
+      setCompareId(target?target.id:null);
+    },[periodId,compareMode,periods.length]);
 
     async function loadReport(){
       if(!periodId)return;
@@ -864,20 +891,26 @@ function CloseApp(){
           </div>
           <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
             <div style={{display:"flex",background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:7,padding:3}}>
+              {[["month","MTD"],["quarter","QTD"],["year","YTD"]].map(([k,l])=>
+                <button key={k} onClick={()=>setPeriodType(k)} style={{padding:"4px 10px",border:"none",background:periodType===k?"#1e2d3d":"transparent",color:periodType===k?"#e2e8f0":"#64748b",borderRadius:5,fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{l}</button>
+              )}
+            </div>
+            <div style={{display:"flex",background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:7,padding:3}}>
               {[["native","QB"],["custom","Custom"]].map(([k,l])=>
                 <button key={k} onClick={()=>setView(k)} style={{padding:"4px 10px",border:"none",background:view===k?"#1e2d3d":"transparent",color:view===k?"#e2e8f0":"#64748b",borderRadius:5,fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{l}</button>
               )}
             </div>
             <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>PERIOD</label>
             <select value={periodId||""} onChange={e=>setPeriodId(parseInt(e.target.value))}
-              style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace"}}>
-              {periods.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+              style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace",minWidth:140}}>
+              {periodsOfType.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
             </select>
-            <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>COMPARE</label>
-            <select value={compareId||""} onChange={e=>setCompareId(e.target.value?parseInt(e.target.value):null)}
+            <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>vs</label>
+            <select value={compareMode} onChange={e=>setCompareMode(e.target.value)}
               style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace"}}>
-              <option value="">None</option>
-              {periods.filter(p=>p.id!==periodId).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+              <option value="prev">Prior period</option>
+              <option value="yoy">Prior year</option>
+              <option value="none">No compare</option>
             </select>
             <button onClick={()=>exportReport("xlsx")} disabled={!lines.length} style={{padding:"6px 14px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ Excel</button>
             <button onClick={()=>exportReport("csv")} disabled={!lines.length} style={{padding:"6px 14px",background:"#1a2535",border:"1px solid #1e2d3d",color:"#94a3b8",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ CSV</button>
