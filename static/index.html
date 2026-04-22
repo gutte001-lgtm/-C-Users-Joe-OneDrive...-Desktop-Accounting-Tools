@@ -490,7 +490,40 @@ function CloseApp(){
     const [qbStatus,setQbStatus]=useState(null);
     useEffect(()=>{api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>{});},[]);
 
-    const stabs=["users","categories","tasks","quickbooks"];
+    const stabs=["users","categories","tasks","quickbooks","groups"];
+
+    // Report Groups state (loaded lazily when groups tab opens)
+    const [groupRtype,setGroupRtype]=useState("pl");
+    const [groups,setGroups]=useState([]);
+    const [newGroupName,setNewGroupName]=useState("");
+    const [availAccounts,setAvailAccounts]=useState([]);
+    async function loadGroups(){
+      try{
+        const g=await api(`/api/report_groups?report_type=${groupRtype}`);
+        setGroups(g);
+        const period=await api("/api/periods/active").catch(()=>null);
+        if(period?.id){
+          const rep=await api(`/api/reports/${groupRtype}?period_id=${period.id}&auto_compare=0`).catch(()=>({lines:[]}));
+          const names=[...new Set((rep.lines||[]).filter(l=>!l.is_subtotal).map(l=>l.account_name))].sort();
+          setAvailAccounts(names);
+        }
+      }catch(e){}
+    }
+    useEffect(()=>{if(settingsTab==="groups")loadGroups();},[settingsTab,groupRtype]);
+    async function addGroup(){
+      if(!newGroupName.trim())return;
+      try{await api("/api/report_groups",{method:"POST",body:JSON.stringify({name:newGroupName.trim(),report_type:groupRtype,sort_order:groups.length})});setNewGroupName("");await loadGroups();}
+      catch(e){alert(e.message);}
+    }
+    async function saveGroupAccounts(gid,accounts){
+      try{await api(`/api/report_groups/${gid}`,{method:"PATCH",body:JSON.stringify({accounts})});await loadGroups();}
+      catch(e){alert(e.message);}
+    }
+    async function deleteGroup(gid){
+      if(!confirm("Delete this group?"))return;
+      try{await api(`/api/report_groups/${gid}`,{method:"DELETE"});await loadGroups();}
+      catch(e){alert(e.message);}
+    }
     return(<div>
       <div style={{display:"flex",gap:0,marginBottom:24,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
         {stabs.map(t=><button key={t} onClick={()=>setSettingsTab(t)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:settingsTab===t?"#1e2d3d":"transparent",color:settingsTab===t?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:settingsTab===t?600:400,textTransform:"capitalize"}}>{t}</button>)}
@@ -633,6 +666,47 @@ function CloseApp(){
         {qbStatus?.connected&&<button onClick={syncQB} disabled={syncing} style={{padding:"7px 16px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync Balances Now"}</button>}
       </div>}
 
+      {settingsTab==="groups"&&<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:12}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Custom Report Groups</div>
+            <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Override QuickBooks' default grouping — toggle &quot;Custom&quot; in Reports to see it applied.</div>
+          </div>
+          <div style={{display:"flex",gap:0,background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:8,padding:3}}>
+            {[["pl","P&L"],["bs","Balance Sheet"],["cf","Cash Flow"]].map(([k,l])=>
+              <button key={k} onClick={()=>setGroupRtype(k)} style={{padding:"5px 12px",border:"none",background:groupRtype===k?"#1e2d3d":"transparent",color:groupRtype===k?"#e2e8f0":"#64748b",borderRadius:5,fontSize:11.5,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{l}</button>
+            )}
+          </div>
+        </div>
+
+        <div style={{display:"flex",gap:8,marginBottom:20}}>
+          <input value={newGroupName} onChange={e=>setNewGroupName(e.target.value)} placeholder="New group name (e.g. Strategic Initiatives)"
+            style={{flex:1,padding:"8px 12px",background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",fontSize:13,outline:"none"}}/>
+          <button className="btn btn-primary" onClick={addGroup}>+ Add Group</button>
+        </div>
+
+        {groups.length===0?<div style={{padding:30,textAlign:"center",color:"#64748b",fontSize:13,fontFamily:"'DM Mono',monospace"}}>No groups yet. Create one above.</div>:
+        groups.map(g=>(
+          <div key={g.id} style={{padding:14,background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:10,marginBottom:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontWeight:600,color:"#e2e8f0",fontSize:13}}>{g.name}</div>
+              <button onClick={()=>deleteGroup(g.id)} style={{background:"transparent",border:"none",color:"#f87171",cursor:"pointer",fontSize:12,fontFamily:"'DM Mono',monospace"}}>Delete</button>
+            </div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:6,fontFamily:"'DM Mono',monospace"}}>{g.accounts.length} account{g.accounts.length===1?"":"s"} · click to toggle</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,maxHeight:260,overflow:"auto"}}>
+              {availAccounts.map(a=>{
+                const on=g.accounts.includes(a);
+                return <button key={a} onClick={()=>{
+                  const next=on?g.accounts.filter(x=>x!==a):[...g.accounts,a];
+                  saveGroupAccounts(g.id,next);
+                }} style={{padding:"4px 10px",fontSize:11,borderRadius:6,border:`1px solid ${on?"#4f8ef740":"#1e2d3d"}`,background:on?"#4f8ef718":"#111827",color:on?"#4f8ef7":"#94a3b8",cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{a}</button>;
+              })}
+              {availAccounts.length===0&&<div style={{fontSize:11,color:"#64748b",fontStyle:"italic"}}>Sync a {groupRtype.toUpperCase()} report first to see available accounts.</div>}
+            </div>
+          </div>
+        ))}
+      </div>}
+
       {showAddTask&&<Modal title="Add Task" onClose={()=>setShowAddTask(false)}>
         <div className="form-group"><label className="form-label">Task Name</label><input className="form-input" value={newTask.name} onChange={e=>setNewTask(p=>({...p,name:e.target.value}))}/></div>
         <div className="form-group"><label className="form-label">Category</label>
@@ -662,12 +736,16 @@ function CloseApp(){
 
   function Reports(){
     const [rtype,setRtype]=useState("pl");
+    const [view,setView]=useState("native");
     const [periods,setPeriods]=useState([]);
     const [periodId,setPeriodId]=useState(null);
     const [compareId,setCompareId]=useState(null);
     const [data,setData]=useState(null);
+    const [kpis,setKpis]=useState(null);
     const [busy,setBusy]=useState(false);
     const [err,setErr]=useState(null);
+    const [drill,setDrill]=useState(null);
+    const [noteLine,setNoteLine]=useState(null);
 
     useEffect(()=>{
       api("/api/periods").then(ps=>{
@@ -686,14 +764,19 @@ function CloseApp(){
       if(!periodId)return;
       setBusy(true);setErr(null);
       try{
-        const qs=new URLSearchParams({period_id:periodId});
+        const qs=new URLSearchParams({period_id:periodId,view});
         if(compareId)qs.set("compare_to",compareId);else qs.set("auto_compare","0");
         const r=await api(`/api/reports/${rtype}?${qs}`);
         setData(r);
       }catch(e){setErr(e.message);}
       setBusy(false);
     }
-    useEffect(()=>{loadReport();},[rtype,periodId,compareId]);
+    async function loadKpis(){
+      if(!periodId)return;
+      try{const r=await api(`/api/reports/kpis?period_id=${periodId}`);setKpis(r.kpis);}catch(e){setKpis(null);}
+    }
+    useEffect(()=>{loadReport();},[rtype,periodId,compareId,view]);
+    useEffect(()=>{loadKpis();},[periodId]);
 
     async function syncFromQB(){
       if(!periodId)return;
@@ -701,14 +784,20 @@ function CloseApp(){
       try{
         const r=await api("/api/qb/sync_reports",{method:"POST",body:JSON.stringify({period_id:periodId,types:[rtype]})});
         if(!r.ok){setErr(JSON.stringify(r.results));}
-        await loadReport();
+        await loadReport();await loadKpis();
       }catch(e){setErr(e.message);}
       setBusy(false);
     }
 
+    function exportReport(fmt){
+      const qs=new URLSearchParams({period_id:periodId,view,format:fmt});
+      if(compareId)qs.set("compare_to",compareId);else qs.set("auto_compare","0");
+      window.location.href=`/api/reports/${rtype}/export?${qs}`;
+    }
+
     const lines=data?.lines||[];
     const hasCompare=!!data?.compare;
-    const title=rtype==="pl"?"Profit & Loss":"Balance Sheet";
+    const title={pl:"Profit & Loss",bs:"Balance Sheet",cf:"Cash Flow"}[rtype];
 
     function varColor(v,name){
       if(v==null||v===0)return "#64748b";
@@ -717,12 +806,53 @@ function CloseApp(){
       return favorable?"#4fd9a0":"#f87171";
     }
 
+    async function saveNote(){
+      if(!noteLine)return;
+      try{
+        await api("/api/flux_notes",{method:"POST",body:JSON.stringify({
+          period_id:periodId,report_type:rtype,account_name:noteLine.account_name,note:noteLine._draft||""
+        })});
+        setNoteLine(null);await loadReport();
+      }catch(e){alert(e.message);}
+    }
+
+    async function openDrill(l){
+      if(l.is_subtotal||!data?.period)return;
+      setDrill({account_name:l.account_name,loading:true,txns:[],cols:[]});
+      try{
+        const qs=new URLSearchParams({period_id:periodId,account_name:l.account_name});
+        if(l.account_id)qs.set("account_id",l.account_id);
+        const r=await api(`/api/qb/transactions?${qs}`);
+        setDrill({account_name:l.account_name,loading:false,txns:r.transactions||[],cols:r.columns||[]});
+      }catch(e){setDrill({account_name:l.account_name,loading:false,error:e.message,txns:[],cols:[]});}
+    }
+
+    const kpiBox=(label,val,sub,color)=>
+      <div style={{flex:"1 1 150px",minWidth:150,padding:"14px 16px",background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:10}}>
+        <div style={{fontSize:10.5,color:"#64748b",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase"}}>{label}</div>
+        <div style={{fontSize:18,fontWeight:700,color:color||"#e2e8f0",marginTop:4,fontFamily:"'DM Mono',monospace"}}>{val}</div>
+        {sub&&<div style={{fontSize:10.5,color:"#64748b",marginTop:2,fontFamily:"'DM Mono',monospace"}}>{sub}</div>}
+      </div>;
+    const pct=v=>v==null?"—":(v>0?"+":"")+v+"%";
+    const ratio=v=>v==null?"—":v.toFixed(2);
+
     return(<div>
       <div style={{display:"flex",gap:0,marginBottom:20,background:"#111827",border:"1px solid #1e2d3d",borderRadius:10,padding:4,width:"fit-content"}}>
-        {[["pl","Profit & Loss"],["bs","Balance Sheet"]].map(([k,l])=>
+        {[["pl","Profit & Loss"],["bs","Balance Sheet"],["cf","Cash Flow"]].map(([k,l])=>
           <button key={k} onClick={()=>setRtype(k)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:rtype===k?"#1e2d3d":"transparent",color:rtype===k?"#e2e8f0":"#64748b",fontSize:13,cursor:"pointer",fontWeight:rtype===k?600:400}}>{l}</button>
         )}
       </div>
+
+      {kpis&&<div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}}>
+        {kpiBox("Revenue",fmt(kpis.revenue))}
+        {kpiBox("Gross Margin",kpis.gross_margin_pct!=null?kpis.gross_margin_pct+"%":"—",kpis.gross_profit!=null?fmt(kpis.gross_profit):null,"#4fd9a0")}
+        {kpiBox("Operating Margin",kpis.operating_margin_pct!=null?kpis.operating_margin_pct+"%":"—",kpis.operating_expenses!=null?"Opex "+fmt(kpis.operating_expenses):null)}
+        {kpiBox("Net Income",fmt(kpis.net_income),kpis.net_margin_pct!=null?kpis.net_margin_pct+"% margin":null,(kpis.net_income||0)>=0?"#4fd9a0":"#f87171")}
+        {kpiBox("Current Ratio",ratio(kpis.current_ratio),kpis.working_capital!=null?"WC "+fmt(kpis.working_capital):null)}
+        {kpiBox("Quick Ratio",ratio(kpis.quick_ratio))}
+        {kpiBox("Debt / Equity",ratio(kpis.debt_to_equity))}
+        {kpiBox("Cash",fmt(kpis.cash),kpis.total_assets!=null?"Assets "+fmt(kpis.total_assets):null,"#4f8ef7")}
+      </div>}
 
       <div style={S.card}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:12}}>
@@ -733,6 +863,11 @@ function CloseApp(){
             </div>
           </div>
           <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+            <div style={{display:"flex",background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:7,padding:3}}>
+              {[["native","QB"],["custom","Custom"]].map(([k,l])=>
+                <button key={k} onClick={()=>setView(k)} style={{padding:"4px 10px",border:"none",background:view===k?"#1e2d3d":"transparent",color:view===k?"#e2e8f0":"#64748b",borderRadius:5,fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{l}</button>
+              )}
+            </div>
             <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>PERIOD</label>
             <select value={periodId||""} onChange={e=>setPeriodId(parseInt(e.target.value))}
               style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace"}}>
@@ -744,6 +879,8 @@ function CloseApp(){
               <option value="">None</option>
               {periods.filter(p=>p.id!==periodId).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
             </select>
+            <button onClick={()=>exportReport("xlsx")} disabled={!lines.length} style={{padding:"6px 14px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ Excel</button>
+            <button onClick={()=>exportReport("csv")} disabled={!lines.length} style={{padding:"6px 14px",background:"#1a2535",border:"1px solid #1e2d3d",color:"#94a3b8",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ CSV</button>
             {isAdmin&&<button onClick={syncFromQB} disabled={busy} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:busy?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{busy?"Syncing…":"↻ Sync from QB"}</button>}
           </div>
         </div>
@@ -760,22 +897,59 @@ function CloseApp(){
             {hasCompare&&<th style={{...S.th,textAlign:"right"}}>{data.compare.label}</th>}
             {hasCompare&&<th style={{...S.th,textAlign:"right"}}>Variance $</th>}
             {hasCompare&&<th style={{...S.th,textAlign:"right"}}>Variance %</th>}
+            <th style={{...S.th,textAlign:"center",width:40}}>Note</th>
           </tr></thead>
           <tbody>{lines.map((l,i)=>{
             const isSub=l.is_subtotal===1;
-            const nameStyle={...S.td,paddingLeft:12+(l.depth||0)*14,fontWeight:isSub?700:400,color:isSub?"#e2e8f0":"#94a3b8",fontSize:12.5,borderTop:isSub?"1px solid #1e2d3d":"none"};
+            const canDrill=!isSub&&rtype!=="cf";
+            const nameStyle={...S.td,paddingLeft:12+(l.depth||0)*14,fontWeight:isSub?700:400,color:isSub?"#e2e8f0":"#94a3b8",fontSize:12.5,borderTop:isSub?"1px solid #1e2d3d":"none",cursor:canDrill?"pointer":"default"};
             const numStyle={...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,fontWeight:isSub?700:400,color:isSub?"#e2e8f0":"#94a3b8",borderTop:isSub?"1px solid #1e2d3d":"none"};
             const vc=varColor(l.variance,l.account_name);
+            const hasNote=!!(l.flux_note&&l.flux_note.length);
             return(<tr key={i} style={isSub?{background:"#0f172a55"}:{}}>
-              <td style={nameStyle}>{l.account_name}</td>
+              <td style={nameStyle} onClick={()=>canDrill&&openDrill(l)} title={canDrill?"Click for transaction detail":""}>
+                {canDrill&&<span style={{color:"#475569",marginRight:6,fontSize:11}}>▸</span>}{l.account_name}
+              </td>
               <td style={numStyle}>{fmt(l.amount)}</td>
               {hasCompare&&<td style={numStyle}>{l.prior_amount!=null?fmt(l.prior_amount):"—"}</td>}
               {hasCompare&&<td style={{...numStyle,color:l.variance!=null?vc:"#475569"}}>{l.variance!=null?fmt(l.variance):"—"}</td>}
               {hasCompare&&<td style={{...numStyle,color:l.variance_pct!=null?vc:"#475569"}}>{l.variance_pct!=null?(l.variance_pct>0?"+":"")+l.variance_pct+"%":"—"}</td>}
+              <td style={{...S.td,textAlign:"center",borderTop:isSub?"1px solid #1e2d3d":"none"}}>
+                {!isSub&&<button onClick={()=>setNoteLine({...l,_draft:l.flux_note||""})} title={hasNote?l.flux_note:"Add flux note"}
+                  style={{background:"transparent",border:"none",color:hasNote?"#4f8ef7":"#475569",cursor:"pointer",fontSize:14}}>
+                  {hasNote?"✎":"+"}
+                </button>}
+              </td>
             </tr>);
           })}</tbody>
         </table>}
       </div>
+
+      {drill&&<Modal title={`Transactions — ${drill.account_name}`} onClose={()=>setDrill(null)}>
+        {drill.loading?<div style={{padding:30,textAlign:"center",color:"#64748b",fontFamily:"'DM Mono',monospace"}}>Loading from QB…</div>:
+         drill.error?<div style={{padding:20,color:"#f87171",fontSize:12,fontFamily:"'DM Mono',monospace"}}>{drill.error}</div>:
+         drill.txns.length===0?<div style={{padding:30,textAlign:"center",color:"#64748b",fontSize:12,fontFamily:"'DM Mono',monospace"}}>No transactions in this period.</div>:
+         <div style={{maxHeight:"60vh",overflow:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <thead><tr>{drill.cols.map(c=><th key={c} style={{...S.th,textAlign:"left",position:"sticky",top:0,background:"#0f172a"}}>{c}</th>)}</tr></thead>
+            <tbody>{drill.txns.map((t,i)=><tr key={i}>{drill.cols.map(c=><td key={c} style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:11.5,color:"#94a3b8"}}>{t[c]||"—"}</td>)}</tr>)}</tbody>
+          </table>
+         </div>
+        }
+      </Modal>}
+
+      {noteLine&&<Modal title={`Flux Note — ${noteLine.account_name}`} onClose={()=>setNoteLine(null)}>
+        <div style={{fontSize:12,color:"#64748b",fontFamily:"'DM Mono',monospace",marginBottom:10}}>
+          {data?.period?.label} · {fmt(noteLine.amount)} {hasCompare&&noteLine.prior_amount!=null&&` vs. ${fmt(noteLine.prior_amount)} (${noteLine.variance_pct!=null?(noteLine.variance_pct>0?"+":"")+noteLine.variance_pct+"%":"—"})`}
+        </div>
+        <textarea value={noteLine._draft||""} onChange={e=>setNoteLine({...noteLine,_draft:e.target.value})}
+          placeholder="Explain the variance — drivers, one-time items, seasonality, mix, etc."
+          style={{width:"100%",minHeight:120,padding:10,background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",fontSize:13,fontFamily:"inherit",resize:"vertical",outline:"none"}}/>
+        <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}}>
+          <button className="btn btn-ghost" onClick={()=>setNoteLine(null)}>Cancel</button>
+          <button className="btn btn-primary" onClick={saveNote}>Save</button>
+        </div>
+      </Modal>}
     </div>);
   }
 

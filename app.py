@@ -306,12 +306,50 @@ def _ensure_report_tables():
         report_type TEXT NOT NULL,
         section TEXT,
         account_name TEXT NOT NULL,
+        account_id TEXT,
         amount REAL NOT NULL DEFAULT 0,
         is_subtotal INTEGER DEFAULT 0,
         depth INTEGER DEFAULT 0,
         sort_order INTEGER DEFAULT 0
     )""")
+    cols = {r[1] for r in db.execute("PRAGMA table_info(qb_report_lines)").fetchall()}
+    if "account_id" not in cols:
+        db.execute("ALTER TABLE qb_report_lines ADD COLUMN account_id TEXT")
     db.execute("CREATE INDEX IF NOT EXISTS idx_rl_period_type ON qb_report_lines(period_id, report_type)")
+
+    db.execute("""CREATE TABLE IF NOT EXISTS flux_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period_id INTEGER NOT NULL REFERENCES periods(id),
+        report_type TEXT NOT NULL,
+        account_name TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        author_id INTEGER REFERENCES users(id),
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(period_id, report_type, account_name)
+    )""")
+
+    db.execute("""CREATE TABLE IF NOT EXISTS report_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        report_type TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS report_group_map (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id INTEGER NOT NULL REFERENCES report_groups(id) ON DELETE CASCADE,
+        account_name TEXT NOT NULL,
+        UNIQUE(group_id, account_name)
+    )""")
+
+    db.execute("""CREATE TABLE IF NOT EXISTS qb_accounts (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        acct_num TEXT,
+        account_type TEXT,
+        classification TEXT,
+        synced_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
     db.commit()
 
 def _flatten_qb_rows(rows, report_type, out, section=None, depth=0):
@@ -333,7 +371,7 @@ def _flatten_qb_rows(rows, report_type, out, section=None, depth=0):
                 except (TypeError, ValueError):
                     amt = 0.0
                 out.append({
-                    "section": new_section, "account_name": name, "amount": amt,
+                    "section": new_section, "account_name": name, "account_id": None, "amount": amt,
                     "is_subtotal": 1, "depth": depth, "sort_order": len(out),
                 })
         else:
@@ -341,12 +379,13 @@ def _flatten_qb_rows(rows, report_type, out, section=None, depth=0):
             if not cd:
                 continue
             name = cd[0].get("value", "")
+            acct_id = cd[0].get("id")
             try:
                 amt = float(cd[-1].get("value", 0) or 0)
             except (TypeError, ValueError):
                 amt = 0.0
             out.append({
-                "section": section, "account_name": name, "amount": amt,
+                "section": section, "account_name": name, "account_id": acct_id, "amount": amt,
                 "is_subtotal": 0, "depth": depth, "sort_order": len(out),
             })
 
@@ -361,6 +400,8 @@ def sync_qb_report(period_id, report_type):
         path = f"/reports/ProfitAndLoss?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
     elif report_type == "bs":
         path = f"/reports/BalanceSheet?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
+    elif report_type == "cf":
+        path = f"/reports/CashFlow?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
     else:
         return {"ok": False, "error": "Unknown report_type"}
 
@@ -382,10 +423,10 @@ def sync_qb_report(period_id, report_type):
     _flatten_qb_rows(data.get("Rows", {}), report_type, lines)
     for ln in lines:
         db.execute("""INSERT INTO qb_report_lines
-                      (period_id, report_type, section, account_name, amount, is_subtotal, depth, sort_order)
-                      VALUES (?,?,?,?,?,?,?,?)""",
-                   (period_id, report_type, ln["section"], ln["account_name"], ln["amount"],
-                    ln["is_subtotal"], ln["depth"], ln["sort_order"]))
+                      (period_id, report_type, section, account_name, account_id, amount, is_subtotal, depth, sort_order)
+                      VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (period_id, report_type, ln["section"], ln["account_name"], ln.get("account_id"),
+                    ln["amount"], ln["is_subtotal"], ln["depth"], ln["sort_order"]))
     db.commit()
     return {"ok": True, "lines": len(lines)}
 
@@ -401,12 +442,12 @@ def sync_reports_endpoint():
         period_id = active["id"] if active else None
     if not period_id:
         return jsonify({"ok": False, "error": "No period selected and no active period"}), 400
-    types = body.get("types") or ["pl", "bs"]
+    types = body.get("types") or ["pl", "bs", "cf"]
     results = {t: sync_qb_report(period_id, t) for t in types}
     return jsonify({"ok": all(r.get("ok") for r in results.values()), "results": results})
 
 def _load_report_lines(period_id, report_type):
-    rows = q("""SELECT section, account_name, amount, is_subtotal, depth, sort_order
+    rows = q("""SELECT section, account_name, account_id, amount, is_subtotal, depth, sort_order
                 FROM qb_report_lines WHERE period_id=? AND report_type=?
                 ORDER BY sort_order""", (period_id, report_type))
     return [dict(r) for r in rows]
@@ -419,12 +460,83 @@ def _prior_period_id(period_id):
                (cur["start_date"],))
     return prior["id"] if prior else None
 
+def _build_report_payload(period_id, rtype, compare_id=None, view="native"):
+    cur_lines = _load_report_lines(period_id, rtype)
+    cmp_lines = _load_report_lines(compare_id, rtype) if compare_id else []
+    cmp_by_name = {(l["section"], l["account_name"]): l["amount"] for l in cmp_lines}
+
+    notes = {r["account_name"]: {"note": r["note"], "updated_at": r["updated_at"], "author_id": r["author_id"]}
+             for r in q("""SELECT account_name, note, updated_at, author_id FROM flux_notes
+                           WHERE period_id=? AND report_type=?""", (period_id, rtype))}
+
+    merged = []
+    for l in cur_lines:
+        prior_amt = cmp_by_name.get((l["section"], l["account_name"]))
+        var = None if prior_amt is None else (l["amount"] - prior_amt)
+        var_pct = None
+        if prior_amt not in (None, 0):
+            var_pct = round((l["amount"] - prior_amt) / abs(prior_amt) * 100, 2)
+        n = notes.get(l["account_name"], {})
+        merged.append({**l, "prior_amount": prior_amt, "variance": var, "variance_pct": var_pct,
+                       "flux_note": n.get("note", ""), "flux_updated_at": n.get("updated_at"),
+                       "flux_author_id": n.get("author_id")})
+
+    if view == "custom":
+        merged = _regroup_lines_custom(period_id, rtype, merged, compare_id)
+
+    return merged
+
+def _regroup_lines_custom(period_id, rtype, lines, compare_id=None):
+    """Re-group non-subtotal lines under admin-defined groups; preserve uncategorized under 'Other'."""
+    groups = q("SELECT id, name, sort_order FROM report_groups WHERE report_type=? ORDER BY sort_order, name", (rtype,))
+    if not groups:
+        return lines
+    name_to_group = {}
+    for g in groups:
+        for m in q("SELECT account_name FROM report_group_map WHERE group_id=?", (g["id"],)):
+            name_to_group[m["account_name"]] = g["name"]
+
+    buckets = {g["name"]: [] for g in groups}
+    buckets["Other"] = []
+    for l in lines:
+        if l.get("is_subtotal"):
+            continue
+        g_name = name_to_group.get(l["account_name"], "Other")
+        buckets.setdefault(g_name, []).append(l)
+
+    out = []
+    sort_order = 0
+    group_order = [g["name"] for g in groups] + ["Other"]
+    for gname in group_order:
+        rows = buckets.get(gname, [])
+        if not rows:
+            continue
+        for r in rows:
+            out.append({**r, "section": gname, "depth": 1, "sort_order": sort_order, "is_subtotal": 0})
+            sort_order += 1
+        subtotal = sum(r["amount"] for r in rows)
+        prior_subtotal = sum((r.get("prior_amount") or 0) for r in rows if r.get("prior_amount") is not None)
+        has_prior = any(r.get("prior_amount") is not None for r in rows)
+        var = (subtotal - prior_subtotal) if has_prior else None
+        var_pct = None
+        if has_prior and prior_subtotal != 0:
+            var_pct = round((subtotal - prior_subtotal) / abs(prior_subtotal) * 100, 2)
+        out.append({
+            "section": gname, "account_name": f"Total {gname}", "account_id": None,
+            "amount": subtotal, "is_subtotal": 1, "depth": 0, "sort_order": sort_order,
+            "prior_amount": prior_subtotal if has_prior else None,
+            "variance": var, "variance_pct": var_pct,
+            "flux_note": "", "flux_updated_at": None, "flux_author_id": None,
+        })
+        sort_order += 1
+    return out
+
 @app.route("/api/reports/<rtype>", methods=["GET", "OPTIONS"])
 @login_required
 def get_report(rtype):
     if request.method == "OPTIONS":
         return "", 204
-    if rtype not in ("pl", "bs"):
+    if rtype not in ("pl", "bs", "cf"):
         return jsonify({"error": "Unknown report type"}), 400
     _ensure_report_tables()
     period_id = request.args.get("period_id", type=int)
@@ -438,18 +550,8 @@ def get_report(rtype):
     if compare_id is None and request.args.get("auto_compare", "1") == "1":
         compare_id = _prior_period_id(period_id)
 
-    cur_lines = _load_report_lines(period_id, rtype)
-    cmp_lines = _load_report_lines(compare_id, rtype) if compare_id else []
-    cmp_by_name = {(l["section"], l["account_name"]): l["amount"] for l in cmp_lines}
-
-    merged = []
-    for l in cur_lines:
-        prior_amt = cmp_by_name.get((l["section"], l["account_name"]))
-        var = None if prior_amt is None else (l["amount"] - prior_amt)
-        var_pct = None
-        if prior_amt not in (None, 0):
-            var_pct = round((l["amount"] - prior_amt) / abs(prior_amt) * 100, 2)
-        merged.append({**l, "prior_amount": prior_amt, "variance": var, "variance_pct": var_pct})
+    view = request.args.get("view", "native")
+    merged = _build_report_payload(period_id, rtype, compare_id, view)
 
     period_meta = q1("SELECT id, label, start_date, end_date FROM periods WHERE id=?", (period_id,))
     compare_meta = q1("SELECT id, label, start_date, end_date FROM periods WHERE id=?", (compare_id,)) if compare_id else None
@@ -457,11 +559,327 @@ def get_report(rtype):
 
     return jsonify({
         "report_type": rtype,
+        "view": view,
         "period": dict(period_meta) if period_meta else None,
         "compare": dict(compare_meta) if compare_meta else None,
         "pulled_at": pulled["pulled_at"] if pulled else None,
         "lines": merged,
     })
+
+# ── Transaction drill-down ────────────────────────────────────────────────────
+
+@app.route("/api/qb/transactions", methods=["GET", "OPTIONS"])
+@login_required
+def qb_transactions():
+    if request.method == "OPTIONS":
+        return "", 204
+    account_id = request.args.get("account_id")
+    account_name = request.args.get("account_name")
+    period_id = request.args.get("period_id", type=int)
+    if not period_id:
+        return jsonify({"error": "period_id required"}), 400
+    period = q1("SELECT start_date, end_date FROM periods WHERE id=?", (period_id,))
+    if not period:
+        return jsonify({"error": "Period not found"}), 404
+
+    if not account_id and account_name:
+        row = q1("""SELECT account_id FROM qb_report_lines
+                    WHERE period_id=? AND account_name=? AND account_id IS NOT NULL
+                    LIMIT 1""", (period_id, account_name))
+        if row:
+            account_id = row["account_id"]
+
+    qs = [f"start_date={period['start_date']}", f"end_date={period['end_date']}",
+          "accounting_method=Accrual", "minorversion=65"]
+    if account_id:
+        qs.append(f"account={account_id}")
+    data, error = qb_get("/reports/TransactionList?" + "&".join(qs))
+    if error:
+        return jsonify({"error": error}), 502
+
+    cols = data.get("Columns", {}).get("Column", [])
+    col_titles = [c.get("ColTitle", "") for c in cols]
+    flat = []
+    def _walk(rows):
+        if not isinstance(rows, dict):
+            return
+        for row in rows.get("Row", []):
+            if row.get("type") == "Section":
+                _walk(row.get("Rows", {}))
+            else:
+                cd = row.get("ColData", [])
+                flat.append({col_titles[i] if i < len(col_titles) else f"col{i}": (cd[i].get("value") if i < len(cd) else "")
+                             for i in range(max(len(cd), len(col_titles)))})
+    _walk(data.get("Rows", {}))
+
+    return jsonify({
+        "account_id": account_id,
+        "account_name": account_name,
+        "period_id": period_id,
+        "columns": col_titles,
+        "transactions": flat,
+    })
+
+# ── Flux Notes ────────────────────────────────────────────────────────────────
+
+@app.route("/api/flux_notes", methods=["GET", "POST", "OPTIONS"])
+@login_required
+def flux_notes():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_report_tables()
+    if request.method == "GET":
+        period_id = request.args.get("period_id", type=int)
+        rtype = request.args.get("report_type")
+        if not period_id or not rtype:
+            return jsonify({"error": "period_id and report_type required"}), 400
+        rows = q("""SELECT id, account_name, note, author_id, updated_at FROM flux_notes
+                    WHERE period_id=? AND report_type=?""", (period_id, rtype))
+        return jsonify([dict(r) for r in rows])
+
+    body = request.get_json(silent=True) or {}
+    period_id = body.get("period_id")
+    rtype = body.get("report_type")
+    account_name = body.get("account_name")
+    note = (body.get("note") or "").strip()
+    if not (period_id and rtype and account_name):
+        return jsonify({"error": "period_id, report_type, account_name required"}), 400
+    uid = session.get("user_id")
+    if not note:
+        run("DELETE FROM flux_notes WHERE period_id=? AND report_type=? AND account_name=?",
+            (period_id, rtype, account_name))
+        return jsonify({"ok": True, "deleted": True})
+    run("""INSERT INTO flux_notes (period_id, report_type, account_name, note, author_id, updated_at)
+           VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+           ON CONFLICT(period_id, report_type, account_name) DO UPDATE SET
+             note=excluded.note, author_id=excluded.author_id, updated_at=CURRENT_TIMESTAMP""",
+        (period_id, rtype, account_name, note, uid))
+    return jsonify({"ok": True})
+
+# ── Report Groups (custom P&L / BS grouping) ──────────────────────────────────
+
+@app.route("/api/report_groups", methods=["GET", "POST", "OPTIONS"])
+@login_required
+def report_groups():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_report_tables()
+    if request.method == "GET":
+        rtype = request.args.get("report_type")
+        sql = "SELECT id, name, report_type, sort_order FROM report_groups"
+        params = ()
+        if rtype:
+            sql += " WHERE report_type=?"
+            params = (rtype,)
+        sql += " ORDER BY report_type, sort_order, name"
+        groups = [dict(r) for r in q(sql, params)]
+        for g in groups:
+            g["accounts"] = [r["account_name"] for r in q(
+                "SELECT account_name FROM report_group_map WHERE group_id=? ORDER BY account_name", (g["id"],))]
+        return jsonify(groups)
+
+    u = get_current_user()
+    if not u or u["role"] != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    rtype = body.get("report_type")
+    if not name or rtype not in ("pl", "bs", "cf"):
+        return jsonify({"error": "name and valid report_type required"}), 400
+    cur = run("INSERT INTO report_groups (name, report_type, sort_order) VALUES (?,?,?)",
+              (name, rtype, int(body.get("sort_order") or 0)))
+    return jsonify({"id": cur.lastrowid, "name": name, "report_type": rtype})
+
+@app.route("/api/report_groups/<int:gid>", methods=["PATCH", "DELETE", "OPTIONS"])
+@login_required
+def report_group_detail(gid):
+    if request.method == "OPTIONS":
+        return "", 204
+    u = get_current_user()
+    if not u or u["role"] != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    _ensure_report_tables()
+    if request.method == "DELETE":
+        run("DELETE FROM report_group_map WHERE group_id=?", (gid,))
+        run("DELETE FROM report_groups WHERE id=?", (gid,))
+        return jsonify({"ok": True})
+    body = request.get_json(silent=True) or {}
+    if "name" in body:
+        run("UPDATE report_groups SET name=? WHERE id=?", (body["name"], gid))
+    if "sort_order" in body:
+        run("UPDATE report_groups SET sort_order=? WHERE id=?", (int(body["sort_order"]), gid))
+    if "accounts" in body:
+        run("DELETE FROM report_group_map WHERE group_id=?", (gid,))
+        for acct in body["accounts"]:
+            run("INSERT OR IGNORE INTO report_group_map (group_id, account_name) VALUES (?,?)", (gid, acct))
+    return jsonify({"ok": True})
+
+# ── KPI Dashboard ─────────────────────────────────────────────────────────────
+
+def _find_line(lines, *needles):
+    needles = [n.lower() for n in needles]
+    for l in lines:
+        nm = (l.get("account_name") or "").lower().strip()
+        if any(n == nm or nm.endswith(n) or nm.startswith(n) for n in needles):
+            return l["amount"]
+    return None
+
+@app.route("/api/reports/kpis", methods=["GET", "OPTIONS"])
+@login_required
+def report_kpis():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_report_tables()
+    period_id = request.args.get("period_id", type=int)
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        return jsonify({"error": "No period"}), 400
+
+    pl = _load_report_lines(period_id, "pl")
+    bs = _load_report_lines(period_id, "bs")
+
+    revenue = _find_line(pl, "total income", "total revenue")
+    cogs = _find_line(pl, "total cost of goods sold", "total cogs")
+    gross = _find_line(pl, "gross profit")
+    opex = _find_line(pl, "total expenses", "total operating expenses")
+    net_income = _find_line(pl, "net income")
+
+    total_assets = _find_line(bs, "total assets")
+    current_assets = _find_line(bs, "total current assets")
+    current_liab = _find_line(bs, "total current liabilities")
+    total_liab = _find_line(bs, "total liabilities")
+    equity = _find_line(bs, "total equity", "total stockholders' equity")
+    cash = _find_line(bs, "total bank accounts", "total cash and cash equivalents")
+    inventory = _find_line(bs, "total other current assets", "total inventory")
+
+    def div(a, b):
+        return round(a / b, 4) if (a is not None and b not in (None, 0)) else None
+
+    kpis = {
+        "revenue": revenue,
+        "cogs": cogs,
+        "gross_profit": gross,
+        "operating_expenses": opex,
+        "net_income": net_income,
+        "gross_margin_pct": round(div(gross, revenue) * 100, 2) if div(gross, revenue) is not None else None,
+        "operating_margin_pct": round(div((gross or 0) - (opex or 0), revenue) * 100, 2) if revenue else None,
+        "net_margin_pct": round(div(net_income, revenue) * 100, 2) if div(net_income, revenue) is not None else None,
+        "total_assets": total_assets,
+        "total_liabilities": total_liab,
+        "total_equity": equity,
+        "cash": cash,
+        "current_ratio": div(current_assets, current_liab),
+        "quick_ratio": div((current_assets or 0) - (inventory or 0), current_liab) if current_liab else None,
+        "debt_to_equity": div(total_liab, equity),
+        "working_capital": (current_assets - current_liab) if (current_assets is not None and current_liab is not None) else None,
+    }
+    return jsonify({"period_id": period_id, "kpis": kpis})
+
+# ── Report Export ─────────────────────────────────────────────────────────────
+
+@app.route("/api/reports/<rtype>/export", methods=["GET"])
+@login_required
+def export_report(rtype):
+    if rtype not in ("pl", "bs", "cf"):
+        return "Unknown report type", 400
+    _ensure_report_tables()
+    period_id = request.args.get("period_id", type=int)
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        return "No period", 400
+    compare_id = request.args.get("compare_to", type=int)
+    if compare_id is None and request.args.get("auto_compare", "1") == "1":
+        compare_id = _prior_period_id(period_id)
+    view = request.args.get("view", "native")
+    fmt = (request.args.get("format") or "xlsx").lower()
+
+    lines = _build_report_payload(period_id, rtype, compare_id, view)
+    period = q1("SELECT label FROM periods WHERE id=?", (period_id,))
+    compare = q1("SELECT label FROM periods WHERE id=?", (compare_id,)) if compare_id else None
+    title = {"pl": "Profit & Loss", "bs": "Balance Sheet", "cf": "Cash Flow"}[rtype]
+    headers = ["Account", f"{period['label'] if period else 'Current'}"]
+    if compare:
+        headers += [compare["label"], "Variance $", "Variance %"]
+    headers.append("Flux Note")
+
+    def row_for(l):
+        r = [("  " * (l.get("depth") or 0)) + (l.get("account_name") or ""), l.get("amount")]
+        if compare:
+            r += [l.get("prior_amount"), l.get("variance"), l.get("variance_pct")]
+        r.append(l.get("flux_note") or "")
+        return r
+
+    if fmt == "csv":
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([title, period["label"] if period else ""])
+        w.writerow([])
+        w.writerow(headers)
+        for l in lines:
+            w.writerow(row_for(l))
+        from flask import Response
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{rtype}_{period_id}.csv"'})
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    except ImportError:
+        return "openpyxl not installed — run: pip install openpyxl  (or use ?format=csv)", 500
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title[:31]
+    bold = Font(bold=True)
+    hdr_fill = PatternFill("solid", fgColor="1E2D3D")
+    hdr_font = Font(bold=True, color="E2E8F0")
+    sub_fill = PatternFill("solid", fgColor="F1F5F9")
+    right = Alignment(horizontal="right")
+    thin = Side(border_style="thin", color="CBD5E1")
+
+    ws.cell(1, 1, title).font = Font(bold=True, size=14)
+    ws.cell(2, 1, f"Period: {period['label'] if period else ''}").font = Font(italic=True, color="64748B")
+    if compare:
+        ws.cell(2, 2, f"Compare: {compare['label']}").font = Font(italic=True, color="64748B")
+
+    for i, h in enumerate(headers, 1):
+        c = ws.cell(4, i, h)
+        c.font = hdr_font
+        c.fill = hdr_fill
+        c.alignment = right if i > 1 else Alignment(horizontal="left")
+        c.border = Border(bottom=thin)
+
+    for ri, l in enumerate(lines, 5):
+        row = row_for(l)
+        for ci, val in enumerate(row, 1):
+            c = ws.cell(ri, ci, val)
+            if ci > 1 and ci < len(row):
+                c.number_format = '#,##0.00;[Red](#,##0.00)' if ci != len(row)-1 or not compare else '0.00"%"'
+                c.alignment = right
+            if l.get("is_subtotal"):
+                c.font = bold
+                c.fill = sub_fill
+        if compare and l.get("variance_pct") is not None:
+            ws.cell(ri, len(headers)-1).number_format = '0.00"%"'
+
+    ws.column_dimensions['A'].width = 42
+    for col_letter in "BCDEF":
+        ws.column_dimensions[col_letter].width = 18
+    ws.column_dimensions['G' if compare else 'C'].width = 60
+
+    import io
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    from flask import Response
+    return Response(buf.read(),
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{rtype}_{period_id}.xlsx"'})
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
