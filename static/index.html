@@ -328,26 +328,72 @@ function CloseApp(){
 
   // ── Reconciliations ─────────────────────────────────────────────────────────
   function Reconciliations(){
-    if(loading)return <Spinner/>;
-    const stale=period?.end_date&&((new Date()-new Date(period.end_date+"T00:00:00"))/86400000>60);
+    const [reconPeriods,setReconPeriods]=useState([]);
+    const [reconPeriodId,setReconPeriodId]=useState(null);
+    const [reconBusy,setReconBusy]=useState(false);
+    const [reconErr,setReconErr]=useState(null);
+
+    useEffect(()=>{
+      api("/api/periods").then(ps=>{
+        const months=ps.filter(p=>(p.period_type||"month")==="month")
+                       .sort((a,b)=>b.start_date.localeCompare(a.start_date));
+        setReconPeriods(months);
+        if(!reconPeriodId){
+          const active=months.find(p=>p.is_active)||months[0];
+          if(active)setReconPeriodId(active.id);
+        }
+      }).catch(e=>setReconErr(e.message));
+    },[]);
+
+    useEffect(()=>{
+      if(!reconPeriodId)return;
+      api(`/api/reconciliations?period_id=${reconPeriodId}`).then(setRecons).catch(e=>setReconErr(e.message));
+    },[reconPeriodId]);
+
+    const selPeriod=reconPeriods.find(p=>p.id===reconPeriodId)||period;
+    const stale=selPeriod?.end_date&&((new Date()-new Date(selPeriod.end_date+"T00:00:00"))/86400000>60);
+
+    async function syncThisPeriod(){
+      if(!reconPeriodId)return;
+      setReconBusy(true);setReconErr(null);setSyncMsg(null);
+      try{
+        const r=await api("/api/qb/sync_reports",{method:"POST",body:JSON.stringify({period_id:reconPeriodId,types:["bs"],derive_recons:true})});
+        if(!r.ok){
+          const msgs=Object.entries(r.results||{}).filter(([_,v])=>!v.ok).map(([t,v])=>`${t.toUpperCase()}: ${v.error||"unknown"}`).join(" · ");
+          setReconErr(msgs||"Sync failed");
+        }else{
+          const rc=r.recons||{};
+          setSyncMsg({kind:"ok",text:`Synced ${selPeriod?.label||"period"} · ${rc.created||0} new accounts, ${rc.updated||0} updated`});
+        }
+        const rr=await api(`/api/reconciliations?period_id=${reconPeriodId}`);setRecons(rr);
+      }catch(e){setReconErr(e.message);}
+      setReconBusy(false);
+    }
+
+    if(loading&&!reconPeriods.length)return <Spinner/>;
     return(<div style={S.card}>
-      {stale&&<div style={{padding:"10px 14px",marginBottom:14,borderRadius:8,background:"#f59e0b18",border:"1px solid #f59e0b40",color:"#f59e0b",fontSize:12.5,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-        <span>⚠ Active period "{period?.label}" ended more than 60 days ago. Click <b>Initialize from QuickBooks</b> to activate the current month and pull fresh data.</span>
-        {isAdmin&&<button onClick={bootstrapQB} disabled={syncing} style={{marginLeft:"auto",padding:"6px 12px",background:"#f59e0b",border:"none",color:"#0d1117",borderRadius:6,fontSize:12,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"Initialize from QB"}</button>}
+      {stale&&!reconBusy&&<div style={{padding:"10px 14px",marginBottom:14,borderRadius:8,background:"#f59e0b18",border:"1px solid #f59e0b40",color:"#f59e0b",fontSize:12.5,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <span>⚠ Period "{selPeriod?.label}" ended more than 60 days ago — QB Balance shows ending balances as of {selPeriod?.end_date}. To refresh, click <b>↻ Sync This Period</b>.</span>
       </div>}
-      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,gap:10,flexWrap:"wrap"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16,gap:10,flexWrap:"wrap",alignItems:"flex-start"}}>
         <div>
           <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Account Reconciliations</div>
-          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Synced from QuickBooks Online · {period?.label||"—"}</div>
+          <div style={{fontSize:11.5,color:"#64748b",marginTop:2}}>Synced from QuickBooks Online · {selPeriod?.label||"—"}</div>
         </div>
-        {isAdmin&&<div style={{display:"flex",gap:8}}>
-          {recons.length===0&&qbStatus?.connected&&<button onClick={bootstrapQB} disabled={syncing} style={{padding:"6px 14px",background:"#2CA01C",border:"none",color:"#fff",borderRadius:8,fontSize:12,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"⇣ Initialize from QuickBooks"}</button>}
-          <button onClick={syncQB} disabled={syncing} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync QB"}</button>
-        </div>}
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>PERIOD</label>
+          <select value={reconPeriodId||""} onChange={e=>setReconPeriodId(parseInt(e.target.value))}
+            style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace",minWidth:140}}>
+            {reconPeriods.map(p=><option key={p.id} value={p.id}>{p.label}{p.is_active?" ●":""}</option>)}
+          </select>
+          {isAdmin&&recons.length===0&&qbStatus?.connected&&<button onClick={bootstrapQB} disabled={syncing||reconBusy} style={{padding:"6px 14px",background:"#2CA01C",border:"none",color:"#fff",borderRadius:8,fontSize:12,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"⇣ Initialize from QuickBooks"}</button>}
+          {isAdmin&&qbStatus?.connected&&<button onClick={syncThisPeriod} disabled={reconBusy||syncing} title="Pull this period's Balance Sheet from QuickBooks and derive account balances" style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:(reconBusy||syncing)?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{reconBusy?"Syncing…":"↻ Sync This Period"}</button>}
+        </div>
       </div>
+      {reconErr&&<div style={{marginBottom:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:"#f8717118",border:"1px solid #f8717140",color:"#f87171"}}>{reconErr}</div>}
       {syncMsg&&<div style={{marginBottom:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:syncMsg.kind==="ok"?"#4fd9a018":"#f8717118",border:`1px solid ${syncMsg.kind==="ok"?"#4fd9a040":"#f8717140"}`,color:syncMsg.kind==="ok"?"#4fd9a0":"#f87171"}}>{syncMsg.text}</div>}
       {recons.length===0&&<div style={{padding:30,textAlign:"center",color:"#64748b",fontSize:13,fontFamily:"'DM Mono',monospace"}}>
-        {qbStatus?.connected?"No reconciliation rows yet. Click Initialize from QuickBooks above.":"Connect QuickBooks in Settings, then Initialize."}
+        {qbStatus?.connected?`No reconciliations for ${selPeriod?.label||"this period"}. Click ↻ Sync This Period to pull it from QuickBooks.`:"Connect QuickBooks in Settings, then Initialize."}
       </div>}
       <table style={{width:"100%",borderCollapse:"collapse"}}>
         <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
@@ -694,7 +740,7 @@ function CloseApp(){
           <button onClick={bootstrapQB} disabled={syncing} style={{padding:"8px 18px",background:"#2CA01C",border:"none",color:"#fff",borderRadius:8,fontSize:13,fontWeight:600,cursor:syncing?"default":"pointer"}}>{syncing?"Working…":"⇣ Initialize from QuickBooks"}</button>
           <button onClick={syncQB} disabled={syncing} style={{padding:"7px 16px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:syncing?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{syncing?"Syncing…":"↻ Sync Balances Now"}</button>
           <div style={{fontSize:11.5,color:"#64748b",flex:"1 1 100%",marginTop:6}}>
-            <b>Initialize</b> activates the current month, creates a reconciliation row for every Asset / Liability / Equity account in your QB, and pulls P&amp;L, Balance Sheet, and Cash Flow. Safe to re-run.
+            <b>Initialize</b> activates the current month, creates a reconciliation row for every Asset / Liability / Equity account in your QB, pulls current P&amp;L / BS / CF, and then sweeps every month / quarter / year from 2024-01-01 through today so historical reports and prior-period reconciliations populate. Safe to re-run.
           </div>
         </div>}
         {syncMsg&&<div style={{marginTop:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:syncMsg.kind==="ok"?"#4fd9a018":"#f8717118",border:`1px solid ${syncMsg.kind==="ok"?"#4fd9a040":"#f8717140"}`,color:syncMsg.kind==="ok"?"#4fd9a0":"#f87171"}}>{syncMsg.text}</div>}
@@ -844,8 +890,22 @@ function CloseApp(){
       setBusy(true);setErr(null);
       try{
         const r=await api("/api/qb/sync_reports",{method:"POST",body:JSON.stringify({period_id:periodId,types:[rtype]})});
-        if(!r.ok){setErr(JSON.stringify(r.results));}
+        if(!r.ok){
+          const msgs=Object.entries(r.results||{}).filter(([_,v])=>!v.ok).map(([t,v])=>`${t.toUpperCase()}: ${v.error||"unknown"}`).join(" · ");
+          setErr(msgs||"Sync failed");
+        }
         await loadReport();await loadKpis();
+      }catch(e){setErr(e.message);}
+      setBusy(false);
+    }
+    async function syncHistory(){
+      if(!confirm("Pull every P&L / Balance Sheet / Cash Flow from QuickBooks for every month, quarter, and year from 2024-01-01 through today, AND derive reconciliations from each month's Balance Sheet. This can take 1–3 minutes. Continue?"))return;
+      setBusy(true);setErr(null);
+      try{
+        const r=await api("/api/qb/sync_history",{method:"POST",body:JSON.stringify({start_date:"2024-01-01"})});
+        await loadReport();await loadKpis();
+        const errTxt=r.errors&&r.errors.length?`\n\n${r.errors.length} soft error(s) — first few:\n${r.errors.slice(0,5).join("\n")}`:"";
+        alert(`History synced through ${r.end_date}.\n${r.periods} periods · P&L ${r.pl} · BS ${r.bs} · CF ${r.cf}\nReconciliations: ${r.recons_created} created, ${r.recons_updated} updated.${errTxt}`);
       }catch(e){setErr(e.message);}
       setBusy(false);
     }
@@ -949,6 +1009,7 @@ function CloseApp(){
             <button onClick={()=>exportReport("xlsx")} disabled={!lines.length} style={{padding:"6px 14px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ Excel</button>
             <button onClick={()=>exportReport("csv")} disabled={!lines.length} style={{padding:"6px 14px",background:"#1a2535",border:"1px solid #1e2d3d",color:"#94a3b8",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ CSV</button>
             {isAdmin&&<button onClick={syncFromQB} disabled={busy} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:busy?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{busy?"Syncing…":"↻ Sync from QB"}</button>}
+            {isAdmin&&<button onClick={syncHistory} disabled={busy} title="Pull P&L / BS / CF + derive recons for every month, quarter, and year from 2024-01-01 through today" style={{padding:"6px 14px",background:"#2CA01C18",border:"1px solid #2CA01C40",color:busy?"#64748b":"#2CA01C",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{busy?"Working…":"⇣ Sync History"}</button>}
           </div>
         </div>
 

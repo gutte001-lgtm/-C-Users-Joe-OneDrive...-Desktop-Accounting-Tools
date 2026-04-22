@@ -328,6 +328,18 @@ hardening port, the state of the repo is:
 
 ### Remaining unmerged branches
 
+- **`claude/fix-quickbooks-sync-PPv7R`** — in-flight at time of writing.
+  Adds historical sweep: `sync_qb_recons_from_bs(period_id)` derives
+  per-period reconciliations from each period's cached Balance Sheet
+  (correct historical ending balances, unlike the current-balance stamp
+  from `sync_qb_accounts`); `sync_history_range(start, end)` iterates
+  every 4-4-5 month/quarter/year overlapping the window and pulls
+  P&L/BS/CF + derives recons; new `/api/qb/sync_history` endpoint and
+  `/api/qb/bootstrap` now sweeps 2024-01-01 → today by default
+  (`skip_history: true` to opt out). Frontend: Reconciliations tab
+  gained a period dropdown + "↻ Sync This Period" button (local state,
+  doesn't mutate the globally-active period); Reports gained a "⇣ Sync
+  History" button and a real error string instead of `JSON.stringify(results)`.
 - **`claude/close-tracker-tools-JVRS3`** — a *different* reports flavor
   (customer / vendor ledgers, GL detail, revenue by customer, expense
   by vendor, by-Jira-epic) plus QB deep-sync of 23 entities,

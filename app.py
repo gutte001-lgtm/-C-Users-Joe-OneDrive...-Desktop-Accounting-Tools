@@ -482,8 +482,11 @@ def manual_sync():
 @csrf_protect
 def qb_bootstrap():
     """One-click 'set this up from my real QuickBooks': activate the current
-    4-4-5 month, seed reconciliations from QB's chart of accounts, and pull
-    P&L/BS/CF for current month, its quarter, and its year."""
+    4-4-5 month, seed reconciliations from QB's chart of accounts, pull
+    P&L/BS/CF for current month/quarter/year, and then sweep every
+    month/quarter/year from 2024-01-01 through today so historical reporting
+    and prior-period reconciliations work. Body may pass
+    {history_start: 'YYYY-MM-DD'} or {skip_history: true}."""
     if request.method == "OPTIONS":
         return "", 204
     if not get_tokens():
@@ -504,11 +507,21 @@ def qb_bootstrap():
     for pid in targets:
         for rtype in ("pl", "bs", "cf"):
             report_results[f"{pid}:{rtype}"] = sync_qb_report(pid, rtype)
+
+    body = request.get_json(silent=True) or {}
+    history = None
+    if not body.get("skip_history"):
+        history = sync_history_range(
+            start_iso=body.get("history_start") or "2024-01-01",
+            end_iso=body.get("history_end") or date.today().isoformat(),
+        )
+
     return jsonify({
         "ok": True,
         "period_id": period_id,
         "accounts": accounts_result,
         "reports": report_results,
+        "history": history,
     })
 
 # ── QuickBooks Report Sync (P&L, Balance Sheet) ───────────────────────────────
@@ -655,6 +668,109 @@ def sync_qb_report(period_id, report_type):
     db.commit()
     return {"ok": True, "lines": len(lines)}
 
+def sync_qb_recons_from_bs(period_id):
+    """Derive reconciliation rows for `period_id` from its cached Balance
+    Sheet lines. Unlike sync_qb_accounts() — which stamps TODAY'S balance
+    against a period — this uses the BS as-of the period end, so historical
+    periods get their real ending balances. Call sync_qb_report(period_id,'bs')
+    first. Idempotent: matches existing rows by name (case-insensitive)."""
+    lines = q("""SELECT account_name, account_id, amount FROM qb_report_lines
+                 WHERE period_id=? AND report_type='bs' AND is_subtotal=0
+                   AND account_name != ''""", (period_id,))
+    if not lines:
+        return {"ok": False, "error": "No BS lines cached — run sync_qb_report(period_id,'bs') first"}
+
+    db = get_db()
+    existing = q("SELECT id, account_name FROM reconciliations WHERE period_id=?", (period_id,))
+    by_name = {(r["account_name"] or "").strip().lower(): r["id"] for r in existing if r["account_name"]}
+
+    qb_acct_by_id = {r["id"]: dict(r) for r in q("SELECT id, name, acct_num FROM qb_accounts")}
+
+    admin = q1("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1") \
+            or q1("SELECT id FROM users ORDER BY id LIMIT 1")
+    assignee_id = admin["id"] if admin else DEFAULT_USER_ID
+
+    created = updated = 0
+    for ln in lines:
+        name = (ln["account_name"] or "").strip()
+        if not name:
+            continue
+        try:
+            amt = float(ln["amount"] or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        acct_num = ""
+        acct_id = ln["account_id"]
+        if acct_id and str(acct_id) in qb_acct_by_id:
+            acct_num = (qb_acct_by_id[str(acct_id)].get("acct_num") or "").strip()
+        rid = by_name.get(name.lower())
+        if rid:
+            db.execute("UPDATE reconciliations SET qb_balance=?, last_synced_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (amt, rid))
+            updated += 1
+        else:
+            db.execute("""INSERT INTO reconciliations
+                          (period_id, account_number, account_name, assignee_id,
+                           qb_balance, expected_balance, status, last_synced_at)
+                          VALUES (?,?,?,?,?,NULL,'open',CURRENT_TIMESTAMP)""",
+                       (period_id, acct_num or f"QB{acct_id or ''}", name, assignee_id, amt))
+            created += 1
+    db.commit()
+    return {"ok": True, "created": created, "updated": updated, "total": len(lines)}
+
+def sync_history_range(start_iso="2024-01-01", end_iso=None, types=("pl", "bs", "cf"), derive_recons=True):
+    """Sweep every 4-4-5 month / quarter / year period whose window overlaps
+    [start_iso, end_iso] and sync P&L / BS / CF into the cache. If derive_recons
+    is on, also upsert per-period reconciliations from the cached BS lines.
+    Returns a summary dict; non-fatal QB errors are collected in 'errors'."""
+    _ensure_fiscal_calendar()
+    _ensure_report_tables()
+    if not end_iso:
+        end_iso = date.today().isoformat()
+    periods = q("""SELECT id, label, period_type, start_date, end_date FROM periods
+                   WHERE end_date >= ? AND start_date <= ?
+                   ORDER BY period_type, start_date""", (start_iso, end_iso))
+    summary = {
+        "ok": True, "start_date": start_iso, "end_date": end_iso,
+        "periods": len(periods), "pl": 0, "bs": 0, "cf": 0,
+        "recons_created": 0, "recons_updated": 0, "errors": [],
+    }
+    for p in periods:
+        pid = p["id"]
+        bs_ok = False
+        for rtype in types:
+            res = sync_qb_report(pid, rtype)
+            if res.get("ok"):
+                summary[rtype] = summary.get(rtype, 0) + 1
+                if rtype == "bs":
+                    bs_ok = True
+            else:
+                summary["errors"].append(f"{p['label']} {rtype}: {res.get('error')}")
+        if derive_recons and bs_ok:
+            rec = sync_qb_recons_from_bs(pid)
+            if rec.get("ok"):
+                summary["recons_created"] += rec.get("created", 0)
+                summary["recons_updated"] += rec.get("updated", 0)
+    return summary
+
+@app.route("/api/qb/sync_history", methods=["POST", "OPTIONS"])
+@login_required
+@csrf_protect
+def qb_sync_history():
+    """One-click historical sweep. Body: {start_date?, end_date?, types?,
+    derive_recons?}. Defaults to 2024-01-01 through today, all three reports,
+    and deriving recons from each period's BS."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not get_tokens():
+        return jsonify({"ok": False, "error": "Not connected to QuickBooks"}), 400
+    body = request.get_json(silent=True) or {}
+    start = body.get("start_date") or "2024-01-01"
+    end = body.get("end_date") or date.today().isoformat()
+    types = body.get("types") or ("pl", "bs", "cf")
+    derive = body.get("derive_recons", True)
+    return jsonify(sync_history_range(start, end, types=tuple(types), derive_recons=bool(derive)))
+
 @app.route("/api/qb/sync_reports", methods=["POST", "OPTIONS"])
 @login_required
 @csrf_protect
@@ -670,7 +786,14 @@ def sync_reports_endpoint():
         return jsonify({"ok": False, "error": "No period selected and no active period"}), 400
     types = body.get("types") or ["pl", "bs", "cf"]
     results = {t: sync_qb_report(period_id, t) for t in types}
-    return jsonify({"ok": all(r.get("ok") for r in results.values()), "results": results})
+    recons = None
+    if "bs" in types and results.get("bs", {}).get("ok") and body.get("derive_recons", True):
+        recons = sync_qb_recons_from_bs(period_id)
+    return jsonify({
+        "ok": all(r.get("ok") for r in results.values()),
+        "results": results,
+        "recons": recons,
+    })
 
 def _load_report_lines(period_id, report_type):
     rows = q("""SELECT section, account_name, account_id, amount, is_subtotal, depth, sort_order
