@@ -298,44 +298,47 @@ forward via another branch's merge while you were working.
 
 ---
 
-## 7. Historical branch ledger (as of 2026-04-22 consolidation)
+## 7. Historical branch ledger (as of 2026-04-22 consolidation + hardening)
 
-After the "8 parallel branches" cleanup, the state of the repo is:
+After the "8 parallel branches" cleanup and the follow-up security
+hardening port, the state of the repo is:
 
-- **`master`** — now contains the work of `fix-accounting-button-B9RTl`
-  (Reports tab with P&L / BS / Cash Flow, KPIs, flux notes, drill-down,
-  Excel/CSV export, 4-4-5 fiscal calendar with MTD/QTD/YTD, QB OAuth
-  connect, login removal, CRUD route normalization, fresh-DB report fix,
-  Privacy/EULA templates, `Start CloseTool.bat` launcher). This is the
-  baseline every new branch must start from.
-- **`claude/close-tracker-tools-JVRS3`** — *not* merged. Contains a
-  different reports flavor (customer / vendor ledgers, GL detail, revenue
-  by customer, expense by vendor, by-Jira-epic) plus QB deep-sync of 23
-  entities, trial-balance snapshots, close-report PDF, audit trail,
-  calendar view, bulk actions, recon attachments, templates, flux
-  analysis, review queue. Kept as a reference; merging it requires real
-  conflict resolution against the `master` Reports tab.
-- **`claude/close-tool-next-steps-8Y8oZ`** — *not* merged. Period
-  rollover, period close/reopen, SMTP + Slack notifications, activity
-  timeline.
-- **`claude/review-close-tool-dG5XJ`** — *consumed* (2026-04-22). The
-  branch was built on pre-login-removal master and could not be merged
-  directly. Five of its seven items were ported into `master`:
-  `SECRET_KEY` enforcement (auto-generated into `.env`), `safe_update`
-  SQL column whitelist, CORS origin allowlist, session-cookie hardening,
-  CSRF tokens on all mutating routes, Fernet encryption of QB tokens.
-  Two items were dropped because the code they targeted is gone: login
-  rate-limit and `setup_auth.py` password hardening. See §4c for the
-  current security posture. Branch can be deleted once Joe confirms.
-- **`claude/organize-files-JGYzh`** — *not* merged. Moves the tool into
-  a `close-tool/` subfolder for multi-project workspace layout.
+- **`master`** — carries the fast-forward from
+  `claude/fix-accounting-button-B9RTl` (Reports tab with P&L / BS /
+  Cash Flow, KPIs, flux notes, drill-down, Excel/CSV export, 4-4-5
+  fiscal calendar with MTD/QTD/YTD, QB OAuth connect, login removal,
+  CRUD route normalization, fresh-DB report fix, Privacy/EULA
+  templates, `Start CloseTool.bat` launcher) **plus** the security
+  hardening ported from `claude/review-close-tool-dG5XJ` (see §4c).
+  This is the baseline every new branch must start from.
+
+### Remaining unmerged branches
+
+- **`claude/close-tracker-tools-JVRS3`** — a *different* reports flavor
+  (customer / vendor ledgers, GL detail, revenue by customer, expense
+  by vendor, by-Jira-epic) plus QB deep-sync of 23 entities,
+  trial-balance snapshots, close-report PDF, audit trail, calendar
+  view, bulk actions, recon attachments, templates, flux analysis,
+  review queue. Kept for reference; merging it requires real conflict
+  resolution against the `master` Reports tab.
+- **`claude/close-tool-next-steps-8Y8oZ`** — period rollover, period
+  close/reopen, SMTP + Slack notifications, activity timeline. Good
+  next-consolidation candidate.
+- **`claude/organize-files-JGYzh`** — moves the tool into a
+  `close-tool/` subfolder for multi-project workspace layout.
   Conflicts with every other branch.
-- **`claude/month-end-close-tool-5eQcQ`** — *not* merged. Early manual
-  schema + fiscal-period seed, authored by Joe. Superseded by §7's
-  4-4-5 calendar on `master`.
-- **`claude/fix-login-screen-removal-2EuuX`**, **`claude/remove-login-screen-Rc77n`** —
-  obsolete. The login is already removed on `master`. Safe to delete
-  once Joe confirms.
+- **`claude/month-end-close-tool-5eQcQ`** — early manual schema +
+  fiscal-period seed, authored by Joe. Superseded by the 4-4-5
+  calendar on `master`; kept for archive.
 
-When in doubt, ask Joe before merging or deleting any of these.
+### Deleted branches (2026-04-22)
+
+- `claude/fix-accounting-button-B9RTl` — landed on `master`.
+- `claude/review-close-tool-dG5XJ` — consumed by the security port.
+- `claude/fix-login-screen-removal-2EuuX`,
+  `claude/remove-login-screen-Rc77n` — obsolete (login already removed
+  on `master`).
+
+When in doubt, ask Joe before merging or deleting any of the
+unmerged-but-still-present branches above.
 
