@@ -76,6 +76,8 @@ async function api(path,opts={}){
 }
 function fmt(n){if(n==null)return"—";return"$"+parseFloat(n).toLocaleString("en-US",{minimumFractionDigits:2})}
 function fmtDate(d){if(!d)return"—";return new Date(d+"T00:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+function fmtDT(d){if(!d)return"—";return new Date(d).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}
+const ACTION_LABEL={status_change:"changed status",review_change:"changed review",note:"left a note",expected_balance:"updated expected balance",variance_threshold:"updated variance threshold",notes:"updated notes"};
 
 const SC={complete:{label:"Complete",color:"#4fd9a0",bg:"rgba(79,217,160,.12)"},in_progress:{label:"In Progress",color:"#f7c948",bg:"rgba(247,201,72,.12)"},open:{label:"Open",color:"#94a3b8",bg:"rgba(148,163,184,.1)"}};
 const RC={approved:{label:"Approved",color:"#4fd9a0",icon:"✓"},pending:{label:"Pending Review",color:"#94a3b8",icon:"○"},needs_revision:{label:"Needs Revision",color:"#f87171",icon:"!"}};
@@ -104,6 +106,30 @@ function Modal({title,onClose,children}){
     </div>
     {children}
   </div></div>;
+}
+
+function ActivityFeed({fetcher}){
+  const [items,setItems]=useState(null);
+  useEffect(()=>{let alive=true;fetcher().then(d=>{if(alive)setItems(d);}).catch(()=>{if(alive)setItems([]);});return()=>{alive=false};},[fetcher]);
+  if(items===null)return <div style={{color:"#475569",fontSize:12,fontFamily:"'DM Mono',monospace"}}>Loading activity…</div>;
+  if(!items.length)return <div style={{color:"#475569",fontSize:12,fontFamily:"'DM Mono',monospace"}}>No activity yet.</div>;
+  return(<div style={{display:"flex",flexDirection:"column",gap:8,maxHeight:180,overflow:"auto"}}>
+    {items.map(a=>(
+      <div key={a.id} style={{display:"flex",gap:10,alignItems:"flex-start",fontSize:12.5}}>
+        <Avatar user={{initials:a.user_initials,color:a.user_color}} size={22}/>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{color:"#cbd5e1"}}>
+            <span style={{fontWeight:600}}>{a.user_name}</span>{" "}
+            <span style={{color:"#64748b"}}>{ACTION_LABEL[a.action]||a.action}</span>
+            {a.old_value!=null&&a.new_value!=null&&<span style={{color:"#64748b"}}>{" "}from <span style={{color:"#94a3b8"}}>{a.old_value||"—"}</span> to <span style={{color:"#e2e8f0"}}>{a.new_value}</span></span>}
+            {a.old_value==null&&a.new_value!=null&&a.action!=="note"&&<span style={{color:"#64748b"}}>{" "}to <span style={{color:"#e2e8f0"}}>{a.new_value}</span></span>}
+          </div>
+          {a.action==="note"&&a.new_value&&<div style={{color:"#94a3b8",marginTop:2,whiteSpace:"pre-wrap",fontSize:12}}>"{a.new_value}"</div>}
+          <div style={{color:"#475569",fontSize:10.5,fontFamily:"'DM Mono',monospace",marginTop:1}}>{fmtDT(a.created_at)}</div>
+        </div>
+      </div>
+    ))}
+  </div>);
 }
 
 // ── Main App ──────────────────────────────────────────────────────────────────
@@ -199,9 +225,13 @@ function CloseApp(){
     }catch(e){alert(e.message);}
   }
 
+  const [selectedRecon,setSelectedRecon]=useState(null);
   async function patchRecon(id,patch){
-    try{const updated=await api(`/api/reconciliations/${id}`,{method:"PATCH",body:JSON.stringify(patch)});setRecons(prev=>prev.map(r=>r.id===id?{...r,...updated}:r));}
-    catch(e){alert(e.message);}
+    try{
+      const updated=await api(`/api/reconciliations/${id}`,{method:"PATCH",body:JSON.stringify(patch)});
+      setRecons(prev=>prev.map(r=>r.id===id?{...r,...updated}:r));
+      if(selectedRecon?.id===id)setSelectedRecon(prev=>({...prev,...updated}));
+    }catch(e){alert(e.message);}
   }
 
   const [syncMsg,setSyncMsg]=useState(null);
@@ -449,21 +479,22 @@ function CloseApp(){
         {qbStatus?.connected?`No reconciliations for ${selPeriod?.label||"this period"}. Click ↻ Sync This Period to pull it from QuickBooks.`:"Connect QuickBooks in Settings, then Initialize."}
       </div>}
       <table style={{width:"100%",borderCollapse:"collapse"}}>
-        <thead><tr>{["Account","QB Balance","Expected","Variance","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=3?"right":"left"}}>{h}</th>)}</tr></thead>
+        <thead><tr>{["Account","QB Balance","Expected","Variance","Threshold","Assignee","Status","Updated"].map((h,i)=><th key={h} style={{...S.th,textAlign:i>=1&&i<=4?"right":"left"}}>{h}</th>)}</tr></thead>
         <tbody>{recons.map(r=>{
           const variance=r.expected_balance!=null?r.qb_balance-r.expected_balance:null;
           const vc=variance===0?"#4fd9a0":variance!=null?"#f87171":"#475569";
-          return(<tr key={r.id}>
+          return(<tr key={r.id} style={{cursor:"pointer"}} onClick={()=>setSelectedRecon(r)}>
             <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{r.account_number} – {r.account_name}</td>
             <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>{fmt(r.qb_balance)}</td>
-            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}}>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5}} onClick={e=>e.stopPropagation()}>
               <input type="text" defaultValue={r.expected_balance!=null?r.expected_balance:""} placeholder="—"
                 onBlur={e=>{const v=parseFloat(e.target.value.replace(/[$,]/g,""));if(!isNaN(v))patchRecon(r.id,{expected_balance:v});}}
                 style={{background:"transparent",border:"none",color:"#e2e8f0",fontFamily:"'DM Mono',monospace",fontSize:12.5,textAlign:"right",width:110,outline:"none",borderBottom:"1px dashed #1e2d3d"}}/>
             </td>
             <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,color:vc,fontWeight:variance!==0&&variance!=null?700:400}}>{variance!=null?(variance===0?"—":fmt(Math.abs(variance))):"—"}</td>
+            <td style={{...S.td,textAlign:"right",fontFamily:"'DM Mono',monospace",fontSize:12.5,color:"#64748b"}}>{r.variance_threshold!=null?fmt(r.variance_threshold):"—"}</td>
             <td style={S.td}><Avatar user={{initials:r.assignee_initials,color:r.assignee_color}}/></td>
-            <td style={S.td}>
+            <td style={{...S.td}} onClick={e=>e.stopPropagation()}>
               <select value={r.status} style={S.sel(XC[r.status]?.color||"#94a3b8")} onChange={e=>patchRecon(r.id,{status:e.target.value})}>
                 <option value="open">Open</option><option value="needs_attention">Variance</option><option value="reconciled">Reconciled</option>
               </select>
@@ -472,7 +503,69 @@ function CloseApp(){
           </tr>);
         })}</tbody>
       </table>
+      {selectedRecon&&<ReconModal/>}
     </div>);
+
+    function ReconModal(){
+      const r=selectedRecon;
+      const [expected,setExpected]=useState("");
+      const [threshold,setThreshold]=useState("");
+      const [notes,setNotes]=useState("");
+      useEffect(()=>{setExpected(r?.expected_balance??"");setThreshold(r?.variance_threshold??"");setNotes(r?.notes||"");},[r?.id]);
+      const fetchActivity=useCallback(()=>r?api(`/api/reconciliations/${r.id}/activity`):Promise.resolve([]),[r?.id]);
+      if(!r)return null;
+      const variance=r.expected_balance!=null&&r.qb_balance!=null?r.qb_balance-r.expected_balance:null;
+      const vc=variance===0?"#4fd9a0":variance!=null?"#f87171":"#475569";
+      const parseNum=(s)=>{if(s===""||s==null)return null;const v=parseFloat(String(s).replace(/[$,]/g,""));return isNaN(v)?null:v;};
+      async function save(){try{await patchRecon(r.id,{expected_balance:parseNum(expected),variance_threshold:parseNum(threshold),notes});setSelectedRecon(null);}catch(e){}}
+      return(<div style={{position:"fixed",inset:0,background:"#0008",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setSelectedRecon(null)}>
+        <div style={{background:"#111827",border:"1px solid #1e2d3d",borderRadius:16,width:540,padding:28,maxHeight:"85vh",overflow:"auto"}} onClick={e=>e.stopPropagation()}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
+            <div>
+              <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>ACCT {r.account_number}</div>
+              <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{r.account_name}</div>
+            </div>
+            <button onClick={()=>setSelectedRecon(null)} style={{background:"none",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>×</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+              <div className="form-label">QB Balance</div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:14,color:"#e2e8f0"}}>{fmt(r.qb_balance)}</div>
+            </div>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+              <div className="form-label">Variance</div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:14,color:vc,fontWeight:600}}>{variance!=null?fmt(Math.abs(variance)):"—"}</div>
+            </div>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Expected Balance</label>
+            <input className="form-input" value={expected} onChange={e=>setExpected(e.target.value)} placeholder="0.00"/>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Variance Threshold <span style={{color:"#475569",textTransform:"none",letterSpacing:0}}>(auto-flags when |variance| &gt; threshold)</span></label>
+            <input className="form-input" value={threshold} onChange={e=>setThreshold(e.target.value)} placeholder="e.g. 100"/>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Notes</label>
+            <textarea className="form-input" value={notes} onChange={e=>setNotes(e.target.value)} style={{minHeight:70,resize:"vertical"}}/>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Status</label>
+            <select className="form-select" value={r.status} onChange={e=>patchRecon(r.id,{status:e.target.value})}>
+              <option value="open">Open</option><option value="needs_attention">Variance</option><option value="reconciled">Reconciled</option>
+            </select>
+          </div>
+          <div style={{marginTop:18,paddingTop:12,borderTop:"1px solid #1e2d3d"}}>
+            <div className="form-label">Activity</div>
+            <ActivityFeed fetcher={fetchActivity}/>
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:18}}>
+            <button className="btn btn-ghost" onClick={()=>setSelectedRecon(null)}>Close</button>
+            <button className="btn btn-primary" onClick={save}>Save</button>
+          </div>
+        </div>
+      </div>);
+    }
   }
 
   // ── Task Modal ──────────────────────────────────────────────────────────────
@@ -486,6 +579,7 @@ function CloseApp(){
     const assignee=users.find(u=>u.id===t.assignee_id);
     const reviewer=users.find(u=>u.id===t.reviewer_id);
     const canEdit=isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+    const fetchActivity=useCallback(()=>api(`/api/tasks/${t.id}/activity`),[t.id]);
 
     async function saveEdit(){
       await patchTask(t.id,{...editData,notes});
@@ -538,6 +632,20 @@ function CloseApp(){
               </select>
               :<span style={{fontSize:13}}>{t.category_name}</span>}
           </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Frequency</div>
+            {editMode&&isAdmin
+              ?<select className="form-select" defaultValue={t.frequency||"Monthly"} onChange={e=>setEditData(p=>({...p,frequency:e.target.value}))}>
+                {["Monthly","Weekly","Daily","Bi-Weekly","Quarterly","Annually","As Needed"].map(f=><option key={f} value={f}>{f}</option>)}
+              </select>
+              :<span style={{fontSize:13,color:"#94a3b8"}}>{t.frequency||"—"}</span>}
+          </div>
+          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+            <div className="form-label">Due Offset <span style={{color:"#475569",textTransform:"none",letterSpacing:0}}>(days from PE)</span></div>
+            {editMode&&isAdmin
+              ?<input type="number" className="form-input" placeholder="e.g. 5" defaultValue={t.due_offset??""} onChange={e=>setEditData(p=>({...p,due_offset:e.target.value===""?null:parseInt(e.target.value)}))}/>
+              :<span style={{fontFamily:"'DM Mono',monospace",fontSize:13,color:"#94a3b8"}}>{t.due_offset!=null?`${t.due_offset>=0?"+":""}${t.due_offset}d`:"—"}</span>}
+          </div>
           <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Status</div><Badge status={t.status}/></div>
           <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Review</div><Badge status={t.review_status} type="review"/></div>
         </div>
@@ -546,6 +654,11 @@ function CloseApp(){
           <div className="form-label">Notes</div>
           <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Add notes or comments…" disabled={!canEdit}
             style={{width:"100%",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:80,fontFamily:"'DM Sans',sans-serif",opacity:canEdit?1:.6}}/>
+        </div>
+
+        <div style={{marginBottom:14,paddingTop:12,borderTop:"1px solid #1e2d3d"}}>
+          <div className="form-label">Activity</div>
+          <ActivityFeed fetcher={fetchActivity}/>
         </div>
 
         <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
@@ -600,12 +713,12 @@ function CloseApp(){
     }
 
     // Add Task Form
-    const [newTask,setNewTask]=useState({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:""});
+    const [newTask,setNewTask]=useState({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:"",frequency:"Monthly",due_offset:""});
     async function addTask(){
       if(!newTask.name||!newTask.category_id||!newTask.assignee_id||!newTask.reviewer_id){alert("Name, category, assignee, and reviewer are required.");return;}
       try{
-        await api("/api/tasks",{method:"POST",body:JSON.stringify({...newTask,period_id:period.id,category_id:parseInt(newTask.category_id),assignee_id:parseInt(newTask.assignee_id),reviewer_id:parseInt(newTask.reviewer_id)})});
-        await loadAll();setShowAddTask(false);setNewTask({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:""});
+        await api("/api/tasks",{method:"POST",body:JSON.stringify({...newTask,period_id:period.id,category_id:parseInt(newTask.category_id),assignee_id:parseInt(newTask.assignee_id),reviewer_id:parseInt(newTask.reviewer_id),due_offset:newTask.due_offset===""?null:parseInt(newTask.due_offset)})});
+        await loadAll();setShowAddTask(false);setNewTask({name:"",category_id:"",assignee_id:"",reviewer_id:"",due_date:"",notes:"",frequency:"Monthly",due_offset:""});
       }catch(e){alert(e.message);}
     }
     async function deleteTask(id){
@@ -613,7 +726,21 @@ function CloseApp(){
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
 
-    const stabs=["users","categories","tasks","quickbooks","groups"];
+    const stabs=["users","categories","tasks","quickbooks","periods","groups"];
+
+    // Period rollover
+    const [showRollover,setShowRollover]=useState(false);
+    const [rollover,setRollover]=useState({label:"",start_date:"",end_date:"",source_period_id:"",activate:true});
+    async function doRollover(){
+      if(!rollover.label||!rollover.start_date||!rollover.end_date){alert("Label, start, and end dates required.");return;}
+      try{
+        const body={...rollover,source_period_id:rollover.source_period_id?parseInt(rollover.source_period_id):undefined};
+        const res=await api("/api/periods/rollover",{method:"POST",body:JSON.stringify(body)});
+        await loadAll();
+        setShowRollover(false);setRollover({label:"",start_date:"",end_date:"",source_period_id:"",activate:true});
+        alert(`Created "${res.label}" with ${res.cloned_tasks} tasks and ${res.cloned_recons} reconciliations.`);
+      }catch(e){alert(e.message);}
+    }
 
     // Report Groups state (loaded lazily when groups tab opens)
     const [groupRtype,setGroupRtype]=useState("pl");
@@ -771,6 +898,42 @@ function CloseApp(){
         </div>
       </Modal>}
 
+      {/* PERIODS ROLLOVER */}
+      {settingsTab==="periods"&&<div style={S.card}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>Period Rollover</div>
+            <div style={{fontSize:12,color:"#475569",marginTop:3}}>Create a new close period by cloning tasks and reconciliation shells from a prior period.</div>
+          </div>
+          <button className="btn btn-primary" style={{fontSize:12}} onClick={()=>setShowRollover(p=>!p)}>{showRollover?"Cancel":"+ New Period"}</button>
+        </div>
+        {showRollover&&<div style={{background:"#0d1117",borderRadius:10,border:"1px solid #1e2d3d",padding:20,marginBottom:16}}>
+          <div className="form-group"><label className="form-label">Period Label</label><input className="form-input" placeholder="e.g. May 2026 (Period 5)" value={rollover.label} onChange={e=>setRollover(p=>({...p,label:e.target.value}))}/></div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <div className="form-group"><label className="form-label">Start Date</label><input type="date" className="form-input" value={rollover.start_date} onChange={e=>setRollover(p=>({...p,start_date:e.target.value}))}/></div>
+            <div className="form-group"><label className="form-label">End Date</label><input type="date" className="form-input" value={rollover.end_date} onChange={e=>setRollover(p=>({...p,end_date:e.target.value}))}/></div>
+          </div>
+          <div className="form-group"><label className="form-label">Clone Tasks From</label>
+            <select className="form-select" value={rollover.source_period_id} onChange={e=>setRollover(p=>({...p,source_period_id:e.target.value}))}>
+              <option value="">Most recent period</option>
+              {allPeriods.filter(p=>(p.period_type||"month")==="month").sort((a,b)=>b.start_date.localeCompare(a.start_date)).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+            </select>
+          </div>
+          <div className="form-group" style={{display:"flex",alignItems:"center",gap:8}}>
+            <input type="checkbox" id="rolloverActivate" checked={rollover.activate} onChange={e=>setRollover(p=>({...p,activate:e.target.checked}))}/>
+            <label htmlFor="rolloverActivate" style={{fontSize:13,color:"#cbd5e1",cursor:"pointer"}}>Make this the active close period</label>
+          </div>
+          <div style={{fontSize:11,color:"#64748b",marginBottom:14,lineHeight:1.5}}>Each task's due date is recomputed from its <code style={{color:"#94a3b8"}}>due_offset</code> relative to the new period end. Statuses reset to open/pending. Reconciliation shells are cloned without balances.</div>
+          <button className="btn btn-primary" onClick={doRollover}>Create Period</button>
+        </div>}
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr>{["Period","Range","Status"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+          <tbody>{allPeriods.filter(p=>(p.period_type||"month")==="month").sort((a,b)=>b.start_date.localeCompare(a.start_date)).slice(0,12).map(p=>(
+            <tr key={p.id}><td style={S.td}>{p.label}{p.is_active?" ●":""}</td><td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12}}>{p.start_date} → {p.end_date}</td><td style={S.td}><Badge status={p.is_closed?"complete":"open"}/></td></tr>
+          ))}</tbody>
+        </table>
+      </div>}
+
       {/* QUICKBOOKS */}
       {settingsTab==="quickbooks"&&<div style={S.card}>
         <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>QuickBooks Online</div>
@@ -855,6 +1018,14 @@ function CloseApp(){
           </select>
         </div>
         <div className="form-group"><label className="form-label">Due Date</label><input type="date" className="form-input" value={newTask.due_date} onChange={e=>setNewTask(p=>({...p,due_date:e.target.value}))}/></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          <div className="form-group"><label className="form-label">Frequency</label>
+            <select className="form-select" value={newTask.frequency} onChange={e=>setNewTask(p=>({...p,frequency:e.target.value}))}>
+              {["Monthly","Weekly","Daily","Bi-Weekly","Quarterly","Annually","As Needed"].map(f=><option key={f} value={f}>{f}</option>)}
+            </select>
+          </div>
+          <div className="form-group"><label className="form-label">Due Offset <span style={{color:"#475569",textTransform:"none",letterSpacing:0}}>(days from PE)</span></label><input type="number" className="form-input" placeholder="e.g. 5" value={newTask.due_offset} onChange={e=>setNewTask(p=>({...p,due_offset:e.target.value}))}/></div>
+        </div>
         <div className="form-group"><label className="form-label">Notes</label><textarea className="form-input" value={newTask.notes} onChange={e=>setNewTask(p=>({...p,notes:e.target.value}))} style={{minHeight:60,resize:"vertical"}}/></div>
         <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
           <button className="btn btn-ghost" onClick={()=>setShowAddTask(false)}>Cancel</button>

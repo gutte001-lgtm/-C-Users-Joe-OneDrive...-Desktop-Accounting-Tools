@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status          TEXT NOT NULL DEFAULT 'open',        -- open | in_progress | complete
     review_status   TEXT NOT NULL DEFAULT 'pending',     -- pending | approved | needs_revision
     notes           TEXT DEFAULT '',
+    frequency       TEXT DEFAULT 'Monthly',              -- Monthly | Weekly | Daily | Bi-Weekly | Quarterly | Annually | As Needed
+    due_offset      INTEGER,                             -- days from period end (nullable)
     completed_at    DATETIME,
     approved_at     DATETIME,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -86,12 +88,27 @@ CREATE TABLE IF NOT EXISTS reconciliations (
     account_number   TEXT    NOT NULL,
     account_name     TEXT    NOT NULL,
     assignee_id      INTEGER NOT NULL REFERENCES users(id),
-    qb_balance       REAL,
-    expected_balance REAL,
-    status           TEXT NOT NULL DEFAULT 'open',  -- open | reconciled | needs_attention
-    last_synced_at   DATETIME,
-    last_updated_at  DATETIME,
-    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+    qb_balance          REAL,
+    expected_balance    REAL,
+    variance_threshold  REAL,
+    notes               TEXT DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'open',  -- open | reconciled | needs_attention
+    last_synced_at      DATETIME,
+    last_updated_at     DATETIME,
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ─────────────────────────────────────────
+--  Reconciliation Activity Log
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS recon_activity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    recon_id    INTEGER NOT NULL REFERENCES reconciliations(id),
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    action      TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Trigger: auto-update tasks.updated_at

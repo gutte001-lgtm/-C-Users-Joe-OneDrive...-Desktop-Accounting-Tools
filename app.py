@@ -1,11 +1,15 @@
 import os, sqlite3, traceback, secrets, urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, jsonify, request, g, send_from_directory, session, redirect
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 from cryptography.fernet import Fernet, InvalidToken
+try:
+    from notifications import notify
+except ImportError:
+    def notify(*a, **k): pass
 
 load_dotenv()
 
@@ -497,6 +501,35 @@ def sync_qb_accounts(period_id):
     db.commit()
     return {"ok": True, "created": created, "updated": updated, "total": len(bs_accounts)}
 
+def _ensure_recon_extras():
+    """Idempotent: add variance_threshold, notes to reconciliations; frequency,
+    due_offset to tasks; create recon_activity table."""
+    db = get_db()
+    recon_cols = {r[1] for r in db.execute("PRAGMA table_info(reconciliations)").fetchall()}
+    for col, ddl in [
+        ("variance_threshold", "ALTER TABLE reconciliations ADD COLUMN variance_threshold REAL"),
+        ("notes",              "ALTER TABLE reconciliations ADD COLUMN notes TEXT DEFAULT ''"),
+    ]:
+        if col not in recon_cols:
+            db.execute(ddl)
+    task_cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)").fetchall()}
+    for col, ddl in [
+        ("frequency",  "ALTER TABLE tasks ADD COLUMN frequency TEXT DEFAULT 'Monthly'"),
+        ("due_offset", "ALTER TABLE tasks ADD COLUMN due_offset INTEGER"),
+    ]:
+        if col not in task_cols:
+            db.execute(ddl)
+    db.execute("""CREATE TABLE IF NOT EXISTS recon_activity (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        recon_id    INTEGER NOT NULL REFERENCES reconciliations(id),
+        user_id     INTEGER NOT NULL REFERENCES users(id),
+        action      TEXT NOT NULL,
+        old_value   TEXT,
+        new_value   TEXT,
+        created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    db.commit()
+
 def _ensure_period_close_columns():
     """Idempotent: add is_closed / closed_at / closed_by columns to `periods`
     if they're missing. Safe to call repeatedly."""
@@ -542,6 +575,7 @@ def _activate_current_close_period():
     Returns the active period id (or None if no months exist)."""
     _ensure_fiscal_calendar()
     _ensure_period_close_columns()
+    _ensure_recon_extras()
     _backfill_closed_once()
     target = _next_open_month()
     if not target:
@@ -1368,8 +1402,6 @@ def export_report(rtype):
 
 # ── Fiscal Calendar (4-4-5) ───────────────────────────────────────────────────
 
-from datetime import date, timedelta
-
 _MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November", "December"]
 
@@ -1621,6 +1653,79 @@ def reopen_period(pid):
         "active": dict(new_active) if new_active else None,
     })
 
+def _calc_due(end_date_str, offset):
+    if offset is None or end_date_str is None:
+        return None
+    try:
+        return (date.fromisoformat(end_date_str) + timedelta(days=int(offset))).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+@app.route("/api/periods/rollover", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def rollover_period():
+    """Clone tasks + recon shells from source_period_id into a new period.
+    Each task's due_date is recomputed from its due_offset relative to the
+    new period's end_date. Statuses reset to open/pending.
+    Body: { label, start_date, end_date, source_period_id?, activate? }"""
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    label = b.get("label", "").strip()
+    start = b.get("start_date", "")
+    end   = b.get("end_date", "")
+    if not (label and start and end):
+        return err("label, start_date, end_date required")
+
+    src = b.get("source_period_id")
+    if src is None:
+        row = q1("SELECT id FROM periods ORDER BY start_date DESC LIMIT 1")
+        src = row["id"] if row else None
+
+    db = get_db()
+    cur = db.execute(
+        "INSERT INTO periods (label,start_date,end_date,is_active) VALUES (?,?,?,0)",
+        (label, start, end))
+    new_id = cur.lastrowid
+
+    cloned_tasks = cloned_recons = 0
+    if src:
+        for t in q(
+            "SELECT category_id,name,assignee_id,reviewer_id,frequency,due_offset,notes FROM tasks WHERE period_id=?",
+            (src,)):
+            due = _calc_due(end, t["due_offset"])
+            db.execute(
+                """INSERT INTO tasks
+                   (period_id,category_id,name,assignee_id,reviewer_id,due_date,
+                    frequency,due_offset,notes,status,review_status)
+                   VALUES (?,?,?,?,?,?,?,?,?,'open','pending')""",
+                (new_id, t["category_id"], t["name"], t["assignee_id"], t["reviewer_id"],
+                 due, t["frequency"], t["due_offset"], t["notes"] or ""))
+            cloned_tasks += 1
+        for r in q(
+            "SELECT account_number,account_name,assignee_id,expected_balance,variance_threshold FROM reconciliations WHERE period_id=?",
+            (src,)):
+            db.execute(
+                """INSERT INTO reconciliations
+                   (period_id,account_number,account_name,assignee_id,
+                    expected_balance,variance_threshold,status)
+                   VALUES (?,?,?,?,?,?,'open')""",
+                (new_id, r["account_number"], r["account_name"], r["assignee_id"],
+                 r["expected_balance"], r["variance_threshold"]))
+            cloned_recons += 1
+
+    if b.get("activate"):
+        db.execute("UPDATE periods SET is_active=0")
+        db.execute("UPDATE periods SET is_active=1 WHERE id=?", (new_id,))
+
+    db.commit()
+    return jsonify({
+        "id": new_id, "label": label,
+        "cloned_tasks": cloned_tasks, "cloned_recons": cloned_recons,
+        "source_period_id": src,
+    }), 201
+
 # ── Users ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/users", methods=["GET", "OPTIONS"])
@@ -1748,9 +1853,10 @@ def create_task():
     if not all(k in b for k in ("period_id", "category_id", "name", "assignee_id", "reviewer_id")):
         return err("Missing required fields")
     cur = run(
-        "INSERT INTO tasks (period_id,category_id,name,assignee_id,reviewer_id,due_date,notes) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO tasks (period_id,category_id,name,assignee_id,reviewer_id,due_date,notes,frequency,due_offset) VALUES (?,?,?,?,?,?,?,?,?)",
         (b["period_id"], b["category_id"], b["name"], b["assignee_id"], b["reviewer_id"],
-         b.get("due_date"), b.get("notes", "")))
+         b.get("due_date"), b.get("notes", ""),
+         b.get("frequency", "Monthly"), b.get("due_offset")))
     return jsonify({"id": cur.lastrowid}), 201
 
 @app.route("/api/tasks/<int:tid>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
@@ -1776,7 +1882,7 @@ def manage_task(tid):
     if not old:
         return err("Task not found", 404)
     if user["role"] == "admin":
-        allowed = {"status", "review_status", "notes", "assignee_id", "reviewer_id", "due_date", "name", "category_id"}
+        allowed = {"status", "review_status", "notes", "assignee_id", "reviewer_id", "due_date", "name", "category_id", "frequency", "due_offset"}
     else:
         if old["assignee_id"] != user["id"] and old["reviewer_id"] != user["id"]:
             return err("You can only update your own tasks", 403)
@@ -1800,6 +1906,21 @@ def manage_task(tid):
         run("INSERT INTO task_activity (task_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
             (tid, actor_id, "note", None, updates["notes"]))
     return jsonify(dict(q1("SELECT * FROM tasks WHERE id=?", (tid,))))
+
+@app.route("/api/tasks/<int:tid>/activity", methods=["GET", "OPTIONS"])
+@login_required
+def get_task_activity(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q("""
+        SELECT a.id, a.action, a.old_value, a.new_value, a.created_at,
+               u.name AS user_name, u.initials AS user_initials, u.color AS user_color
+        FROM task_activity a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.task_id=?
+        ORDER BY a.created_at DESC, a.id DESC
+    """, (tid,))
+    return jsonify(rows_to_list(rows))
 
 # ── Reconciliations ───────────────────────────────────────────────────────────
 
@@ -1840,27 +1961,72 @@ def create_reconciliation():
          b.get("qb_balance"), b.get("expected_balance"), "open"))
     return jsonify({"id": cur.lastrowid}), 201
 
-@app.route("/api/reconciliations/<int:rid>", methods=["PATCH", "DELETE", "OPTIONS"])
+@app.route("/api/reconciliations/<int:rid>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
 @login_required
 @csrf_protect
 def manage_reconciliation(rid):
     if request.method == "OPTIONS":
         return "", 204
+    if request.method == "GET":
+        row = q1(RECON_SELECT + " WHERE r.id=?", (rid,))
+        return jsonify(dict(row)) if row else err("Reconciliation not found", 404)
     if request.method == "DELETE":
         user = get_current_user()
         if user["role"] != "admin":
             return err("Admin required", 403)
+        run("DELETE FROM recon_activity WHERE recon_id=?", (rid,))
         run("DELETE FROM reconciliations WHERE id=?", (rid,))
         return jsonify({"deleted": rid})
+    # PATCH
     b = request.json or {}
     user = get_current_user()
-    allowed = {"expected_balance", "status", "assignee_id", "account_number", "account_name"} if user["role"] == "admin" else {"expected_balance", "status"}
+    old = q1("SELECT * FROM reconciliations WHERE id=?", (rid,))
+    if not old:
+        return err("Reconciliation not found", 404)
+    if user["role"] == "admin":
+        allowed = {"expected_balance", "variance_threshold", "notes", "status",
+                   "assignee_id", "account_number", "account_name"}
+    else:
+        allowed = {"expected_balance", "variance_threshold", "notes", "status"}
     updates = {k: v for k, v in b.items() if k in allowed}
     if not updates:
         return err("No valid fields")
+    # Auto-flip status when variance crosses threshold (only if caller didn't set status explicitly).
+    if "status" not in updates:
+        expected = updates.get("expected_balance", old["expected_balance"])
+        threshold = updates.get("variance_threshold", old["variance_threshold"])
+        qb_bal = old["qb_balance"]
+        if expected is not None and qb_bal is not None and threshold is not None:
+            variance = abs(qb_bal - expected)
+            if variance > threshold and old["status"] != "needs_attention":
+                updates["status"] = "needs_attention"
+            elif variance <= threshold and old["status"] == "needs_attention":
+                updates["status"] = "reconciled"
     updates["last_updated_at"] = datetime.now(timezone.utc).isoformat()
     safe_update("reconciliations", "id", allowed | {"last_updated_at"}, updates, rid)
+    actor_id = user["id"]
+    for k in ("status", "expected_balance", "variance_threshold", "notes"):
+        if k in updates and str(updates[k]) != str(old[k] or ""):
+            run("INSERT INTO recon_activity (recon_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
+                (rid, actor_id, k,
+                 None if old[k] is None else str(old[k]),
+                 None if updates[k] is None else str(updates[k])))
     return jsonify(dict(q1(RECON_SELECT + " WHERE r.id=?", (rid,))))
+
+@app.route("/api/reconciliations/<int:rid>/activity", methods=["GET", "OPTIONS"])
+@login_required
+def get_recon_activity(rid):
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q("""
+        SELECT a.id, a.action, a.old_value, a.new_value, a.created_at,
+               u.name AS user_name, u.initials AS user_initials, u.color AS user_color
+        FROM recon_activity a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.recon_id=?
+        ORDER BY a.created_at DESC, a.id DESC
+    """, (rid,))
+    return jsonify(rows_to_list(rows))
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
