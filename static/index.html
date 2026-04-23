@@ -4,9 +4,46 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CloseTool</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script>
+    // Diagnostics: if the page renders blank, surface why. Sets a flag when
+    // each CDN dep finishes loading; if any is still missing when the Babel
+    // script should have run, or an uncaught error fires, paint a visible
+    // message in #root instead of leaving the user staring at a black page.
+    window.__closetool_diag = {react:false, reactDom:false, babel:false, mounted:false, cdnFailed:[]};
+    function __ct_showDiag(title, detail){
+      var root = document.getElementById("root");
+      if(!root || window.__closetool_diag.mounted) return;
+      root.innerHTML = ""
+        + "<div style=\"padding:24px 28px;background:#0d1117;color:#f87171;font-family:'DM Mono',monospace;font-size:13px;line-height:1.55;min-height:100vh\">"
+        + "<div style=\"font-size:16px;font-weight:700;margin-bottom:12px\">&#9888; CloseTool failed to load</div>"
+        + "<div style=\"color:#e2e8f0;margin-bottom:10px\"></div>"
+        + "<pre style=\"background:#111827;padding:12px;border-radius:8px;color:#94a3b8;font-size:12px;white-space:pre-wrap;overflow:auto;max-height:320px\"></pre>"
+        + "<div style=\"color:#64748b;margin-top:14px;font-size:12px\">Open DevTools &rarr; Console for the full stack. If the three CDN scripts (react, react-dom, babel-standalone) are blocked by your network, the page can't render.</div>"
+        + "</div>";
+      root.querySelector("div:nth-child(2)").textContent = title || "Unknown error";
+      root.querySelector("pre").textContent = detail || "";
+    }
+    window.addEventListener("error", function(e){
+      if(window.__closetool_diag.mounted) return;
+      var msg = e.message || "Script error";
+      var src = (e.error && e.error.stack) || (e.filename ? (e.filename + ":" + e.lineno + ":" + e.colno) : "");
+      __ct_showDiag(msg, src);
+    });
+    window.addEventListener("unhandledrejection", function(e){
+      if(window.__closetool_diag.mounted) return;
+      var r = e.reason;
+      __ct_showDiag("Unhandled promise rejection: " + (r && r.message || r), (r && r.stack) || "");
+    });
+  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"
+          onload="window.__closetool_diag.react=true"
+          onerror="window.__closetool_diag.cdnFailed.push('react'); __ct_showDiag('Failed to load React from cdnjs.cloudflare.com','The CDN script tag for react.production.min.js failed. Check your internet connection or corporate firewall.')"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"
+          onload="window.__closetool_diag.reactDom=true"
+          onerror="window.__closetool_diag.cdnFailed.push('react-dom'); __ct_showDiag('Failed to load ReactDOM from cdnjs.cloudflare.com','The CDN script tag for react-dom.production.min.js failed. Check your internet connection or corporate firewall.')"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"
+          onload="window.__closetool_diag.babel=true"
+          onerror="window.__closetool_diag.cdnFailed.push('babel'); __ct_showDiag('Failed to load Babel-standalone from cdnjs.cloudflare.com','The CDN script tag for babel.min.js failed. Check your internet connection or corporate firewall.')"></script>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
@@ -34,7 +71,26 @@
   </style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root"><div style="min-height:100vh;display:flex;align-items:center;justify-content:center;color:#64748b;font-family:'DM Mono',monospace;font-size:13px">Loading CloseTool&hellip;</div></div>
+<script>
+  // Watchdog: if React hasn't mounted after 8s, show a diagnostic so the
+  // user sees something actionable instead of a blank screen.
+  setTimeout(function(){
+    var d = window.__closetool_diag || {};
+    if(d.mounted) return;
+    var missing = [];
+    if(!d.react) missing.push("react");
+    if(!d.reactDom) missing.push("react-dom");
+    if(!d.babel) missing.push("babel-standalone");
+    if(missing.length){
+      __ct_showDiag("CDN scripts did not load: " + missing.join(", "),
+        "These are fetched from cdnjs.cloudflare.com. If your network blocks that host, the app cannot render.");
+    } else {
+      __ct_showDiag("React did not mount within 8 seconds",
+        "The three CDN scripts loaded but <CloseApp/> never rendered. Check the browser console for an error from the inline <script type='text/babel'> block.");
+    }
+  }, 8000);
+</script>
 <script type="text/babel">
 const {useState,useEffect,useCallback,useRef} = React;
 
@@ -1265,7 +1321,8 @@ function CloseApp(){
   </div>);
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<CloseApp/>);
+window.__closetool_diag.mounted = true;
+ReactDOM.createRoot(document.getElementById("root")).render(<ErrorBoundary label="the app"><CloseApp/></ErrorBoundary>);
 </script>
 </body>
 </html>
