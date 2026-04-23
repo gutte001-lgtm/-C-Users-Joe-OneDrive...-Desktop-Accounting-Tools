@@ -771,10 +771,11 @@ function CloseApp(){
     const [rtype,setRtype]=useState("pl");
     const [view,setView]=useState("native");
     const [periodType,setPeriodType]=useState("month");
-    const [compareMode,setCompareMode]=useState("prev");
+    const [compareType,setCompareType]=useState("month");
     const [periods,setPeriods]=useState([]);
     const [periodId,setPeriodId]=useState(null);
     const [compareId,setCompareId]=useState(null);
+    const [compareUserPick,setCompareUserPick]=useState(false);
     const [data,setData]=useState(null);
     const [kpis,setKpis]=useState(null);
     const [busy,setBusy]=useState(false);
@@ -803,22 +804,18 @@ function CloseApp(){
         setPeriodId(active.id);
       }
     },[periodType,periods.length]);
-    // Auto-compute compare_id when compareMode or periodId changes (unless user overrides)
+    // Compare-period dropdown options: every period of compareType, newest first.
+    const comparePeriods=periods.filter(p=>(p.period_type||"month")===compareType)
+                                .sort((a,b)=>b.start_date.localeCompare(a.start_date));
+    // Auto-pick the most recent compare period earlier than current (unless user overrode).
     useEffect(()=>{
-      if(!periodId||compareMode==="none"){setCompareId(null);return;}
+      if(!periodId||compareType==="none"){setCompareId(null);setCompareUserPick(false);return;}
+      if(compareUserPick&&comparePeriods.find(p=>p.id===compareId))return;
       const cur=periods.find(p=>p.id===periodId);
       if(!cur)return;
-      let target=null;
-      if(compareMode==="yoy"&&cur.fiscal_year){
-        target=periods.find(p=>p.period_type===cur.period_type&&p.fiscal_year===cur.fiscal_year-1
-          &&((cur.period_number==null&&p.period_number==null)||p.period_number===cur.period_number));
-      }else if(compareMode==="prev"){
-        const sameType=periods.filter(p=>p.period_type===cur.period_type&&p.start_date<cur.start_date)
-          .sort((a,b)=>b.start_date.localeCompare(a.start_date));
-        target=sameType[0];
-      }
-      setCompareId(target?target.id:null);
-    },[periodId,compareMode,periods.length]);
+      const prior=comparePeriods.find(p=>p.start_date<cur.start_date);
+      setCompareId(prior?prior.id:null);
+    },[periodId,compareType,periods.length]);
 
     async function loadReport(){
       if(!periodId)return;
@@ -939,12 +936,16 @@ function CloseApp(){
               {periodsOfType.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
             </select>
             <label style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace"}}>vs</label>
-            <select value={compareMode} onChange={e=>setCompareMode(e.target.value)}
-              style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace"}}>
-              <option value="prev">Prior period</option>
-              <option value="yoy">Prior year</option>
-              <option value="none">No compare</option>
-            </select>
+            <div style={{display:"flex",background:"#0f172a",border:"1px solid #1e2d3d",borderRadius:7,padding:3}}>
+              {[["month","MTD"],["quarter","QTD"],["year","YTD"],["none","—"]].map(([k,l])=>
+                <button key={k} onClick={()=>{setCompareType(k);setCompareUserPick(false);}} title={k==="none"?"No compare":`Compare ${l}`} style={{padding:"4px 10px",border:"none",background:compareType===k?"#1e2d3d":"transparent",color:compareType===k?"#e2e8f0":"#64748b",borderRadius:5,fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{l}</button>
+              )}
+            </div>
+            {compareType!=="none"&&<select value={compareId||""} onChange={e=>{const v=parseInt(e.target.value);setCompareId(v||null);setCompareUserPick(true);}}
+              style={{padding:"6px 10px",background:"#111827",border:"1px solid #1e2d3d",color:"#e2e8f0",borderRadius:7,fontSize:12,fontFamily:"'DM Mono',monospace",minWidth:140}}>
+              <option value="">— pick period —</option>
+              {comparePeriods.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+            </select>}
             <button onClick={()=>exportReport("xlsx")} disabled={!lines.length} style={{padding:"6px 14px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ Excel</button>
             <button onClick={()=>exportReport("csv")} disabled={!lines.length} style={{padding:"6px 14px",background:"#1a2535",border:"1px solid #1e2d3d",color:"#94a3b8",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>⇩ CSV</button>
             {isAdmin&&<button onClick={syncFromQB} disabled={busy} style={{padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:busy?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{busy?"Syncing…":"↻ Sync from QB"}</button>}

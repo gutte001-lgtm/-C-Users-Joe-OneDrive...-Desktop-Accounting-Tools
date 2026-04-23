@@ -702,6 +702,12 @@ def _prior_period_id(period_id, mode="prev"):
 def _build_report_payload(period_id, rtype, compare_id=None, view="native"):
     cur_lines = _load_report_lines(period_id, rtype)
     cmp_lines = _load_report_lines(compare_id, rtype) if compare_id else []
+    if compare_id and not cmp_lines:
+        try:
+            sync_qb_report(compare_id, rtype)
+        except Exception as e:
+            print(f"[qb] compare auto-sync failed for period {compare_id} {rtype}: {e}", flush=True)
+        cmp_lines = _load_report_lines(compare_id, rtype)
     cmp_by_name = {(l["section"], l["account_name"]): l["amount"] for l in cmp_lines}
 
     notes = {r["account_name"]: {"note": r["note"], "updated_at": r["updated_at"], "author_id": r["author_id"]}
