@@ -1521,6 +1521,95 @@ scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
 scheduler.add_job(sync_qb_all_reports, "interval", minutes=15, id="qb_reports_sync")
 scheduler.start()
 
+def _ensure_new_features_schema():
+    """Idempotent: add all columns/tables for the 13 new features."""
+    db = get_db()
+
+    # Feature 2: task dependencies
+    db.execute("""CREATE TABLE IF NOT EXISTS task_dependencies (
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        PRIMARY KEY(task_id, depends_on_id)
+    )""")
+
+    # Feature 4: checklist templates
+    db.execute("""CREATE TABLE IF NOT EXISTS checklist_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        period_type TEXT DEFAULT 'monthly',
+        description TEXT,
+        created_by INTEGER REFERENCES users(id),
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS template_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        template_id INTEGER NOT NULL REFERENCES checklist_templates(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        category_id INTEGER REFERENCES categories(id),
+        assignee_id INTEGER REFERENCES users(id),
+        reviewer_id INTEGER REFERENCES users(id),
+        day_target INTEGER,
+        sort_order INTEGER DEFAULT 0
+    )""")
+
+    # Feature 6: open items
+    db.execute("""CREATE TABLE IF NOT EXISTS open_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period_id INTEGER NOT NULL REFERENCES periods(id),
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT DEFAULT 'open',
+        priority TEXT DEFAULT 'medium',
+        assigned_to INTEGER REFERENCES users(id),
+        created_by INTEGER REFERENCES users(id),
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        resolved_at DATETIME,
+        resolved_by INTEGER REFERENCES users(id)
+    )""")
+
+    # Feature 8: attachments
+    db.execute("""CREATE TABLE IF NOT EXISTS attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        recon_id INTEGER REFERENCES reconciliations(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL,
+        content_type TEXT,
+        data BLOB NOT NULL,
+        uploaded_by INTEGER REFERENCES users(id),
+        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Feature 9: journal entries
+    db.execute("""CREATE TABLE IF NOT EXISTS journal_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period_id INTEGER NOT NULL REFERENCES periods(id),
+        je_number TEXT,
+        description TEXT NOT NULL,
+        debit_account TEXT,
+        credit_account TEXT,
+        amount REAL,
+        preparer_id INTEGER REFERENCES users(id),
+        reviewer_id INTEGER REFERENCES users(id),
+        status TEXT DEFAULT 'draft',
+        prepared_at DATETIME,
+        submitted_at DATETIME,
+        approved_at DATETIME,
+        notes TEXT
+    )""")
+
+    # Feature 5: recurrence on tasks
+    cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "recurrence" not in cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT DEFAULT 'none'")
+    # Feature 7: submitted_at/submitted_by on tasks
+    if "submitted_at" not in cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN submitted_at DATETIME")
+    if "submitted_by" not in cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN submitted_by INTEGER REFERENCES users(id)")
+
+    db.commit()
+
+
 # Ensure the base schema + seed data exist before the fiscal-calendar migration
 # runs. init_db.init() is idempotent.
 try:
@@ -1531,6 +1620,7 @@ try:
         _ensure_period_close_columns()
         _backfill_closed_once()
         _activate_current_close_period()
+        _ensure_new_features_schema()
 except Exception:
     traceback.print_exc()
 
@@ -1718,11 +1808,13 @@ def manage_category(cid):
 TASK_SELECT = """
     SELECT t.*, c.name AS category_name,
            u1.name AS assignee_name, u1.initials AS assignee_initials, u1.color AS assignee_color,
-           u2.name AS reviewer_name, u2.initials AS reviewer_initials
+           u2.name AS reviewer_name, u2.initials AS reviewer_initials,
+           u3.name AS submitter_name
     FROM tasks t
     JOIN categories c ON c.id = t.category_id
     JOIN users u1 ON u1.id = t.assignee_id
     JOIN users u2 ON u2.id = t.reviewer_id
+    LEFT JOIN users u3 ON u3.id = t.submitted_by
 """
 
 @app.route("/api/tasks", methods=["GET", "OPTIONS"])
@@ -1776,11 +1868,11 @@ def manage_task(tid):
     if not old:
         return err("Task not found", 404)
     if user["role"] == "admin":
-        allowed = {"status", "review_status", "notes", "assignee_id", "reviewer_id", "due_date", "name", "category_id"}
+        allowed = {"status", "review_status", "notes", "assignee_id", "reviewer_id", "due_date", "name", "category_id", "recurrence"}
     else:
         if old["assignee_id"] != user["id"] and old["reviewer_id"] != user["id"]:
             return err("You can only update your own tasks", 403)
-        allowed = {"status", "review_status", "notes"}
+        allowed = {"status", "review_status", "notes", "recurrence"}
     updates = {k: v for k, v in b.items() if k in allowed}
     if not updates:
         return err("No valid fields")
@@ -1788,7 +1880,10 @@ def manage_task(tid):
         updates["completed_at"] = datetime.now(timezone.utc).isoformat()
     if updates.get("review_status") == "approved" and old["review_status"] != "approved":
         updates["approved_at"] = datetime.now(timezone.utc).isoformat()
-    safe_update("tasks", "id", allowed | {"completed_at", "approved_at"}, updates, tid)
+    if updates.get("status") == "submitted" and (old["status"] if old else "") != "submitted":
+        updates["submitted_at"] = datetime.now(timezone.utc).isoformat()
+        updates["submitted_by"] = user["id"]
+    safe_update("tasks", "id", allowed | {"completed_at", "approved_at", "submitted_at", "submitted_by"}, updates, tid)
     actor_id = user["id"]
     if "status" in updates:
         run("INSERT INTO task_activity (task_id,user_id,action,old_value,new_value) VALUES (?,?,?,?,?)",
