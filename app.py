@@ -379,6 +379,65 @@ def qb_status():
         "token_expires_in": max(0, int(tokens.get("expires_at", 0) - datetime.now(timezone.utc).timestamp()))
     })
 
+@app.route("/api/qb/diagnose", methods=["GET", "OPTIONS"])
+@login_required
+def qb_diagnose():
+    """Fetches a report straight from QuickBooks and returns the raw shape so
+    we can see *why* a sync produces zero lines. Usage:
+    /api/qb/diagnose?period_id=123&rtype=pl   (rtype: pl | bs | cf; default pl)
+    Returns: {connected, realm_id, environment, period, url, qb_error, rows,
+              row_count_top_level, row_count_flattened, sample_rows, header}.
+    No side effects — does not touch qb_reports / qb_report_lines."""
+    if request.method == "OPTIONS":
+        return "", 204
+    tokens = get_tokens()
+    realm = get_realm_id()
+    out = {
+        "connected": bool(tokens),
+        "realm_id": realm or None,
+        "environment": QB_ENVIRONMENT,
+    }
+    if not tokens:
+        out["qb_error"] = "Not connected — click Settings → Connect QuickBooks"
+        return jsonify(out)
+    period_id = request.args.get("period_id", type=int)
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        out["qb_error"] = "No period_id supplied and no active period"
+        return jsonify(out)
+    period = q1("SELECT id, label, start_date, end_date FROM periods WHERE id=?", (period_id,))
+    if not period:
+        out["qb_error"] = "Period not found"
+        return jsonify(out)
+    out["period"] = dict(period)
+    rtype = (request.args.get("rtype") or "pl").lower()
+    endpoints = {"pl": "ProfitAndLoss", "bs": "BalanceSheet", "cf": "CashFlow"}
+    if rtype not in endpoints:
+        out["qb_error"] = f"Unknown rtype '{rtype}' (expected pl/bs/cf)"
+        return jsonify(out)
+    path = f"/reports/{endpoints[rtype]}?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
+    out["url"] = f"{QB_API_BASE}/{realm}{path}"
+    data, err_str = qb_get(path)
+    if err_str:
+        out["qb_error"] = err_str
+        return jsonify(out)
+    out["qb_error"] = None
+    out["header"] = data.get("Header")
+    rows = data.get("Rows", {}) or {}
+    top_rows = rows.get("Row", []) if isinstance(rows, dict) else []
+    out["row_count_top_level"] = len(top_rows)
+    flat = []
+    _flatten_qb_rows(rows, rtype, flat)
+    out["row_count_flattened"] = len(flat)
+    out["sample_rows"] = [
+        {"name": r.get("account_name"), "amount": r.get("amount"),
+         "section": r.get("section"), "is_subtotal": r.get("is_subtotal")}
+        for r in flat[:12]
+    ]
+    return jsonify(out)
+
 def sync_qb_accounts(period_id):
     """Pull QB's chart of accounts, cache it, and make sure there's a
     reconciliation row for every Asset/Liability/Equity account in the given
@@ -438,29 +497,65 @@ def sync_qb_accounts(period_id):
     db.commit()
     return {"ok": True, "created": created, "updated": updated, "total": len(bs_accounts)}
 
-def _activate_current_period_if_stale(max_stale_days=60):
-    """If there's no active period, or the active period ended more than
-    max_stale_days ago, activate the 4-4-5 month that contains today. Returns
-    the active period id (or None if nothing could be activated)."""
+def _ensure_period_close_columns():
+    """Idempotent: add is_closed / closed_at / closed_by columns to `periods`
+    if they're missing. Safe to call repeatedly."""
+    db = get_db()
+    cols = {r[1] for r in db.execute("PRAGMA table_info(periods)").fetchall()}
+    for col, ddl in [
+        ("is_closed", "ALTER TABLE periods ADD COLUMN is_closed INTEGER NOT NULL DEFAULT 0"),
+        ("closed_at", "ALTER TABLE periods ADD COLUMN closed_at DATETIME"),
+        ("closed_by", "ALTER TABLE periods ADD COLUMN closed_by INTEGER REFERENCES users(id)"),
+    ]:
+        if col not in cols:
+            db.execute(ddl)
+    db.commit()
+
+def _backfill_closed_once():
+    """On first-ever run (no period has been marked closed yet), mark every
+    month period that ENDED BEFORE the most-recently-ended month as closed.
+    Result: the earliest unclosed month is the most recently completed month.
+    Joe's expected starting point — 'April 2026 today → start on March 2026'."""
+    _ensure_period_close_columns()
+    if q1("SELECT 1 FROM periods WHERE is_closed=1 LIMIT 1"):
+        return  # user has already closed something; don't touch history
+    today_iso = date.today().isoformat()
+    latest_ended = q1("""SELECT end_date FROM periods
+                         WHERE period_type='month' AND end_date < ?
+                         ORDER BY end_date DESC LIMIT 1""", (today_iso,))
+    if not latest_ended:
+        return
+    run("""UPDATE periods SET is_closed=1, closed_at=CURRENT_TIMESTAMP
+           WHERE period_type='month' AND end_date < ?""", (latest_ended["end_date"],))
+
+def _next_open_month():
+    """The earliest month period with is_closed=0, globally. That's the close
+    period the app should default to: 'whichever period has not been closed'.
+    Returns a full row or None."""
+    return q1("""SELECT * FROM periods
+                 WHERE period_type='month' AND is_closed=0
+                 ORDER BY start_date ASC LIMIT 1""")
+
+def _activate_current_close_period():
+    """Make the 'next open month' the active close period. Safe to call
+    repeatedly; no-op if the active period is already the next-open-month.
+    Returns the active period id (or None if no months exist)."""
     _ensure_fiscal_calendar()
-    today = date.today()
-    today_iso = today.isoformat()
-    active = q1("SELECT id, end_date FROM periods WHERE is_active=1")
-    if active:
-        try:
-            end = date.fromisoformat(active["end_date"])
-            if (today - end).days <= max_stale_days:
-                return active["id"]
-        except (TypeError, ValueError):
-            pass
-    cur = q1("""SELECT id FROM periods WHERE period_type='month'
-                AND start_date <= ? AND end_date >= ?
-                ORDER BY start_date DESC LIMIT 1""", (today_iso, today_iso))
-    if not cur:
+    _ensure_period_close_columns()
+    _backfill_closed_once()
+    target = _next_open_month()
+    if not target:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
         return active["id"] if active else None
+    current = q1("SELECT id FROM periods WHERE is_active=1")
+    if current and current["id"] == target["id"]:
+        return target["id"]
     run("UPDATE periods SET is_active=0")
-    run("UPDATE periods SET is_active=1 WHERE id=?", (cur["id"],))
-    return cur["id"]
+    run("UPDATE periods SET is_active=1 WHERE id=?", (target["id"],))
+    return target["id"]
+
+# Back-compat alias — older call sites still reference the old name.
+_activate_current_period_if_stale = _activate_current_close_period
 
 def sync_qb_balances():
     with app.app_context():
@@ -482,8 +577,11 @@ def manual_sync():
 @csrf_protect
 def qb_bootstrap():
     """One-click 'set this up from my real QuickBooks': activate the current
-    4-4-5 month, seed reconciliations from QB's chart of accounts, and pull
-    P&L/BS/CF for current month, its quarter, and its year."""
+    4-4-5 month, seed reconciliations from QB's chart of accounts, pull
+    P&L/BS/CF for current month/quarter/year, and then sweep every
+    month/quarter/year from 2024-01-01 through today so historical reporting
+    and prior-period reconciliations work. Body may pass
+    {history_start: 'YYYY-MM-DD'} or {skip_history: true}."""
     if request.method == "OPTIONS":
         return "", 204
     if not get_tokens():
@@ -504,11 +602,21 @@ def qb_bootstrap():
     for pid in targets:
         for rtype in ("pl", "bs", "cf"):
             report_results[f"{pid}:{rtype}"] = sync_qb_report(pid, rtype)
+
+    body = request.get_json(silent=True) or {}
+    history = None
+    if not body.get("skip_history"):
+        history = sync_history_range(
+            start_iso=body.get("history_start") or "2024-01-01",
+            end_iso=body.get("history_end") or date.today().isoformat(),
+        )
+
     return jsonify({
         "ok": True,
         "period_id": period_id,
         "accounts": accounts_result,
         "reports": report_results,
+        "history": history,
     })
 
 # ── QuickBooks Report Sync (P&L, Balance Sheet) ───────────────────────────────
@@ -655,6 +763,109 @@ def sync_qb_report(period_id, report_type):
     db.commit()
     return {"ok": True, "lines": len(lines)}
 
+def sync_qb_recons_from_bs(period_id):
+    """Derive reconciliation rows for `period_id` from its cached Balance
+    Sheet lines. Unlike sync_qb_accounts() — which stamps TODAY'S balance
+    against a period — this uses the BS as-of the period end, so historical
+    periods get their real ending balances. Call sync_qb_report(period_id,'bs')
+    first. Idempotent: matches existing rows by name (case-insensitive)."""
+    lines = q("""SELECT account_name, account_id, amount FROM qb_report_lines
+                 WHERE period_id=? AND report_type='bs' AND is_subtotal=0
+                   AND account_name != ''""", (period_id,))
+    if not lines:
+        return {"ok": False, "error": "No BS lines cached — run sync_qb_report(period_id,'bs') first"}
+
+    db = get_db()
+    existing = q("SELECT id, account_name FROM reconciliations WHERE period_id=?", (period_id,))
+    by_name = {(r["account_name"] or "").strip().lower(): r["id"] for r in existing if r["account_name"]}
+
+    qb_acct_by_id = {r["id"]: dict(r) for r in q("SELECT id, name, acct_num FROM qb_accounts")}
+
+    admin = q1("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1") \
+            or q1("SELECT id FROM users ORDER BY id LIMIT 1")
+    assignee_id = admin["id"] if admin else DEFAULT_USER_ID
+
+    created = updated = 0
+    for ln in lines:
+        name = (ln["account_name"] or "").strip()
+        if not name:
+            continue
+        try:
+            amt = float(ln["amount"] or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        acct_num = ""
+        acct_id = ln["account_id"]
+        if acct_id and str(acct_id) in qb_acct_by_id:
+            acct_num = (qb_acct_by_id[str(acct_id)].get("acct_num") or "").strip()
+        rid = by_name.get(name.lower())
+        if rid:
+            db.execute("UPDATE reconciliations SET qb_balance=?, last_synced_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (amt, rid))
+            updated += 1
+        else:
+            db.execute("""INSERT INTO reconciliations
+                          (period_id, account_number, account_name, assignee_id,
+                           qb_balance, expected_balance, status, last_synced_at)
+                          VALUES (?,?,?,?,?,NULL,'open',CURRENT_TIMESTAMP)""",
+                       (period_id, acct_num or f"QB{acct_id or ''}", name, assignee_id, amt))
+            created += 1
+    db.commit()
+    return {"ok": True, "created": created, "updated": updated, "total": len(lines)}
+
+def sync_history_range(start_iso="2024-01-01", end_iso=None, types=("pl", "bs", "cf"), derive_recons=True):
+    """Sweep every 4-4-5 month / quarter / year period whose window overlaps
+    [start_iso, end_iso] and sync P&L / BS / CF into the cache. If derive_recons
+    is on, also upsert per-period reconciliations from the cached BS lines.
+    Returns a summary dict; non-fatal QB errors are collected in 'errors'."""
+    _ensure_fiscal_calendar()
+    _ensure_report_tables()
+    if not end_iso:
+        end_iso = date.today().isoformat()
+    periods = q("""SELECT id, label, period_type, start_date, end_date FROM periods
+                   WHERE end_date >= ? AND start_date <= ?
+                   ORDER BY period_type, start_date""", (start_iso, end_iso))
+    summary = {
+        "ok": True, "start_date": start_iso, "end_date": end_iso,
+        "periods": len(periods), "pl": 0, "bs": 0, "cf": 0,
+        "recons_created": 0, "recons_updated": 0, "errors": [],
+    }
+    for p in periods:
+        pid = p["id"]
+        bs_ok = False
+        for rtype in types:
+            res = sync_qb_report(pid, rtype)
+            if res.get("ok"):
+                summary[rtype] = summary.get(rtype, 0) + 1
+                if rtype == "bs":
+                    bs_ok = True
+            else:
+                summary["errors"].append(f"{p['label']} {rtype}: {res.get('error')}")
+        if derive_recons and bs_ok:
+            rec = sync_qb_recons_from_bs(pid)
+            if rec.get("ok"):
+                summary["recons_created"] += rec.get("created", 0)
+                summary["recons_updated"] += rec.get("updated", 0)
+    return summary
+
+@app.route("/api/qb/sync_history", methods=["POST", "OPTIONS"])
+@login_required
+@csrf_protect
+def qb_sync_history():
+    """One-click historical sweep. Body: {start_date?, end_date?, types?,
+    derive_recons?}. Defaults to 2024-01-01 through today, all three reports,
+    and deriving recons from each period's BS."""
+    if request.method == "OPTIONS":
+        return "", 204
+    if not get_tokens():
+        return jsonify({"ok": False, "error": "Not connected to QuickBooks"}), 400
+    body = request.get_json(silent=True) or {}
+    start = body.get("start_date") or "2024-01-01"
+    end = body.get("end_date") or date.today().isoformat()
+    types = body.get("types") or ("pl", "bs", "cf")
+    derive = body.get("derive_recons", True)
+    return jsonify(sync_history_range(start, end, types=tuple(types), derive_recons=bool(derive)))
+
 @app.route("/api/qb/sync_reports", methods=["POST", "OPTIONS"])
 @login_required
 @csrf_protect
@@ -670,7 +881,14 @@ def sync_reports_endpoint():
         return jsonify({"ok": False, "error": "No period selected and no active period"}), 400
     types = body.get("types") or ["pl", "bs", "cf"]
     results = {t: sync_qb_report(period_id, t) for t in types}
-    return jsonify({"ok": all(r.get("ok") for r in results.values()), "results": results})
+    recons = None
+    if "bs" in types and results.get("bs", {}).get("ok") and body.get("derive_recons", True):
+        recons = sync_qb_recons_from_bs(period_id)
+    return jsonify({
+        "ok": all(r.get("ok") for r in results.values()),
+        "results": results,
+        "recons": recons,
+    })
 
 def _load_report_lines(period_id, report_type):
     rows = q("""SELECT section, account_name, account_id, amount, is_subtotal, depth, sort_order
@@ -679,15 +897,25 @@ def _load_report_lines(period_id, report_type):
     return [dict(r) for r in rows]
 
 def _prior_period_id(period_id, mode="prev"):
-    """mode='prev' — immediately prior period of same type;
-       mode='yoy'  — same type + period_number in previous fiscal year."""
+    """Resolve a compare-to period id from a mode string. Supported modes:
+      prev    — immediately prior period of same type (MoM / QoQ / Y-1)
+      prev2   — two periods ago (same type)
+      prev3   — three periods ago (same type)
+      yoy     — same type + same period_number in the previous fiscal year
+      yoy2    — same period_number two fiscal years ago
+      ytd     — the FY `year` period of the same fiscal year (this period vs YTD)
+      ytd_ly  — the FY `year` period of the prior fiscal year
+    Unknown modes fall back to 'prev'."""
     cur = q1("SELECT start_date, period_type, period_number, fiscal_year FROM periods WHERE id=?", (period_id,))
     if not cur:
         return None
     ptype = cur["period_type"] or "month"
-    if mode == "yoy" and cur["fiscal_year"]:
+    fy = cur["fiscal_year"]
+
+    if mode in ("yoy", "yoy2") and fy:
+        back = 1 if mode == "yoy" else 2
         pn_match = "period_number IS NULL" if cur["period_number"] is None else "period_number=?"
-        params = [ptype, cur["fiscal_year"] - 1]
+        params = [ptype, fy - back]
         if cur["period_number"] is not None:
             params.append(cur["period_number"])
         row = q1(f"""SELECT id FROM periods
@@ -695,9 +923,23 @@ def _prior_period_id(period_id, mode="prev"):
                      LIMIT 1""", tuple(params))
         if row:
             return row["id"]
-    prior = q1("""SELECT id FROM periods WHERE period_type=? AND start_date < ?
-                  ORDER BY start_date DESC LIMIT 1""", (ptype, cur["start_date"]))
-    return prior["id"] if prior else None
+
+    if mode == "ytd" and fy:
+        row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=? LIMIT 1", (fy,))
+        if row:
+            return row["id"]
+    if mode == "ytd_ly" and fy:
+        row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=? LIMIT 1", (fy - 1,))
+        if row:
+            return row["id"]
+
+    offset_map = {"prev": 1, "prev2": 2, "prev3": 3}
+    offset = offset_map.get(mode, 1)
+    # LIMIT 1 OFFSET N-1 picks the Nth-prior period of this type
+    row = q1(f"""SELECT id FROM periods WHERE period_type=? AND start_date < ?
+                 ORDER BY start_date DESC LIMIT 1 OFFSET {offset - 1}""",
+             (ptype, cur["start_date"]))
+    return row["id"] if row else None
 
 def _build_report_payload(period_id, rtype, compare_id=None, view="native"):
     cur_lines = _load_report_lines(period_id, rtype)
@@ -1286,6 +1528,9 @@ try:
     _init_db()
     with app.app_context():
         _ensure_fiscal_calendar()
+        _ensure_period_close_columns()
+        _backfill_closed_once()
+        _activate_current_close_period()
 except Exception:
     traceback.print_exc()
 
@@ -1330,6 +1575,51 @@ def activate_period(pid):
     run("UPDATE periods SET is_active=0")
     run("UPDATE periods SET is_active=1 WHERE id=?", (pid,))
     return jsonify({"activated": pid})
+
+@app.route("/api/periods/<int:pid>/close", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def close_period(pid):
+    """Mark a period as closed and auto-advance `is_active` to the next
+    unclosed month. Response includes the newly-active period so the
+    frontend can jump to it without a second round-trip."""
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_period_close_columns()
+    row = q1("SELECT id, label FROM periods WHERE id=?", (pid,))
+    if not row:
+        return err("Period not found", 404)
+    u = get_current_user()
+    uid = u["id"] if u else None
+    run("UPDATE periods SET is_closed=1, closed_at=CURRENT_TIMESTAMP, closed_by=? WHERE id=?", (uid, pid))
+    new_active_id = _activate_current_close_period()
+    new_active = q1("SELECT * FROM periods WHERE id=?", (new_active_id,)) if new_active_id else None
+    return jsonify({
+        "closed": pid,
+        "closed_label": row["label"],
+        "active": dict(new_active) if new_active else None,
+    })
+
+@app.route("/api/periods/<int:pid>/reopen", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def reopen_period(pid):
+    """Undo a close. If the reopened period is earlier than the currently
+    active one, it becomes active again (it's now the earliest unclosed)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_period_close_columns()
+    row = q1("SELECT id, label FROM periods WHERE id=?", (pid,))
+    if not row:
+        return err("Period not found", 404)
+    run("UPDATE periods SET is_closed=0, closed_at=NULL, closed_by=NULL WHERE id=?", (pid,))
+    new_active_id = _activate_current_close_period()
+    new_active = q1("SELECT * FROM periods WHERE id=?", (new_active_id,)) if new_active_id else None
+    return jsonify({
+        "reopened": pid,
+        "reopened_label": row["label"],
+        "active": dict(new_active) if new_active else None,
+    })
 
 # ── Users ─────────────────────────────────────────────────────────────────────
 

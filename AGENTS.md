@@ -328,6 +328,54 @@ hardening port, the state of the repo is:
 
 ### Remaining unmerged branches
 
+- **`claude/fix-quickbooks-sync-PPv7R`** — in-flight at time of writing.
+  Three stacked features on one branch:
+  (a) Historical sweep: `sync_qb_recons_from_bs(period_id)` derives
+  per-period reconciliations from each period's cached Balance Sheet
+  (correct historical ending balances, unlike the current-balance stamp
+  from `sync_qb_accounts`); `sync_history_range(start, end)` iterates
+  every 4-4-5 month/quarter/year overlapping the window and pulls
+  P&L/BS/CF + derives recons; new `/api/qb/sync_history` endpoint and
+  `/api/qb/bootstrap` now sweeps 2024-01-01 → today by default
+  (`skip_history: true` to opt out). Frontend: Reconciliations tab
+  gained a period dropdown + "↻ Sync This Period" button; Reports
+  gained a "⇣ Sync History" button and a real error string instead of
+  `JSON.stringify(results)`.
+  (c) Richer compare modes + diagnostics on Reports. Backend
+  `_prior_period_id()` now handles `prev`, `prev2`, `prev3`, `yoy`,
+  `yoy2`, `ytd` (FY year of same fiscal year), `ytd_ly` (FY year of
+  prior fiscal year), plus caller-supplied `compare_to=<id>` for
+  Custom. New `GET /api/qb/diagnose?period_id=X&rtype=pl` hits the
+  QuickBooks reports API directly and returns the URL, HTTP status,
+  top-level row count, flattened row count, and first 12 sample lines
+  — no side effects. Frontend Reports: compare dropdown gained
+  "Prior period / 2 periods ago / 3 periods ago / Prior year / Two
+  years ago / This fiscal year (YTD) / Prior fiscal year / Custom…"
+  options; Custom reveals a second dropdown of every cached period
+  (type-tagged). Empty-state now distinguishes "Not yet synced" from
+  "QuickBooks returned this report with zero rows" and suggests likely
+  causes (empty company, sandbox/production mix, accounting method).
+  New "🔎 Diagnose" button opens a modal with the raw QB response
+  summary — this is the tool to reach for when a sync succeeds but
+  Reports stay empty.
+  (b) Close-period workflow. New `periods` columns: `is_closed`,
+  `closed_at`, `closed_by` (idempotent ALTER migration in
+  `_ensure_period_close_columns()`). `_backfill_closed_once()` runs on
+  first-ever startup (when nothing has been closed yet) and marks every
+  month whose `end_date` is strictly before the most-recently-ended
+  month as closed — so Joe lands on the prior completed month (March
+  2026 today) instead of January 2022. `_activate_current_close_period()`
+  picks the earliest month with `is_closed=0` as the active close
+  period; it replaces `_activate_current_period_if_stale()` (kept as an
+  alias). New endpoints `POST /api/periods/<id>/close` and
+  `POST /api/periods/<id>/reopen`; `/close` auto-advances `is_active`
+  to the next unclosed month and returns the new active row. Frontend
+  sidebar "CLOSE PERIOD" block is now a dropdown (all months, newest
+  first) + "✓ Close This Period" button; changing the dropdown flips
+  `is_active` and refetches Dashboard / Checklist / Reconciliations
+  so the whole close workflow moves together. Reports keeps its own
+  independent period picker. Reconciliations follows the global close
+  period by default but keeps its own dropdown for historical peeking.
 - **`claude/close-tracker-tools-JVRS3`** — a *different* reports flavor
   (customer / vendor ledgers, GL detail, revenue by customer, expense
   by vendor, by-Jira-epic) plus QB deep-sync of 23 entities,
