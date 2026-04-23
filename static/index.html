@@ -613,7 +613,47 @@ function CloseApp(){
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
 
-    const stabs=["users","categories","tasks","quickbooks","groups"];
+    const stabs=["users","categories","tasks","quickbooks","jira","groups"];
+
+    // Jira state
+    const [jiraStatus,setJiraStatus]=useState(null);
+    const [jiraForm,setJiraForm]=useState({base_url:"",email:"",api_token:"",default_jql:""});
+    const [jiraBusy,setJiraBusy]=useState(false);
+    const [jiraMsg,setJiraMsg]=useState(null);
+    async function loadJiraStatus(){
+      try{const s=await api("/api/jira/status");setJiraStatus(s);
+        if(s?.connected)setJiraForm(f=>({...f,base_url:s.base_url||"",email:s.email||"",default_jql:s.default_jql||""}));
+      }catch{}
+    }
+    useEffect(()=>{if(settingsTab==="jira")loadJiraStatus();},[settingsTab]);
+    async function jiraConnect(){
+      if(!jiraForm.base_url||!jiraForm.email||!jiraForm.api_token){setJiraMsg({kind:"error",text:"Base URL, email, and API token are required."});return;}
+      setJiraBusy(true);setJiraMsg(null);
+      try{
+        const res=await api("/api/jira/connect",{method:"POST",body:JSON.stringify(jiraForm)});
+        setJiraMsg({kind:"ok",text:`Connected as ${res.display_name||res.email||"Jira user"}.`});
+        setJiraForm(f=>({...f,api_token:""}));
+        await loadJiraStatus();
+      }catch(e){setJiraMsg({kind:"error",text:e.message});}
+      setJiraBusy(false);
+    }
+    async function jiraSyncNow(){
+      setJiraBusy(true);setJiraMsg(null);
+      try{
+        const res=await api("/api/jira/sync",{method:"POST",body:JSON.stringify({})});
+        if(!res.ok)setJiraMsg({kind:"error",text:res.error||"Sync failed"});
+        else setJiraMsg({kind:"ok",text:`Pulled ${res.pulled||0} issues across ${res.pages||1} page(s).`});
+        await loadJiraStatus();
+      }catch(e){setJiraMsg({kind:"error",text:e.message});}
+      setJiraBusy(false);
+    }
+    async function jiraDisconnect(){
+      if(!confirm("Disconnect Jira? Cached issues stay in the DB; you can reconnect later."))return;
+      setJiraBusy(true);setJiraMsg(null);
+      try{await api("/api/jira/disconnect",{method:"POST"});setJiraForm({base_url:"",email:"",api_token:"",default_jql:""});setJiraMsg({kind:"ok",text:"Disconnected."});await loadJiraStatus();}
+      catch(e){setJiraMsg({kind:"error",text:e.message});}
+      setJiraBusy(false);
+    }
 
     // Report Groups state (loaded lazily when groups tab opens)
     const [groupRtype,setGroupRtype]=useState("pl");
@@ -794,6 +834,41 @@ function CloseApp(){
           </div>
         </div>}
         {syncMsg&&<div style={{marginTop:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:syncMsg.kind==="ok"?"#4fd9a018":"#f8717118",border:`1px solid ${syncMsg.kind==="ok"?"#4fd9a040":"#f8717140"}`,color:syncMsg.kind==="ok"?"#4fd9a0":"#f87171"}}>{syncMsg.text}</div>}
+      </div>}
+
+      {/* JIRA */}
+      {settingsTab==="jira"&&<div style={S.card}>
+        <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>Jira Cloud</div>
+        <div style={{fontSize:12,color:"#475569",marginBottom:20}}>Connect a Jira Cloud workspace via email + API token. Issues are pulled on-demand and cached locally for joins against your close data.</div>
+
+        <div style={{display:"flex",alignItems:"center",gap:16,padding:"16px 20px",background:"#0d1117",borderRadius:10,border:"1px solid #1e2d3d",marginBottom:16}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#e2e8f0",marginBottom:3}}>Connection Status</div>
+            {jiraStatus===null&&<div style={{fontSize:12,color:"#64748b"}}>Checking…</div>}
+            {jiraStatus?.connected&&<div style={{fontSize:12,color:"#4fd9a0"}}>✓ Connected · {jiraStatus.email} · {jiraStatus.issue_count||0} cached issue{jiraStatus.issue_count===1?"":"s"}{jiraStatus.last_synced_at?` · last sync ${new Date(jiraStatus.last_synced_at.replace(" ","T")+"Z").toLocaleString()}`:""}</div>}
+            {jiraStatus&&!jiraStatus.connected&&<div style={{fontSize:12,color:"#f87171"}}>Not connected</div>}
+          </div>
+          {jiraStatus?.connected&&<button onClick={jiraDisconnect} disabled={jiraBusy} style={{padding:"8px 14px",background:"transparent",border:"1px solid #1e2d3d",color:"#f87171",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",cursor:jiraBusy?"default":"pointer"}}>Disconnect</button>}
+        </div>
+
+        <div className="form-group"><label className="form-label">Base URL</label>
+          <input className="form-input" placeholder="https://yourcompany.atlassian.net" value={jiraForm.base_url} onChange={e=>setJiraForm(f=>({...f,base_url:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Email</label>
+          <input className="form-input" placeholder="you@company.com" value={jiraForm.email} onChange={e=>setJiraForm(f=>({...f,email:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">API Token</label>
+          <input className="form-input" type="password" placeholder={jiraStatus?.connected?"(leave blank to keep existing)":"Atlassian API token"} value={jiraForm.api_token} onChange={e=>setJiraForm(f=>({...f,api_token:e.target.value}))}/>
+          <div style={{fontSize:11,color:"#64748b",marginTop:4}}>Create at id.atlassian.com → Security → Create and manage API tokens. Stored encrypted (Fernet).</div>
+        </div>
+        <div className="form-group"><label className="form-label">Default JQL (optional)</label>
+          <input className="form-input" placeholder='project = FIN AND updated >= -90d ORDER BY updated DESC' value={jiraForm.default_jql} onChange={e=>setJiraForm(f=>({...f,default_jql:e.target.value}))}/>
+          <div style={{fontSize:11,color:"#64748b",marginTop:4}}>Used when you click Sync without a custom query. Defaults to <code>updated &gt;= -90d</code> if blank.</div>
+        </div>
+
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center",marginTop:6}}>
+          <button onClick={jiraConnect} disabled={jiraBusy} style={{padding:"8px 18px",background:"#0052CC",border:"none",color:"#fff",borderRadius:8,fontSize:13,fontWeight:600,cursor:jiraBusy?"default":"pointer"}}>{jiraBusy?"Working…":(jiraStatus?.connected?"Save & Verify":"Connect Jira")}</button>
+          {jiraStatus?.connected&&<button onClick={jiraSyncNow} disabled={jiraBusy} style={{padding:"7px 16px",background:"#0052CC18",border:"1px solid #0052CC40",color:jiraBusy?"#64748b":"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>{jiraBusy?"Syncing…":"↻ Sync Issues Now"}</button>}
+        </div>
+        {jiraMsg&&<div style={{marginTop:14,padding:"10px 14px",borderRadius:8,fontSize:12,fontFamily:"'DM Mono',monospace",background:jiraMsg.kind==="ok"?"#4fd9a018":"#f8717118",border:`1px solid ${jiraMsg.kind==="ok"?"#4fd9a040":"#f8717140"}`,color:jiraMsg.kind==="ok"?"#4fd9a0":"#f87171"}}>{jiraMsg.text}</div>}
       </div>}
 
       {settingsTab==="groups"&&<div style={S.card}>

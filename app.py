@@ -1,4 +1,4 @@
-import os, sqlite3, traceback, secrets, urllib.parse
+import os, sqlite3, traceback, secrets, urllib.parse, json
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, jsonify, request, g, send_from_directory, session, redirect
@@ -1515,6 +1515,260 @@ def reseed_calendar():
         return jsonify({"error": "Admin only"}), 403
     _ensure_fiscal_calendar()
     return jsonify({"ok": True})
+
+# ── Jira ──────────────────────────────────────────────────────────────────────
+# Jira Cloud auth: HTTP Basic with (email, API token). Token is Fernet-encrypted
+# at rest via encrypt_token() / decrypt_token(). Config is a single row
+# (id=1). Issues are cached into jira_issues so downstream features (e.g.
+# tagging recons by Jira epic) can JOIN without a round-trip to Atlassian.
+# Uses /rest/api/3/search/jql (POST) — the classic GET /search was removed
+# by Atlassian in 2025.
+
+JIRA_SEARCH_ENDPOINT = "/rest/api/3/search/jql"
+JIRA_MYSELF_ENDPOINT = "/rest/api/3/myself"
+JIRA_DEFAULT_FIELDS = [
+    "summary", "status", "issuetype", "priority", "assignee", "reporter",
+    "project", "parent", "labels", "created", "updated", "resolutiondate", "duedate",
+]
+JIRA_SYNC_MAX_PAGES = 50   # safety cap: 50 * 100 = 5000 issues per sync
+
+def _ensure_jira_tables():
+    db = get_db()
+    db.execute("""CREATE TABLE IF NOT EXISTS jira_config (
+        id          INTEGER PRIMARY KEY CHECK (id = 1),
+        base_url    TEXT NOT NULL,
+        email       TEXT NOT NULL,
+        api_token   TEXT NOT NULL,
+        default_jql TEXT DEFAULT '',
+        updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS jira_issues (
+        issue_key       TEXT PRIMARY KEY,
+        summary         TEXT,
+        status          TEXT,
+        status_category TEXT,
+        issue_type      TEXT,
+        priority        TEXT,
+        assignee        TEXT,
+        reporter        TEXT,
+        project_key     TEXT,
+        project_name    TEXT,
+        parent_key      TEXT,
+        labels          TEXT,
+        jira_created    TEXT,
+        jira_updated    TEXT,
+        resolved_at     TEXT,
+        due_date        TEXT,
+        synced_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_jira_issues_status  ON jira_issues(status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_jira_issues_project ON jira_issues(project_key)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_jira_issues_updated ON jira_issues(jira_updated)")
+    db.commit()
+
+def get_jira_config():
+    _ensure_jira_tables()
+    row = q1("SELECT base_url, email, api_token, default_jql FROM jira_config WHERE id=1")
+    if not row:
+        return None
+    return {
+        "base_url":    row["base_url"].rstrip("/"),
+        "email":       row["email"],
+        "api_token":   decrypt_token(row["api_token"]),
+        "default_jql": row["default_jql"] or "",
+    }
+
+def save_jira_config(base_url, email, api_token, default_jql=""):
+    _ensure_jira_tables()
+    db = get_db()
+    db.execute("""INSERT INTO jira_config (id, base_url, email, api_token, default_jql, updated_at)
+                  VALUES (1, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                  ON CONFLICT(id) DO UPDATE SET
+                      base_url=excluded.base_url, email=excluded.email,
+                      api_token=excluded.api_token, default_jql=excluded.default_jql,
+                      updated_at=CURRENT_TIMESTAMP""",
+               (base_url.rstrip("/"), email, encrypt_token(api_token), default_jql or ""))
+    db.commit()
+
+def jira_request(method, path, cfg=None, **kwargs):
+    """Call Jira REST with basic-auth. Returns (json_or_none, error_str_or_none)."""
+    cfg = cfg or get_jira_config()
+    if not cfg:
+        return None, "Not connected"
+    url = f"{cfg['base_url']}{path}"
+    try:
+        r = requests.request(
+            method, url,
+            auth=(cfg["email"], cfg["api_token"]),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=30, **kwargs,
+        )
+    except requests.RequestException as e:
+        return None, f"Network error: {e}"
+    if r.status_code in (401, 403):
+        return None, f"Jira auth failed (HTTP {r.status_code}). Check email and API token."
+    if r.status_code == 404:
+        return None, f"Jira 404 — endpoint not found. Check base URL: {cfg['base_url']}"
+    if not r.ok:
+        return None, f"Jira HTTP {r.status_code}: {r.text[:300]}"
+    try:
+        return r.json(), None
+    except ValueError:
+        return None, "Jira returned non-JSON response"
+
+def _flatten_jira_issue(issue):
+    f = issue.get("fields") or {}
+    def dn(v): return (v or {}).get("displayName") if isinstance(v, dict) else None
+    return {
+        "issue_key":       issue.get("key"),
+        "summary":         f.get("summary"),
+        "status":          (f.get("status") or {}).get("name"),
+        "status_category": ((f.get("status") or {}).get("statusCategory") or {}).get("name"),
+        "issue_type":      (f.get("issuetype") or {}).get("name"),
+        "priority":        (f.get("priority") or {}).get("name"),
+        "assignee":        dn(f.get("assignee")),
+        "reporter":        dn(f.get("reporter")),
+        "project_key":     (f.get("project") or {}).get("key"),
+        "project_name":    (f.get("project") or {}).get("name"),
+        "parent_key":      (f.get("parent") or {}).get("key"),
+        "labels":          json.dumps(f.get("labels") or []),
+        "jira_created":    f.get("created"),
+        "jira_updated":    f.get("updated"),
+        "resolved_at":     f.get("resolutiondate"),
+        "due_date":        f.get("duedate"),
+    }
+
+def sync_jira_issues(jql=None):
+    cfg = get_jira_config()
+    if not cfg:
+        return {"ok": False, "error": "Not connected"}
+    _ensure_jira_tables()
+    effective_jql = (jql or cfg.get("default_jql") or "").strip() or "updated >= -90d ORDER BY updated DESC"
+    payload = {"jql": effective_jql, "fields": JIRA_DEFAULT_FIELDS, "maxResults": 100}
+    pulled = 0
+    pages = 0
+    db = get_db()
+    while pages < JIRA_SYNC_MAX_PAGES:
+        data, error = jira_request("POST", JIRA_SEARCH_ENDPOINT, cfg=cfg, json=payload)
+        if error:
+            return {"ok": False, "error": error, "pulled": pulled, "jql": effective_jql}
+        for raw in (data.get("issues") or []):
+            it = _flatten_jira_issue(raw)
+            db.execute("""INSERT INTO jira_issues
+                (issue_key, summary, status, status_category, issue_type, priority,
+                 assignee, reporter, project_key, project_name, parent_key, labels,
+                 jira_created, jira_updated, resolved_at, due_date, synced_at)
+                VALUES (:issue_key, :summary, :status, :status_category, :issue_type, :priority,
+                        :assignee, :reporter, :project_key, :project_name, :parent_key, :labels,
+                        :jira_created, :jira_updated, :resolved_at, :due_date, CURRENT_TIMESTAMP)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                    summary=excluded.summary, status=excluded.status, status_category=excluded.status_category,
+                    issue_type=excluded.issue_type, priority=excluded.priority,
+                    assignee=excluded.assignee, reporter=excluded.reporter,
+                    project_key=excluded.project_key, project_name=excluded.project_name,
+                    parent_key=excluded.parent_key, labels=excluded.labels,
+                    jira_created=excluded.jira_created, jira_updated=excluded.jira_updated,
+                    resolved_at=excluded.resolved_at, due_date=excluded.due_date,
+                    synced_at=CURRENT_TIMESTAMP""", it)
+            pulled += 1
+        db.commit()
+        pages += 1
+        if data.get("isLast") or not data.get("nextPageToken"):
+            break
+        payload["nextPageToken"] = data["nextPageToken"]
+    return {"ok": True, "pulled": pulled, "pages": pages, "jql": effective_jql}
+
+@app.route("/api/jira/status", methods=["GET", "OPTIONS"])
+@login_required
+def jira_status():
+    if request.method == "OPTIONS":
+        return "", 204
+    cfg = get_jira_config()
+    if not cfg:
+        return jsonify({"connected": False})
+    stats = q1("SELECT COUNT(*) AS n, MAX(synced_at) AS last FROM jira_issues")
+    return jsonify({
+        "connected":      True,
+        "base_url":       cfg["base_url"],
+        "email":          cfg["email"],
+        "default_jql":    cfg["default_jql"],
+        "issue_count":    stats["n"] if stats else 0,
+        "last_synced_at": stats["last"] if stats else None,
+    })
+
+@app.route("/api/jira/connect", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def jira_connect():
+    """Validate credentials against Jira /myself before persisting. Body:
+    {base_url, email, api_token, default_jql?}."""
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    base_url    = (b.get("base_url") or "").strip()
+    email       = (b.get("email") or "").strip()
+    api_token   = (b.get("api_token") or "").strip()
+    default_jql = (b.get("default_jql") or "").strip()
+    if not (base_url and email and api_token):
+        return err("base_url, email, api_token are required")
+    if not base_url.startswith(("http://", "https://")):
+        return err("base_url must start with http:// or https://")
+    probe = {"base_url": base_url.rstrip("/"), "email": email, "api_token": api_token, "default_jql": default_jql}
+    data, error = jira_request("GET", JIRA_MYSELF_ENDPOINT, cfg=probe)
+    if error:
+        return jsonify({"ok": False, "error": error}), 400
+    save_jira_config(base_url, email, api_token, default_jql)
+    return jsonify({
+        "ok":           True,
+        "account_id":   data.get("accountId"),
+        "display_name": data.get("displayName"),
+        "email":        data.get("emailAddress"),
+    })
+
+@app.route("/api/jira/disconnect", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def jira_disconnect():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_jira_tables()
+    run("DELETE FROM jira_config WHERE id=1")
+    return jsonify({"ok": True})
+
+@app.route("/api/jira/sync", methods=["POST", "OPTIONS"])
+@login_required
+@csrf_protect
+def jira_sync():
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.json or {}
+    jql = (b.get("jql") or "").strip() or None
+    res = sync_jira_issues(jql=jql)
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+@app.route("/api/jira/issues", methods=["GET", "OPTIONS"])
+@login_required
+def jira_issues_list():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_jira_tables()
+    try:
+        limit = min(int(request.args.get("limit", 200)), 1000)
+    except ValueError:
+        limit = 200
+    project = request.args.get("project")
+    status  = request.args.get("status")
+    sql = "SELECT * FROM jira_issues"
+    conds, params = [], []
+    if project:
+        conds.append("project_key = ?"); params.append(project)
+    if status:
+        conds.append("status = ?");      params.append(status)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY jira_updated DESC LIMIT ?"
+    params.append(limit)
+    return jsonify(rows_to_list(q(sql, params)))
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(sync_qb_balances, "interval", minutes=15, id="qb_sync")
