@@ -604,9 +604,10 @@ def qb_bootstrap():
             report_results[f"{pid}:{rtype}"] = sync_qb_report(pid, rtype)
 
     body = request.get_json(silent=True) or {}
-    history = None
+    history_started = False
+    history_state = None
     if not body.get("skip_history"):
-        history = sync_history_range(
+        history_started, history_state = _start_sync_history_thread(
             start_iso=body.get("history_start") or "2024-01-01",
             end_iso=body.get("history_end") or date.today().isoformat(),
         )
@@ -616,7 +617,8 @@ def qb_bootstrap():
         "period_id": period_id,
         "accounts": accounts_result,
         "reports": report_results,
-        "history": history,
+        "history_started": history_started,
+        "history_state": history_state,
     })
 
 # ── QuickBooks Report Sync (P&L, Balance Sheet) ───────────────────────────────
@@ -813,10 +815,27 @@ def sync_qb_recons_from_bs(period_id):
     db.commit()
     return {"ok": True, "created": created, "updated": updated, "total": len(lines)}
 
+import threading
+
+# Shared state for the long-running history sweep. Polled by GET
+# /api/qb/sync_progress so the UI can show a live progress bar. Only one
+# sweep runs at a time (guarded by status == "running").
+_SYNC_LOCK = threading.Lock()
+_SYNC_STATE = {"status": "idle"}
+
+def _sync_state_snapshot():
+    with _SYNC_LOCK:
+        return dict(_SYNC_STATE)
+
+def _sync_state_update(**patch):
+    with _SYNC_LOCK:
+        _SYNC_STATE.update(patch)
+
 def sync_history_range(start_iso="2024-01-01", end_iso=None, types=("pl", "bs", "cf"), derive_recons=True):
     """Sweep every 4-4-5 month / quarter / year period whose window overlaps
     [start_iso, end_iso] and sync P&L / BS / CF into the cache. If derive_recons
     is on, also upsert per-period reconciliations from the cached BS lines.
+    Updates _SYNC_STATE as it goes so the UI can show a progress bar.
     Returns a summary dict; non-fatal QB errors are collected in 'errors'."""
     _ensure_fiscal_calendar()
     _ensure_report_tables()
@@ -825,36 +844,97 @@ def sync_history_range(start_iso="2024-01-01", end_iso=None, types=("pl", "bs", 
     periods = q("""SELECT id, label, period_type, start_date, end_date FROM periods
                    WHERE end_date >= ? AND start_date <= ?
                    ORDER BY period_type, start_date""", (start_iso, end_iso))
-    summary = {
-        "ok": True, "start_date": start_iso, "end_date": end_iso,
-        "periods": len(periods), "pl": 0, "bs": 0, "cf": 0,
-        "recons_created": 0, "recons_updated": 0, "errors": [],
-    }
+    total_steps = len(periods) * len(types)
+    _sync_state_update(
+        status="running",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=None,
+        start_date=start_iso,
+        end_date=end_iso,
+        periods=len(periods),
+        total=total_steps,
+        done=0,
+        current=None,
+        pl=0, bs=0, cf=0,
+        recons_created=0,
+        recons_updated=0,
+        errors=[],
+    )
+    summary = _sync_state_snapshot()
+    summary["ok"] = True
+    done = 0
     for p in periods:
         pid = p["id"]
         bs_ok = False
         for rtype in types:
+            _sync_state_update(current=f"{p['label']} · {rtype.upper()}")
             res = sync_qb_report(pid, rtype)
+            done += 1
+            patch = {"done": done}
             if res.get("ok"):
-                summary[rtype] = summary.get(rtype, 0) + 1
+                patch[rtype] = summary.get(rtype, 0) + 1
+                summary[rtype] = patch[rtype]
                 if rtype == "bs":
                     bs_ok = True
             else:
-                summary["errors"].append(f"{p['label']} {rtype}: {res.get('error')}")
+                err_line = f"{p['label']} {rtype}: {res.get('error')}"
+                with _SYNC_LOCK:
+                    _SYNC_STATE["errors"].append(err_line)
+                summary["errors"].append(err_line)
+            _sync_state_update(**patch)
         if derive_recons and bs_ok:
             rec = sync_qb_recons_from_bs(pid)
             if rec.get("ok"):
                 summary["recons_created"] += rec.get("created", 0)
                 summary["recons_updated"] += rec.get("updated", 0)
+                _sync_state_update(
+                    recons_created=summary["recons_created"],
+                    recons_updated=summary["recons_updated"],
+                )
+    _sync_state_update(
+        status="done",
+        current=None,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
     return summary
+
+def _run_sync_history_background(start_iso, end_iso, types, derive_recons):
+    """Runs sync_history_range in a thread with a Flask app context. Catches
+    any uncaught exception and records it in _SYNC_STATE so the UI shows a
+    readable error instead of the thread silently dying."""
+    try:
+        with app.app_context():
+            sync_history_range(start_iso, end_iso, types=types, derive_recons=derive_recons)
+    except Exception as e:
+        _sync_state_update(
+            status="error",
+            error=str(e) or e.__class__.__name__,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+def _start_sync_history_thread(start_iso, end_iso, types=("pl","bs","cf"), derive_recons=True):
+    """Returns (started: bool, state_snapshot). Refuses to start if a sweep is
+    already running."""
+    state = _sync_state_snapshot()
+    if state.get("status") == "running":
+        return False, state
+    t = threading.Thread(
+        target=_run_sync_history_background,
+        args=(start_iso, end_iso, tuple(types), bool(derive_recons)),
+        daemon=True,
+    )
+    t.start()
+    return True, _sync_state_snapshot()
 
 @app.route("/api/qb/sync_history", methods=["POST", "OPTIONS"])
 @login_required
 @csrf_protect
 def qb_sync_history():
-    """One-click historical sweep. Body: {start_date?, end_date?, types?,
-    derive_recons?}. Defaults to 2024-01-01 through today, all three reports,
-    and deriving recons from each period's BS."""
+    """Kick off a history sweep in a background thread. Returns immediately
+    with {started, state}. The UI polls /api/qb/sync_progress for progress
+    and waits for state.status == 'done' / 'error'. Body:
+    {start_date?, end_date?, types?, derive_recons?}. Defaults: 2024-01-01
+    through today, all three reports, deriving recons from each period's BS."""
     if request.method == "OPTIONS":
         return "", 204
     if not get_tokens():
@@ -864,7 +944,21 @@ def qb_sync_history():
     end = body.get("end_date") or date.today().isoformat()
     types = body.get("types") or ("pl", "bs", "cf")
     derive = body.get("derive_recons", True)
-    return jsonify(sync_history_range(start, end, types=tuple(types), derive_recons=bool(derive)))
+    started, state = _start_sync_history_thread(start, end, types=types, derive_recons=derive)
+    if not started:
+        return jsonify({"ok": False, "error": "A history sweep is already running", "state": state}), 409
+    return jsonify({"ok": True, "started": True, "state": state})
+
+@app.route("/api/qb/sync_progress", methods=["GET", "OPTIONS"])
+@login_required
+def qb_sync_progress():
+    """Poll endpoint — returns the current state of the background history
+    sweep. Fields: status (idle | running | done | error), done/total, pl/bs/cf
+    counts, current (the period+report being processed right now), errors[],
+    started_at / finished_at."""
+    if request.method == "OPTIONS":
+        return "", 204
+    return jsonify(_sync_state_snapshot())
 
 @app.route("/api/qb/sync_reports", methods=["POST", "OPTIONS"])
 @login_required

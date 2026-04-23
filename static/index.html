@@ -153,6 +153,29 @@ function CloseApp(){
   const [allPeriods,setAllPeriods]=useState([]);
   const [qbStatus,setQbStatus]=useState(null);
   useEffect(()=>{if(!currentUser)return;api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>setQbStatus({connected:false}));},[currentUser]);
+
+  // Live progress for the background history sweep (Initialize + Sync History).
+  // Polls /api/qb/sync_progress every 1.5s while running; stops when idle/done.
+  const [syncProgress,setSyncProgress]=useState(null);
+  const syncPollRef=useRef(null);
+  function pokeSyncProgress(){
+    api("/api/qb/sync_progress").then(s=>{
+      setSyncProgress(s);
+      if(s?.status==="running"){
+        if(!syncPollRef.current)syncPollRef.current=setInterval(pokeSyncProgress,1500);
+      }else{
+        if(syncPollRef.current){clearInterval(syncPollRef.current);syncPollRef.current=null;}
+        // When the sweep just finished, refresh the data sets that depend on it.
+        if(s?.status==="done"&&period?.id){
+          api(`/api/reconciliations?period_id=${period.id}`).then(r=>setRecons(Array.isArray(r)?r:[])).catch(()=>{});
+          api("/api/periods").then(setAllPeriods).catch(()=>{});
+        }
+      }
+    }).catch(()=>{});
+  }
+  useEffect(()=>{if(currentUser)pokeSyncProgress();
+    return ()=>{if(syncPollRef.current){clearInterval(syncPollRef.current);syncPollRef.current=null;}};
+  },[currentUser]);
   const loadAll=useCallback(async()=>{
     setLoading(true);
     try{
@@ -219,20 +242,22 @@ function CloseApp(){
     setSyncing(false);
   }
   async function bootstrapQB(){
-    if(!confirm("This will activate the current month, pull your QuickBooks chart of accounts, create reconciliation rows for every balance-sheet account, and sync P&L / BS / CF. Continue?"))return;
+    if(!confirm("This will activate the current month, pull your QuickBooks chart of accounts, create reconciliation rows for every balance-sheet account, and sync P&L / BS / CF for the current period. Then a historical sweep (2024 → today) runs in the background — you'll see a progress bar up top. Continue?"))return;
     setSyncing(true);setSyncMsg(null);
     try{
       const res=await api("/api/qb/bootstrap",{method:"POST"});
       if(!res.ok){setSyncMsg({kind:"error",text:res.error||"Bootstrap failed"});}
       else{
         const a=res.accounts||{};
-        setSyncMsg({kind:"ok",text:`Ready. ${a.created||0} new accounts, ${a.updated||0} existing updated, P&L/BS/CF synced.`});
+        const hist=res.history_started?" History sync running in background — watch the banner up top.":"";
+        setSyncMsg({kind:"ok",text:`Current period ready. ${a.created||0} new accounts, ${a.updated||0} existing updated.${hist}`});
       }
+      if(res.history_started)pokeSyncProgress();
       const p=await api("/api/periods/active").catch(()=>null);
       if(p)setPeriod(p);
       if(p?.id){
         const [r,d]=await Promise.all([api(`/api/reconciliations?period_id=${p.id}`),api(`/api/dashboard?period_id=${p.id}`)]);
-        setRecons(r);setDash(d);
+        setRecons(Array.isArray(r)?r:[]);setDash(d);
       }
     }catch(e){setSyncMsg({kind:"error",text:e.message});}
     setSyncing(false);
@@ -952,15 +977,13 @@ function CloseApp(){
       setBusy(false);
     }
     async function syncHistory(){
-      if(!confirm("Pull every P&L / Balance Sheet / Cash Flow from QuickBooks for every month, quarter, and year from 2024-01-01 through today, AND derive reconciliations from each month's Balance Sheet. This can take 1–3 minutes. Continue?"))return;
-      setBusy(true);setErr(null);
+      if(!confirm("Pull every P&L / Balance Sheet / Cash Flow from QuickBooks for every month, quarter, and year from 2024-01-01 through today, AND derive reconciliations from each month's Balance Sheet. Runs in the background — watch the progress banner at the top. Continue?"))return;
+      setErr(null);
       try{
         const r=await api("/api/qb/sync_history",{method:"POST",body:JSON.stringify({start_date:"2024-01-01"})});
-        await loadReport();await loadKpis();
-        const errTxt=r.errors&&r.errors.length?`\n\n${r.errors.length} soft error(s) — first few:\n${r.errors.slice(0,5).join("\n")}`:"";
-        alert(`History synced through ${r.end_date}.\n${r.periods} periods · P&L ${r.pl} · BS ${r.bs} · CF ${r.cf}\nReconciliations: ${r.recons_created} created, ${r.recons_updated} updated.${errTxt}`);
+        if(!r.ok){setErr(r.error||"Could not start sync");return;}
+        pokeSyncProgress();
       }catch(e){setErr(e.message);}
-      setBusy(false);
     }
     const [diag,setDiag]=useState(null);
     async function diagnose(){
@@ -1205,6 +1228,26 @@ function CloseApp(){
     {qbToast&&<div style={{position:"fixed",top:20,right:20,zIndex:999,padding:"12px 20px",borderRadius:10,fontSize:13,fontWeight:600,background:qbToast.kind==="connected"?"#4fd9a018":"#f8717118",border:`1px solid ${qbToast.kind==="connected"?"#4fd9a040":"#f8717140"}`,color:qbToast.kind==="connected"?"#4fd9a0":"#f87171",maxWidth:420,lineHeight:1.4}}>
       {qbToast.kind==="connected"?"✓ QuickBooks connected successfully!":<span>✗ {qbErrorMessage(qbToast.reason)}{qbToast.reason&&<span style={{display:"block",fontWeight:400,fontSize:11,opacity:0.7,marginTop:3,fontFamily:"'DM Mono',monospace"}}>reason: {qbToast.reason}</span>}</span>}
       <button onClick={()=>setQbToast(null)} style={{marginLeft:12,background:"none",border:"none",color:"inherit",cursor:"pointer",fontSize:16}}>×</button>
+    </div>}
+    {syncProgress&&(syncProgress.status==="running"||syncProgress.status==="error"||(syncProgress.status==="done"&&syncProgress.finished_at&&((new Date()-new Date(syncProgress.finished_at))/1000<15)))&&<div style={{position:"fixed",top:20,left:"50%",transform:"translateX(-50%)",zIndex:998,minWidth:420,maxWidth:640,padding:"12px 16px",borderRadius:10,background:syncProgress.status==="error"?"#f8717118":syncProgress.status==="done"?"#4fd9a018":"#4f8ef718",border:`1px solid ${syncProgress.status==="error"?"#f8717140":syncProgress.status==="done"?"#4fd9a040":"#4f8ef740"}`,color:"#e2e8f0",fontFamily:"'DM Mono',monospace",fontSize:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+        <div style={{fontWeight:600,color:syncProgress.status==="error"?"#f87171":syncProgress.status==="done"?"#4fd9a0":"#4f8ef7"}}>
+          {syncProgress.status==="running"&&`⇣ Syncing history from QuickBooks — ${syncProgress.done||0} / ${syncProgress.total||0}`}
+          {syncProgress.status==="done"&&`✓ History sync complete · ${syncProgress.periods||0} periods · P&L ${syncProgress.pl||0} · BS ${syncProgress.bs||0} · CF ${syncProgress.cf||0} · Recons ${syncProgress.recons_created||0}+${syncProgress.recons_updated||0}`}
+          {syncProgress.status==="error"&&`✗ Sync error: ${syncProgress.error||"unknown"}`}
+        </div>
+        {syncProgress.status!=="running"&&<button onClick={()=>setSyncProgress({...syncProgress,status:"dismissed"})} style={{background:"none",border:"none",color:"#64748b",cursor:"pointer",fontSize:16}}>×</button>}
+      </div>
+      {syncProgress.status==="running"&&<>
+        <div style={{height:6,background:"#1e2d3d",borderRadius:3,marginTop:8,overflow:"hidden"}}>
+          <div style={{height:"100%",width:(syncProgress.total?Math.min(100,Math.round(100*(syncProgress.done||0)/syncProgress.total)):0)+"%",background:"#4f8ef7",borderRadius:3,transition:"width .4s"}}/>
+        </div>
+        <div style={{marginTop:6,color:"#94a3b8",fontSize:11.5}}>
+          {syncProgress.current||"starting…"}
+          {syncProgress.errors&&syncProgress.errors.length>0&&<span style={{marginLeft:10,color:"#f59e0b"}}>· {syncProgress.errors.length} soft error(s)</span>}
+        </div>
+      </>}
+      {syncProgress.status==="done"&&syncProgress.errors&&syncProgress.errors.length>0&&<div style={{marginTop:6,color:"#f59e0b",fontSize:11.5}}>{syncProgress.errors.length} soft error(s); first: {syncProgress.errors[0]}</div>}
     </div>}
     <div style={S.sidebar}>
       <div style={{padding:"0 20px 20px",borderBottom:"1px solid #1e2d3d",marginBottom:8}}>
