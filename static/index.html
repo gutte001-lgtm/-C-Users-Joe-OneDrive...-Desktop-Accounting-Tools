@@ -151,6 +151,8 @@ function CloseApp(){
   },[]);
 
   const [allPeriods,setAllPeriods]=useState([]);
+  const [qbStatus,setQbStatus]=useState(null);
+  useEffect(()=>{if(!currentUser)return;api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>setQbStatus({connected:false}));},[currentUser]);
   const loadAll=useCallback(async()=>{
     setLoading(true);
     try{
@@ -610,9 +612,6 @@ function CloseApp(){
       if(!confirm("Delete this task?"))return;
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
-
-    const [qbStatus,setQbStatus]=useState(null);
-    useEffect(()=>{api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>{});},[]);
 
     const stabs=["users","categories","tasks","quickbooks","groups"];
 
