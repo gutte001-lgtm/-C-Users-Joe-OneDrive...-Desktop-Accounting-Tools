@@ -374,18 +374,6 @@ hardening port, the state of the repo is:
 
 ### Remaining unmerged branches
 
-- **`claude/fix-powershell-path-spaces-MabVa`** — launcher robustness
-  for the "path with spaces + dash" problem. `Start CloseTool.bat` now
-  self-locates via `cd /d "%~dp0"` (no hardcoded
-  `C:\Users\Joe\OneDrive - Healthcare Markets DBA\...` path, so moving
-  the folder doesn't break it). Adds `Start-CloseTool.ps1` — filename
-  has no spaces, so PowerShell users can run
-  `& .\Start-CloseTool.ps1` or right-click → Run with PowerShell
-  without fighting PS's token-splits-on-space parser; uses
-  `$PSScriptRoot` so it's location-independent; 5.1-compatible (no
-  `??` operator). Root cause was the PS error Joe hit when he pasted
-  the bare project path into a prompt — PS parsed `C:\Users\Joe\OneDrive`
-  as a command and everything after the first space as args.
 - **`claude/close-tracker-tools-JVRS3`** — a *different* reports flavor
   (customer / vendor ledgers, GL detail, revenue by customer, expense
   by vendor, by-Jira-epic) plus QB deep-sync of 23 entities,
@@ -425,6 +413,11 @@ hardening port, the state of the repo is:
   `Reconciliations()` can reach it via closure; prior version threw
   `ReferenceError: qbStatus is not defined` on render). Single-commit
   branch; remote deleted after merge.
+- `claude/fix-powershell-path-spaces-MabVa` — landed on `master` via
+  `--no-ff` merge `ea95d22`. `Start CloseTool.bat` now self-locates
+  with `%~dp0`; new `Start-CloseTool.ps1` launcher (no-space filename,
+  `$PSScriptRoot`, PS 5.1-compatible). Fixes ReferenceError Joe hit
+  pasting the bare OneDrive path into a PS prompt.
 
 When in doubt, ask Joe before merging or deleting any of the
 unmerged-but-still-present branches above.
