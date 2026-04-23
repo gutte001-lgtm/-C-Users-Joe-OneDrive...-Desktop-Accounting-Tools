@@ -379,6 +379,65 @@ def qb_status():
         "token_expires_in": max(0, int(tokens.get("expires_at", 0) - datetime.now(timezone.utc).timestamp()))
     })
 
+@app.route("/api/qb/diagnose", methods=["GET", "OPTIONS"])
+@login_required
+def qb_diagnose():
+    """Fetches a report straight from QuickBooks and returns the raw shape so
+    we can see *why* a sync produces zero lines. Usage:
+    /api/qb/diagnose?period_id=123&rtype=pl   (rtype: pl | bs | cf; default pl)
+    Returns: {connected, realm_id, environment, period, url, qb_error, rows,
+              row_count_top_level, row_count_flattened, sample_rows, header}.
+    No side effects — does not touch qb_reports / qb_report_lines."""
+    if request.method == "OPTIONS":
+        return "", 204
+    tokens = get_tokens()
+    realm = get_realm_id()
+    out = {
+        "connected": bool(tokens),
+        "realm_id": realm or None,
+        "environment": QB_ENVIRONMENT,
+    }
+    if not tokens:
+        out["qb_error"] = "Not connected — click Settings → Connect QuickBooks"
+        return jsonify(out)
+    period_id = request.args.get("period_id", type=int)
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        out["qb_error"] = "No period_id supplied and no active period"
+        return jsonify(out)
+    period = q1("SELECT id, label, start_date, end_date FROM periods WHERE id=?", (period_id,))
+    if not period:
+        out["qb_error"] = "Period not found"
+        return jsonify(out)
+    out["period"] = dict(period)
+    rtype = (request.args.get("rtype") or "pl").lower()
+    endpoints = {"pl": "ProfitAndLoss", "bs": "BalanceSheet", "cf": "CashFlow"}
+    if rtype not in endpoints:
+        out["qb_error"] = f"Unknown rtype '{rtype}' (expected pl/bs/cf)"
+        return jsonify(out)
+    path = f"/reports/{endpoints[rtype]}?start_date={period['start_date']}&end_date={period['end_date']}&accounting_method=Accrual&minorversion=65"
+    out["url"] = f"{QB_API_BASE}/{realm}{path}"
+    data, err_str = qb_get(path)
+    if err_str:
+        out["qb_error"] = err_str
+        return jsonify(out)
+    out["qb_error"] = None
+    out["header"] = data.get("Header")
+    rows = data.get("Rows", {}) or {}
+    top_rows = rows.get("Row", []) if isinstance(rows, dict) else []
+    out["row_count_top_level"] = len(top_rows)
+    flat = []
+    _flatten_qb_rows(rows, rtype, flat)
+    out["row_count_flattened"] = len(flat)
+    out["sample_rows"] = [
+        {"name": r.get("account_name"), "amount": r.get("amount"),
+         "section": r.get("section"), "is_subtotal": r.get("is_subtotal")}
+        for r in flat[:12]
+    ]
+    return jsonify(out)
+
 def sync_qb_accounts(period_id):
     """Pull QB's chart of accounts, cache it, and make sure there's a
     reconciliation row for every Asset/Liability/Equity account in the given
@@ -838,15 +897,25 @@ def _load_report_lines(period_id, report_type):
     return [dict(r) for r in rows]
 
 def _prior_period_id(period_id, mode="prev"):
-    """mode='prev' — immediately prior period of same type;
-       mode='yoy'  — same type + period_number in previous fiscal year."""
+    """Resolve a compare-to period id from a mode string. Supported modes:
+      prev    — immediately prior period of same type (MoM / QoQ / Y-1)
+      prev2   — two periods ago (same type)
+      prev3   — three periods ago (same type)
+      yoy     — same type + same period_number in the previous fiscal year
+      yoy2    — same period_number two fiscal years ago
+      ytd     — the FY `year` period of the same fiscal year (this period vs YTD)
+      ytd_ly  — the FY `year` period of the prior fiscal year
+    Unknown modes fall back to 'prev'."""
     cur = q1("SELECT start_date, period_type, period_number, fiscal_year FROM periods WHERE id=?", (period_id,))
     if not cur:
         return None
     ptype = cur["period_type"] or "month"
-    if mode == "yoy" and cur["fiscal_year"]:
+    fy = cur["fiscal_year"]
+
+    if mode in ("yoy", "yoy2") and fy:
+        back = 1 if mode == "yoy" else 2
         pn_match = "period_number IS NULL" if cur["period_number"] is None else "period_number=?"
-        params = [ptype, cur["fiscal_year"] - 1]
+        params = [ptype, fy - back]
         if cur["period_number"] is not None:
             params.append(cur["period_number"])
         row = q1(f"""SELECT id FROM periods
@@ -854,9 +923,23 @@ def _prior_period_id(period_id, mode="prev"):
                      LIMIT 1""", tuple(params))
         if row:
             return row["id"]
-    prior = q1("""SELECT id FROM periods WHERE period_type=? AND start_date < ?
-                  ORDER BY start_date DESC LIMIT 1""", (ptype, cur["start_date"]))
-    return prior["id"] if prior else None
+
+    if mode == "ytd" and fy:
+        row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=? LIMIT 1", (fy,))
+        if row:
+            return row["id"]
+    if mode == "ytd_ly" and fy:
+        row = q1("SELECT id FROM periods WHERE period_type='year' AND fiscal_year=? LIMIT 1", (fy - 1,))
+        if row:
+            return row["id"]
+
+    offset_map = {"prev": 1, "prev2": 2, "prev3": 3}
+    offset = offset_map.get(mode, 1)
+    # LIMIT 1 OFFSET N-1 picks the Nth-prior period of this type
+    row = q1(f"""SELECT id FROM periods WHERE period_type=? AND start_date < ?
+                 ORDER BY start_date DESC LIMIT 1 OFFSET {offset - 1}""",
+             (ptype, cur["start_date"]))
+    return row["id"] if row else None
 
 def _build_report_payload(period_id, rtype, compare_id=None, view="native"):
     cur_lines = _load_report_lines(period_id, rtype)

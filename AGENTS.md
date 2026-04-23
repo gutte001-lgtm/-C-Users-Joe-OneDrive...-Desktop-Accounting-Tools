@@ -329,7 +329,7 @@ hardening port, the state of the repo is:
 ### Remaining unmerged branches
 
 - **`claude/fix-quickbooks-sync-PPv7R`** — in-flight at time of writing.
-  Two stacked features on one branch:
+  Three stacked features on one branch:
   (a) Historical sweep: `sync_qb_recons_from_bs(period_id)` derives
   per-period reconciliations from each period's cached Balance Sheet
   (correct historical ending balances, unlike the current-balance stamp
@@ -341,6 +341,23 @@ hardening port, the state of the repo is:
   gained a period dropdown + "↻ Sync This Period" button; Reports
   gained a "⇣ Sync History" button and a real error string instead of
   `JSON.stringify(results)`.
+  (c) Richer compare modes + diagnostics on Reports. Backend
+  `_prior_period_id()` now handles `prev`, `prev2`, `prev3`, `yoy`,
+  `yoy2`, `ytd` (FY year of same fiscal year), `ytd_ly` (FY year of
+  prior fiscal year), plus caller-supplied `compare_to=<id>` for
+  Custom. New `GET /api/qb/diagnose?period_id=X&rtype=pl` hits the
+  QuickBooks reports API directly and returns the URL, HTTP status,
+  top-level row count, flattened row count, and first 12 sample lines
+  — no side effects. Frontend Reports: compare dropdown gained
+  "Prior period / 2 periods ago / 3 periods ago / Prior year / Two
+  years ago / This fiscal year (YTD) / Prior fiscal year / Custom…"
+  options; Custom reveals a second dropdown of every cached period
+  (type-tagged). Empty-state now distinguishes "Not yet synced" from
+  "QuickBooks returned this report with zero rows" and suggests likely
+  causes (empty company, sandbox/production mix, accounting method).
+  New "🔎 Diagnose" button opens a modal with the raw QB response
+  summary — this is the tool to reach for when a sync succeeds but
+  Reports stay empty.
   (b) Close-period workflow. New `periods` columns: `is_closed`,
   `closed_at`, `closed_by` (idempotent ALTER migration in
   `_ensure_period_close_columns()`). `_backfill_closed_once()` runs on
