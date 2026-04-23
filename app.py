@@ -1994,20 +1994,463 @@ def dashboard():
         JOIN categories c ON c.id = t.category_id
         WHERE t.period_id=? AND (t.review_status='needs_revision' OR t.status='open')
         ORDER BY t.due_date LIMIT 8""", (period_id,)))
+    # open issues count
+    try:
+        open_issues = q1("SELECT COUNT(*) AS n FROM open_items WHERE period_id=? AND status='open'", (period_id,))
+        open_issues_count = open_issues["n"] if open_issues else 0
+    except Exception:
+        open_issues_count = 0
+    # avg days to close
+    try:
+        _ensure_period_close_columns()
+        closed_rows = q("SELECT end_date, closed_at FROM periods WHERE is_closed=1 AND closed_at IS NOT NULL")
+        days_list = []
+        for cr in closed_rows:
+            try:
+                from datetime import datetime as _dt2
+                d1 = _dt2.fromisoformat(cr["end_date"][:10])
+                d2 = _dt2.fromisoformat(cr["closed_at"][:19].replace("T", " ").split(".")[0])
+                days_list.append(max(0, (d2.date() - d1.date()).days))
+            except Exception:
+                pass
+        avg_days_to_close = round(sum(days_list) / len(days_list), 1) if days_list else None
+    except Exception:
+        avg_days_to_close = None
     return jsonify({
-        "period_id":      period_id,
-        "tasks_total":    total,
-        "tasks_complete": complete,
-        "tasks_approved": approved,
-        "close_pct":      round(complete / total * 100) if total else 0,
-        "approval_pct":   round(approved / total * 100) if total else 0,
-        "recon_total":    len(recons_all),
-        "recon_done":     recon_done,
-        "recon_pct":      round(recon_done / len(recons_all) * 100) if recons_all else 0,
-        "by_user":        users,
-        "by_category":    cats,
-        "attention":      attention,
+        "period_id":        period_id,
+        "tasks_total":      total,
+        "tasks_complete":   complete,
+        "tasks_approved":   approved,
+        "close_pct":        round(complete / total * 100) if total else 0,
+        "approval_pct":     round(approved / total * 100) if total else 0,
+        "recon_total":      len(recons_all),
+        "recon_done":       recon_done,
+        "recon_pct":        round(recon_done / len(recons_all) * 100) if recons_all else 0,
+        "by_user":          users,
+        "by_category":      cats,
+        "attention":        attention,
+        "open_issues":      open_issues_count,
+        "avg_days_to_close": avg_days_to_close,
     })
+
+# ── Feature 2: Task Dependencies ─────────────────────────────────────────────
+
+@app.route("/api/tasks/<int:tid>/dependencies", methods=["GET", "OPTIONS"])
+@login_required
+def get_task_dependencies(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    rows = q("""SELECT t.id, t.name, t.status, t.category_id, c.name AS category_name
+                FROM task_dependencies td
+                JOIN tasks t ON t.id = td.depends_on_id
+                JOIN categories c ON c.id = t.category_id
+                WHERE td.task_id=?""", (tid,))
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/tasks/<int:tid>/dependencies", methods=["POST"])
+@login_required
+@csrf_protect
+def add_task_dependency(tid):
+    _ensure_new_features_schema()
+    b = request.get_json(silent=True) or {}
+    dep_id = b.get("depends_on_id")
+    if not dep_id:
+        return err("depends_on_id required")
+    if dep_id == tid:
+        return err("Task cannot depend on itself")
+    try:
+        run("INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_id) VALUES (?,?)", (tid, dep_id))
+    except Exception as e:
+        return err(str(e))
+    return jsonify({"ok": True}), 201
+
+@app.route("/api/tasks/<int:tid>/dependencies/<int:dep_id>", methods=["DELETE", "OPTIONS"])
+@login_required
+@csrf_protect
+def remove_task_dependency(tid, dep_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    run("DELETE FROM task_dependencies WHERE task_id=? AND depends_on_id=?", (tid, dep_id))
+    return jsonify({"ok": True})
+
+# ── Feature 3: Roll-forward ────────────────────────────────────────────────────
+
+@app.route("/api/periods/<int:pid>/rollforward", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def rollforward_period(pid):
+    if request.method == "OPTIONS":
+        return "", 204
+    b = request.get_json(silent=True) or {}
+    target_id = b.get("target_period_id")
+    if not target_id:
+        return err("target_period_id required")
+    src_tasks = q("SELECT * FROM tasks WHERE period_id=?", (pid,))
+    db = get_db()
+    copied = 0
+    for t in src_tasks:
+        if t["recurrence"] in (None, "none", "") and not b.get("include_all"):
+            pass  # include all tasks regardless (simple roll-forward)
+        db.execute(
+            """INSERT INTO tasks (period_id, category_id, name, assignee_id, reviewer_id, due_date,
+               status, review_status, notes, recurrence)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (target_id, t["category_id"], t["name"], t["assignee_id"], t["reviewer_id"],
+             t["due_date"], "open", "pending", "", t["recurrence"] or "none"))
+        copied += 1
+    db.commit()
+    return jsonify({"copied": copied})
+
+# ── Feature 4: Checklist Templates ────────────────────────────────────────────
+
+@app.route("/api/templates", methods=["GET", "OPTIONS"])
+@login_required
+def get_templates():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    rows = q("SELECT * FROM checklist_templates ORDER BY created_at DESC")
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/templates", methods=["POST"])
+@admin_required
+@csrf_protect
+def create_template():
+    _ensure_new_features_schema()
+    b = request.get_json(silent=True) or {}
+    name = (b.get("name") or "").strip()
+    if not name:
+        return err("name required")
+    u = get_current_user()
+    cur = run("INSERT INTO checklist_templates (name, period_type, description, created_by) VALUES (?,?,?,?)",
+              (name, b.get("period_type", "monthly"), b.get("description", ""), u["id"] if u else DEFAULT_USER_ID))
+    return jsonify({"id": cur.lastrowid, "name": name}), 201
+
+@app.route("/api/templates/<int:tmpl_id>", methods=["DELETE", "OPTIONS"])
+@admin_required
+@csrf_protect
+def delete_template(tmpl_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    run("DELETE FROM template_tasks WHERE template_id=?", (tmpl_id,))
+    run("DELETE FROM checklist_templates WHERE id=?", (tmpl_id,))
+    return jsonify({"deleted": tmpl_id})
+
+@app.route("/api/templates/<int:tmpl_id>/tasks", methods=["GET", "OPTIONS"])
+@login_required
+def get_template_tasks(tmpl_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    rows = q("SELECT * FROM template_tasks WHERE template_id=? ORDER BY sort_order, id", (tmpl_id,))
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/templates/<int:tmpl_id>/tasks", methods=["POST"])
+@admin_required
+@csrf_protect
+def add_template_task(tmpl_id):
+    _ensure_new_features_schema()
+    b = request.get_json(silent=True) or {}
+    title = (b.get("title") or "").strip()
+    if not title:
+        return err("title required")
+    cur = run("INSERT INTO template_tasks (template_id, title, category_id, assignee_id, reviewer_id, day_target, sort_order) VALUES (?,?,?,?,?,?,?)",
+              (tmpl_id, title, b.get("category_id"), b.get("assignee_id"), b.get("reviewer_id"),
+               b.get("day_target"), b.get("sort_order", 0)))
+    return jsonify({"id": cur.lastrowid}), 201
+
+@app.route("/api/templates/<int:tmpl_id>/tasks/<int:ttid>", methods=["DELETE", "OPTIONS"])
+@admin_required
+@csrf_protect
+def remove_template_task(tmpl_id, ttid):
+    if request.method == "OPTIONS":
+        return "", 204
+    run("DELETE FROM template_tasks WHERE id=? AND template_id=?", (ttid, tmpl_id))
+    return jsonify({"ok": True})
+
+@app.route("/api/templates/<int:tmpl_id>/apply", methods=["POST", "OPTIONS"])
+@admin_required
+@csrf_protect
+def apply_template(tmpl_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    b = request.get_json(silent=True) or {}
+    period_id = b.get("period_id")
+    if not period_id:
+        return err("period_id required")
+    period = q1("SELECT * FROM periods WHERE id=?", (period_id,))
+    if not period:
+        return err("Period not found", 404)
+    tasks = q("SELECT * FROM template_tasks WHERE template_id=? ORDER BY sort_order, id", (tmpl_id,))
+    db = get_db()
+    created = 0
+    for t in tasks:
+        due = None
+        if t["day_target"] and period["start_date"]:
+            from datetime import date as _date, timedelta as _td
+            start = _date.fromisoformat(period["start_date"])
+            due = (start + _td(days=t["day_target"] - 1)).isoformat()
+        db.execute("""INSERT INTO tasks (period_id, category_id, name, assignee_id, reviewer_id, due_date, status, review_status)
+                      VALUES (?,?,?,?,?,?,?,?)""",
+                   (period_id, t["category_id"], t["title"], t["assignee_id"], t["reviewer_id"],
+                    due, "open", "pending"))
+        created += 1
+    db.commit()
+    return jsonify({"created": created})
+
+# ── Feature 6: Open Items / Issues Log ────────────────────────────────────────
+
+@app.route("/api/open_items", methods=["GET", "OPTIONS"])
+@login_required
+def get_open_items():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    period_id = request.args.get("period_id")
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        return jsonify([])
+    rows = q("""SELECT oi.*, u1.name AS assigned_to_name, u2.name AS created_by_name
+                FROM open_items oi
+                LEFT JOIN users u1 ON u1.id = oi.assigned_to
+                LEFT JOIN users u2 ON u2.id = oi.created_by
+                WHERE oi.period_id=? ORDER BY oi.created_at DESC""", (period_id,))
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/open_items", methods=["POST"])
+@login_required
+@csrf_protect
+def create_open_item():
+    _ensure_new_features_schema()
+    b = request.get_json(silent=True) or {}
+    title = (b.get("title") or "").strip()
+    period_id = b.get("period_id")
+    if not title or not period_id:
+        return err("title and period_id required")
+    u = get_current_user()
+    uid = u["id"] if u else DEFAULT_USER_ID
+    cur = run("""INSERT INTO open_items (period_id, title, description, status, priority, assigned_to, created_by)
+                 VALUES (?,?,?,?,?,?,?)""",
+              (period_id, title, b.get("description", ""), b.get("status", "open"),
+               b.get("priority", "medium"), b.get("assigned_to"), uid))
+    run("INSERT INTO task_activity (task_id, user_id, action, new_value) VALUES (?,?,?,?)",
+        (cur.lastrowid, uid, "created", f"open_item:{title}"))
+    return jsonify({"id": cur.lastrowid}), 201
+
+@app.route("/api/open_items/<int:oid>", methods=["PATCH", "DELETE", "OPTIONS"])
+@login_required
+@csrf_protect
+def manage_open_item(oid):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    if request.method == "DELETE":
+        u = get_current_user()
+        if u["role"] != "admin":
+            return err("Admin required", 403)
+        run("DELETE FROM open_items WHERE id=?", (oid,))
+        return jsonify({"deleted": oid})
+    b = request.get_json(silent=True) or {}
+    allowed = {"status", "description", "assigned_to", "priority", "resolved_at", "resolved_by"}
+    updates = {k: v for k, v in b.items() if k in allowed}
+    if not updates:
+        return err("No valid fields")
+    u = get_current_user()
+    uid = u["id"] if u else DEFAULT_USER_ID
+    if updates.get("status") == "resolved":
+        updates.setdefault("resolved_at", datetime.now(timezone.utc).isoformat())
+        updates.setdefault("resolved_by", uid)
+    safe_update("open_items", "id", allowed, updates, oid)
+    run("INSERT INTO task_activity (task_id, user_id, action, new_value) VALUES (?,?,?,?)",
+        (oid, uid, "status_change", updates.get("status", "")))
+    row = q1("""SELECT oi.*, u1.name AS assigned_to_name FROM open_items oi
+                LEFT JOIN users u1 ON u1.id = oi.assigned_to WHERE oi.id=?""", (oid,))
+    return jsonify(dict(row)) if row else err("Not found", 404)
+
+# ── Feature 8: Attachments ─────────────────────────────────────────────────────
+
+@app.route("/api/attachments", methods=["GET", "POST", "OPTIONS"])
+@login_required
+@csrf_protect
+def attachments():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    if request.method == "GET":
+        task_id = request.args.get("task_id")
+        recon_id = request.args.get("recon_id")
+        if task_id:
+            rows = q("""SELECT a.id, a.filename, a.content_type, a.uploaded_at, u.name AS uploaded_by_name
+                        FROM attachments a LEFT JOIN users u ON u.id=a.uploaded_by
+                        WHERE a.task_id=? ORDER BY a.uploaded_at DESC""", (task_id,))
+        elif recon_id:
+            rows = q("""SELECT a.id, a.filename, a.content_type, a.uploaded_at, u.name AS uploaded_by_name
+                        FROM attachments a LEFT JOIN users u ON u.id=a.uploaded_by
+                        WHERE a.recon_id=? ORDER BY a.uploaded_at DESC""", (recon_id,))
+        else:
+            return err("task_id or recon_id required")
+        return jsonify(rows_to_list(rows))
+    # POST — file upload
+    f = request.files.get("file")
+    if not f:
+        return err("file required")
+    data = f.read()
+    if len(data) > 5 * 1024 * 1024:
+        return err("File too large (max 5 MB)")
+    u = get_current_user()
+    uid = u["id"] if u else DEFAULT_USER_ID
+    task_id = request.form.get("task_id")
+    recon_id = request.form.get("recon_id")
+    cur = run("INSERT INTO attachments (task_id, recon_id, filename, content_type, data, uploaded_by) VALUES (?,?,?,?,?,?)",
+              (task_id, recon_id, f.filename, f.content_type or "application/octet-stream", data, uid))
+    return jsonify({"id": cur.lastrowid, "filename": f.filename}), 201
+
+@app.route("/api/attachments/<int:att_id>/download", methods=["GET"])
+@login_required
+def download_attachment(att_id):
+    _ensure_new_features_schema()
+    row = q1("SELECT filename, content_type, data FROM attachments WHERE id=?", (att_id,))
+    if not row:
+        return err("Not found", 404)
+    from flask import Response
+    return Response(bytes(row["data"]), mimetype=row["content_type"] or "application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'})
+
+@app.route("/api/attachments/<int:att_id>", methods=["DELETE", "OPTIONS"])
+@admin_required
+@csrf_protect
+def delete_attachment(att_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    run("DELETE FROM attachments WHERE id=?", (att_id,))
+    return jsonify({"deleted": att_id})
+
+# ── Feature 9: Journal Entries ─────────────────────────────────────────────────
+
+@app.route("/api/journal_entries", methods=["GET", "OPTIONS"])
+@login_required
+def get_journal_entries():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    period_id = request.args.get("period_id")
+    if not period_id:
+        active = q1("SELECT id FROM periods WHERE is_active=1")
+        period_id = active["id"] if active else None
+    if not period_id:
+        return jsonify([])
+    rows = q("""SELECT je.*, u1.name AS preparer_name, u2.name AS reviewer_name
+                FROM journal_entries je
+                LEFT JOIN users u1 ON u1.id = je.preparer_id
+                LEFT JOIN users u2 ON u2.id = je.reviewer_id
+                WHERE je.period_id=? ORDER BY je.id DESC""", (period_id,))
+    return jsonify(rows_to_list(rows))
+
+@app.route("/api/journal_entries", methods=["POST"])
+@login_required
+@csrf_protect
+def create_journal_entry():
+    _ensure_new_features_schema()
+    b = request.get_json(silent=True) or {}
+    desc = (b.get("description") or "").strip()
+    period_id = b.get("period_id")
+    if not desc or not period_id:
+        return err("description and period_id required")
+    u = get_current_user()
+    uid = u["id"] if u else DEFAULT_USER_ID
+    cur = run("""INSERT INTO journal_entries (period_id, je_number, description, debit_account, credit_account,
+                 amount, preparer_id, reviewer_id, status, prepared_at, notes)
+                 VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)""",
+              (period_id, b.get("je_number", ""), desc, b.get("debit_account", ""),
+               b.get("credit_account", ""), b.get("amount"), uid, b.get("reviewer_id"),
+               b.get("status", "draft"), b.get("notes", "")))
+    run("INSERT INTO task_activity (task_id, user_id, action, new_value) VALUES (?,?,?,?)",
+        (cur.lastrowid, uid, "created", f"je:{desc}"))
+    return jsonify({"id": cur.lastrowid}), 201
+
+@app.route("/api/journal_entries/<int:jeid>", methods=["PATCH", "DELETE", "OPTIONS"])
+@login_required
+@csrf_protect
+def manage_journal_entry(jeid):
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_new_features_schema()
+    if request.method == "DELETE":
+        u = get_current_user()
+        if u["role"] != "admin":
+            return err("Admin required", 403)
+        run("DELETE FROM journal_entries WHERE id=?", (jeid,))
+        return jsonify({"deleted": jeid})
+    b = request.get_json(silent=True) or {}
+    allowed = {"status", "notes", "reviewer_id", "je_number", "description",
+               "debit_account", "credit_account", "amount", "approved_at", "submitted_at"}
+    updates = {k: v for k, v in b.items() if k in allowed}
+    if not updates:
+        return err("No valid fields")
+    u = get_current_user()
+    uid = u["id"] if u else DEFAULT_USER_ID
+    old = q1("SELECT status FROM journal_entries WHERE id=?", (jeid,))
+    if updates.get("status") == "submitted" and (old["status"] if old else "") != "submitted":
+        updates["submitted_at"] = datetime.now(timezone.utc).isoformat()
+    if updates.get("status") == "approved" and (old["status"] if old else "") != "approved":
+        updates["approved_at"] = datetime.now(timezone.utc).isoformat()
+    safe_update("journal_entries", "id", allowed, updates, jeid)
+    run("INSERT INTO task_activity (task_id, user_id, action, old_value, new_value) VALUES (?,?,?,?,?)",
+        (jeid, uid, "status_change", old["status"] if old else None, updates.get("status", "")))
+    row = q1("""SELECT je.*, u1.name AS preparer_name, u2.name AS reviewer_name
+                FROM journal_entries je
+                LEFT JOIN users u1 ON u1.id = je.preparer_id
+                LEFT JOIN users u2 ON u2.id = je.reviewer_id
+                WHERE je.id=?""", (jeid,))
+    return jsonify(dict(row)) if row else err("Not found", 404)
+
+# ── Feature 10: Task Activity ──────────────────────────────────────────────────
+
+@app.route("/api/tasks/<int:tid>/activity", methods=["GET", "OPTIONS"])
+@login_required
+def get_task_activity(tid):
+    if request.method == "OPTIONS":
+        return "", 204
+    rows = q("""SELECT ta.*, u.name AS user_name, u.initials AS user_initials
+                FROM task_activity ta
+                LEFT JOIN users u ON u.id = ta.user_id
+                WHERE ta.task_id=? ORDER BY ta.created_at ASC""", (tid,))
+    return jsonify(rows_to_list(rows))
+
+# ── Feature 12/13: Analytics / Time-to-Close ──────────────────────────────────
+
+@app.route("/api/analytics/time_to_close", methods=["GET", "OPTIONS"])
+@login_required
+def time_to_close():
+    if request.method == "OPTIONS":
+        return "", 204
+    _ensure_period_close_columns()
+    rows = q("""SELECT id, label, end_date, closed_at
+                FROM periods WHERE is_closed=1 AND closed_at IS NOT NULL
+                ORDER BY end_date ASC""")
+    result = []
+    for r in rows:
+        try:
+            end = r["end_date"]
+            closed = r["closed_at"]
+            if end and closed:
+                from datetime import datetime as _dt
+                d_end = _dt.fromisoformat(end[:10])
+                d_closed = _dt.fromisoformat(closed[:19].replace("T", " ").split(".")[0])
+                days = max(0, (d_closed.date() - d_end.date()).days)
+            else:
+                days = None
+        except Exception:
+            days = None
+        result.append({"id": r["id"], "label": r["label"], "end_date": r["end_date"],
+                        "closed_at": r["closed_at"], "days_to_close": days})
+    return jsonify(result)
 
 # ── Frontend ──────────────────────────────────────────────────────────────────
 
