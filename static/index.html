@@ -38,6 +38,29 @@
 <script type="text/babel">
 const {useState,useEffect,useCallback,useRef} = React;
 
+// Error boundary — without this, any render error in a child collapses the
+// whole tree to a blank screen. This renders the stack inline so we can see
+// what went wrong in production (there is no separate dev build).
+class ErrorBoundary extends React.Component{
+  constructor(p){super(p);this.state={err:null};}
+  static getDerivedStateFromError(e){return {err:e};}
+  componentDidCatch(e,info){console.error("ErrorBoundary caught:",e,info);this.setState({err:e,info});}
+  reset=()=>this.setState({err:null,info:null});
+  render(){
+    if(!this.state.err)return this.props.children;
+    const msg=this.state.err?.message||String(this.state.err);
+    const stack=this.state.err?.stack||"";
+    const compStack=this.state.info?.componentStack||"";
+    return <div style={{padding:"24px 28px",background:"#0d1117",color:"#f87171",fontFamily:"'DM Mono',monospace",fontSize:12.5,lineHeight:1.5,minHeight:"100vh"}}>
+      <div style={{fontSize:16,fontWeight:700,marginBottom:12}}>⚠ React crashed while rendering {this.props.label||"this tab"}</div>
+      <div style={{color:"#e2e8f0",marginBottom:8}}>{msg}</div>
+      {stack&&<pre style={{background:"#111827",padding:12,borderRadius:8,overflow:"auto",maxHeight:260,color:"#94a3b8",fontSize:11.5,whiteSpace:"pre-wrap"}}>{stack}</pre>}
+      {compStack&&<pre style={{background:"#111827",padding:12,borderRadius:8,overflow:"auto",maxHeight:200,color:"#64748b",fontSize:11.5,whiteSpace:"pre-wrap",marginTop:10}}>{compStack}</pre>}
+      <button onClick={this.reset} style={{marginTop:12,padding:"6px 14px",background:"#4f8ef718",border:"1px solid #4f8ef740",color:"#4f8ef7",borderRadius:8,fontSize:12,cursor:"pointer"}}>Try again</button>
+    </div>;
+  }
+}
+
 let _csrfToken="";
 async function api(path,opts={}){
   const method=(opts.method||"GET").toUpperCase();
@@ -373,7 +396,9 @@ function CloseApp(){
 
     useEffect(()=>{
       if(!reconPeriodId)return;
-      api(`/api/reconciliations?period_id=${reconPeriodId}`).then(setRecons).catch(e=>setReconErr(e.message));
+      api(`/api/reconciliations?period_id=${reconPeriodId}`)
+        .then(rs=>setRecons(Array.isArray(rs)?rs:[]))
+        .catch(e=>{setReconErr(e.message);setRecons([]);});
     },[reconPeriodId]);
 
     const selPeriod=reconPeriods.find(p=>p.id===reconPeriodId)||period;
@@ -1230,11 +1255,11 @@ function CloseApp(){
           </div>
         </div>
       </div>
-      {tab==="dashboard"&&<Dashboard/>}
-      {tab==="checklist"&&<Checklist/>}
-      {tab==="recons"&&<Reconciliations/>}
-      {tab==="reports"&&<Reports/>}
-      {tab==="settings"&&isAdmin&&<Settings/>}
+      {tab==="dashboard"&&<ErrorBoundary label="Dashboard"><Dashboard/></ErrorBoundary>}
+      {tab==="checklist"&&<ErrorBoundary label="Checklist"><Checklist/></ErrorBoundary>}
+      {tab==="recons"&&<ErrorBoundary label="Reconciliations"><Reconciliations/></ErrorBoundary>}
+      {tab==="reports"&&<ErrorBoundary label="Reports"><Reports/></ErrorBoundary>}
+      {tab==="settings"&&isAdmin&&<ErrorBoundary label="Settings"><Settings/></ErrorBoundary>}
     </div>
     {selectedTask&&<TaskModal/>}
   </div>);
