@@ -155,6 +155,8 @@ function CloseApp(){
   }
 
   const [syncMsg,setSyncMsg]=useState(null);
+  const [qbStatus,setQbStatus]=useState(null);
+  useEffect(()=>{api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>{});},[]);
   async function syncQB(){
     setSyncing(true);setSyncMsg(null);
     try{
@@ -513,9 +515,6 @@ function CloseApp(){
       if(!confirm("Delete this task?"))return;
       try{await api(`/api/tasks/${id}`,{method:"DELETE"});await loadAll();}catch(e){alert(e.message);}
     }
-
-    const [qbStatus,setQbStatus]=useState(null);
-    useEffect(()=>{api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>{});},[]);
 
     const stabs=["users","categories","tasks","quickbooks","groups"];
 
