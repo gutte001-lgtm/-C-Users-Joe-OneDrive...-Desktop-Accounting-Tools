@@ -407,6 +407,12 @@ hardening port, the state of the repo is:
   merge (QB history sweep, close-period workflow, compare modes +
   `/api/qb/diagnose`, React error boundary). Remote branch kept until
   Joe confirms it works in the browser, then delete per §6.
+- `claude/fix-qb-reporting-sync-3gSlS` — landed on `master` via `--no-ff`
+  merge `51b249e` (Reconciliations-tab crash fix: hoisted `qbStatus`
+  state out of `Settings()` and into `CloseApp()` so
+  `Reconciliations()` can reach it via closure; prior version threw
+  `ReferenceError: qbStatus is not defined` on render). Single-commit
+  branch; remote deleted after merge.
 
 When in doubt, ask Joe before merging or deleting any of the
 unmerged-but-still-present branches above.
