@@ -381,9 +381,15 @@ hardening port, the state of the repo is:
   view, bulk actions, recon attachments, templates, flux analysis,
   review queue. Kept for reference; merging it requires real conflict
   resolution against the `master` Reports tab.
-- **`claude/close-tool-next-steps-8Y8oZ`** — period rollover, period
-  close/reopen, SMTP + Slack notifications, activity timeline. Good
-  next-consolidation candidate.
+- **`claude/close-tool-next-steps-8Y8oZ`** — novel features mined onto
+  `master` via commit `3cf3b3f` (2026-04-23): rollover endpoint, task
+  activity GET endpoint, recon activity log + ReconModal, task
+  frequency/due_offset, notifications.py SMTP+Slack infrastructure.
+  Branch NOT merged directly — it conflicted with master's QB/auth
+  hardening (older stale versions of those files). Remaining unique
+  content: period lock UI, some notification wiring in task/recon
+  PATCHes not yet connected. Branch can be deleted once Joe confirms
+  the features work.
 - **`claude/organize-files-JGYzh`** — moves the tool into a
   `close-tool/` subfolder for multi-project workspace layout.
   Conflicts with every other branch.
