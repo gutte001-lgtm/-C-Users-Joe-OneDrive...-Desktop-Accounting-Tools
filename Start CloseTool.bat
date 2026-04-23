@@ -1,6 +1,6 @@
 @echo off
 title CloseTool - Running
-cd /d "C:\Users\Joe\OneDrive - Healthcare Markets DBA\Desktop\Accounting Tools"
+cd /d "%~dp0"
 
 :: Open browser after 3 seconds (in background)
 start "" /min powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 3; Start-Process 'http://127.0.0.1:5000'"
