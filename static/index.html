@@ -178,6 +178,8 @@ function CloseApp(){
   const [filterCat,setFilterCat]=useState(null);
   const [syncing,setSyncing]=useState(false);
   const [loading,setLoading]=useState(true);
+  const [myTasksOnly,setMyTasksOnly]=useState(false);
+  const [openIssuesCount,setOpenIssuesCount]=useState(0);
   const [qbToast,setQbToast]=useState(()=>{
     const p=new URLSearchParams(window.location.search);
     if(p.get("qb")==="connected"){window.history.replaceState({},"","/");return {kind:"connected"};}
@@ -292,7 +294,11 @@ function CloseApp(){
     setSyncing(false);
   }
 
-  const filteredTasks=tasks.filter(t=>(!filterUser||t.assignee_id===filterUser||t.reviewer_id===filterUser)&&(!filterCat||t.category_id===filterCat));
+  const filteredTasks=tasks.filter(t=>
+    (!filterUser||t.assignee_id===filterUser||t.reviewer_id===filterUser)&&
+    (!filterCat||t.category_id===filterCat)&&
+    (!myTasksOnly||(t.assignee_id===currentUser?.id||t.reviewer_id===currentUser?.id))
+  );
   const groupedTasks=cats.reduce((acc,c)=>{const ct=filteredTasks.filter(t=>t.category_id===c.id);if(ct.length)acc[c.name]={cat:c,tasks:ct};return acc},{});
 
   const S={
@@ -300,7 +306,7 @@ function CloseApp(){
     sidebar:{width:230,background:"#111827",borderRight:"1px solid #1e2d3d",padding:"24px 0",display:"flex",flexDirection:"column",gap:4,flexShrink:0},
     main:{flex:1,overflow:"auto",padding:"28px 32px"},
     card:{background:"#111827",border:"1px solid #1e2d3d",borderRadius:12,padding:"18px 22px"},
-    kpiGrid:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24},
+    kpiGrid:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16,marginBottom:24},
     th:{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase",padding:"8px 12px",borderBottom:"1px solid #1e2d3d",textAlign:"left",fontWeight:500},
     td:{padding:"11px 12px",borderBottom:"1px solid #0d1117",fontSize:13.5,verticalAlign:"middle"},
     filterBar:{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap",alignItems:"center"},
@@ -328,19 +334,23 @@ function CloseApp(){
       daysColor=bd>TARGET_DAYS?"#f87171":bd>=TARGET_DAYS-1?"#f7c948":"#4fd9a0";
       daysPct=Math.min(Math.round(bd/TARGET_DAYS*100),100);
     }
+    const issuesBadgeColor=dash.open_issues>0?"#f87171":"#4fd9a0";
+    const avgDays=dash.avg_days_to_close;
     const kpis=[
       {label:"Close Progress",value:dash.close_pct+"%",sub:`${dash.tasks_complete} of ${dash.tasks_total} tasks`,color:"#4f8ef7",pct:dash.close_pct},
       {label:"Approved",value:dash.approval_pct+"%",sub:`${dash.tasks_approved} reviewed & signed`,color:"#4fd9a0",pct:dash.approval_pct},
       {label:"Reconciliations",value:dash.recon_pct+"%",sub:`${dash.recon_done} of ${dash.recon_total} accounts`,color:"#c084fc",pct:dash.recon_pct},
       {label:"Days to Close",value:daysValue,sub:daysSub,color:daysColor,pct:daysPct},
+      {label:"Open Issues",value:String(dash.open_issues||0),sub:dash.open_issues?"Needs resolution":"All clear",color:issuesBadgeColor,pct:0,noBar:true,link:"issues"},
+      {label:"Avg Days to Close",value:avgDays!=null?String(avgDays)+"d":"—",sub:avgDays!=null?`Historical avg across ${avgDays!=null?"closed":"0"} periods`:"No closed periods yet",color:"#f7c948",pct:0,noBar:true},
     ];
     return(<div>
       <div style={S.kpiGrid}>{kpis.map(k=>(
-        <div key={k.label} style={S.card}>
+        <div key={k.label} style={{...S.card,cursor:k.link?"pointer":"default"}} onClick={k.link?()=>setTab(k.link):undefined}>
           <div style={{fontSize:11,color:"#64748b",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase"}}>{k.label}</div>
           <div style={{fontSize:32,fontWeight:800,color:k.color,lineHeight:1.1,margin:"6px 0 4px"}}>{k.value}</div>
           <div style={{fontSize:11.5,color:"#64748b"}}>{k.sub}</div>
-          <ProgressBar pct={k.pct} color={k.color}/>
+          {!k.noBar&&<ProgressBar pct={k.pct} color={k.color}/>}
         </div>
       ))}</div>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
@@ -388,10 +398,15 @@ function CloseApp(){
   // ── Checklist ───────────────────────────────────────────────────────────────
   function Checklist(){
     if(loading)return <Spinner/>;
+    const today=new Date();today.setHours(0,0,0,0);
+    const isOverdue=(t)=>t.due_date&&t.status!=="complete"&&new Date(t.due_date+"T00:00:00")<today;
+    const overdueDays=(t)=>{if(!isOverdue(t))return 0;return Math.round((today-new Date(t.due_date+"T00:00:00"))/86400000);};
     const canEdit=(t)=>isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
     return(<div>
       <div style={S.filterBar}>
-        <button style={S.filterBtn(!filterUser&&!filterCat)} onClick={()=>{setFilterUser(null);setFilterCat(null);}}>All</button>
+        <button style={S.filterBtn(!filterUser&&!filterCat&&!myTasksOnly)} onClick={()=>{setFilterUser(null);setFilterCat(null);setMyTasksOnly(false);}}>All</button>
+        <button style={S.filterBtn(myTasksOnly)} onClick={()=>setMyTasksOnly(!myTasksOnly)}>My Tasks</button>
+        <span style={{width:1,background:"#1e2d3d",margin:"0 4px",height:20,display:"inline-block"}}/>
         {users.map(u=><button key={u.id} style={S.filterBtn(filterUser===u.id)} onClick={()=>setFilterUser(filterUser===u.id?null:u.id)}>{u.initials}</button>)}
         <span style={{width:1,background:"#1e2d3d",margin:"0 4px",height:20,display:"inline-block"}}/>
         {cats.map(c=><button key={c.id} style={S.filterBtn(filterCat===c.id)} onClick={()=>setFilterCat(filterCat===c.id?null:c.id)}>{c.name}</button>)}
@@ -404,15 +419,21 @@ function CloseApp(){
           </div>
           <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead><tr>{["Task","Assignee","Due","Status","Reviewer","Review"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
-            <tbody>{ct.map(t=>(
-              <tr key={t.id} style={{cursor:"pointer"}} onClick={()=>setSelectedTask(t)}>
-                <td style={{...S.td,fontWeight:500}}>{t.notes&&<span style={{color:"#f7c948",marginRight:6,fontSize:11}}>●</span>}{t.name}</td>
+            <tbody>{ct.map(t=>{
+              const od=isOverdue(t);
+              return(<tr key={t.id} style={{cursor:"pointer",borderLeft:od?"3px solid #f87171":"3px solid transparent"}} onClick={()=>setSelectedTask(t)}>
+                <td style={{...S.td,fontWeight:500}}>
+                  {t.notes&&<span style={{color:"#f7c948",marginRight:6,fontSize:11}}>●</span>}
+                  {t.recurrence&&t.recurrence!=="none"&&<span title={`Recurring: ${t.recurrence}`} style={{color:"#4f8ef7",marginRight:5,fontSize:10}}>↻</span>}
+                  {t.name}
+                  {od&&<span style={{marginLeft:8,fontSize:10,color:"#f87171",fontFamily:"'DM Mono',monospace"}}>{overdueDays(t)}d overdue</span>}
+                </td>
                 <td style={S.td}><Avatar user={{initials:t.assignee_initials,color:t.assignee_color}}/></td>
-                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#94a3b8"}}>{fmtDate(t.due_date)}</td>
+                <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:od?"#f87171":"#94a3b8"}}>{fmtDate(t.due_date)}</td>
                 <td style={S.td}>
                   {canEdit(t)
                     ?<select value={t.status} style={S.sel(SC[t.status]?.color||"#94a3b8")} onClick={e=>e.stopPropagation()} onChange={e=>{e.stopPropagation();patchTask(t.id,{status:e.target.value});}}>
-                      <option value="open">Open</option><option value="in_progress">In Progress</option><option value="complete">Complete</option>
+                      <option value="open">Open</option><option value="in_progress">In Progress</option><option value="submitted">Submitted</option><option value="complete">Complete</option>
                     </select>
                     :<Badge status={t.status}/>}
                 </td>
@@ -424,8 +445,8 @@ function CloseApp(){
                     </select>
                     :<Badge status={t.review_status} type="review"/>}
                 </td>
-              </tr>
-            ))}</tbody>
+              </tr>);
+            })}</tbody>
           </table>
         </div>
       ))}
@@ -534,23 +555,68 @@ function CloseApp(){
     const [notes,setNotes]=useState(selectedTask?.notes||"");
     const [editMode,setEditMode]=useState(false);
     const [editData,setEditData]=useState({});
-    useEffect(()=>{setNotes(selectedTask?.notes||"");setEditMode(false);},[selectedTask?.id]);
+    const [deps,setDeps]=useState([]);
+    const [attachments,setAttachments]=useState([]);
+    const [activity,setActivity]=useState([]);
+    const [activeSection,setActiveSection]=useState("details");
+    const [uploading,setUploading]=useState(false);
+    const fileRef=useRef(null);
+
+    useEffect(()=>{
+      if(!selectedTask?.id)return;
+      setNotes(selectedTask?.notes||"");setEditMode(false);setEditData({});setActiveSection("details");
+      api(`/api/tasks/${selectedTask.id}/dependencies`).then(setDeps).catch(()=>{});
+      api(`/api/attachments?task_id=${selectedTask.id}`).then(setAttachments).catch(()=>{});
+      api(`/api/tasks/${selectedTask.id}/activity`).then(setActivity).catch(()=>{});
+    },[selectedTask?.id]);
+
     if(!selectedTask)return null;
     const t=selectedTask;
     const assignee=users.find(u=>u.id===t.assignee_id);
     const reviewer=users.find(u=>u.id===t.reviewer_id);
     const canEdit=isAdmin||t.assignee_id===currentUser.id||t.reviewer_id===currentUser.id;
+    const isAssignee=t.assignee_id===currentUser.id;
+    const isReviewer=t.reviewer_id===currentUser.id;
+    const isBlocked=deps.some(d=>d.status!=="complete");
 
     async function saveEdit(){
       await patchTask(t.id,{...editData,notes});
       setEditMode(false);setEditData({});
     }
+    async function addDep(depId){
+      if(!depId)return;
+      await api(`/api/tasks/${t.id}/dependencies`,{method:"POST",body:JSON.stringify({depends_on_id:parseInt(depId)})});
+      const d=await api(`/api/tasks/${t.id}/dependencies`);setDeps(d);
+    }
+    async function removeDep(depId){
+      await api(`/api/tasks/${t.id}/dependencies/${depId}`,{method:"DELETE"});
+      setDeps(prev=>prev.filter(d=>d.id!==depId));
+    }
+    async function uploadFile(file){
+      if(!file)return;
+      setUploading(true);
+      const fd=new FormData();fd.append("file",file);fd.append("task_id",String(t.id));
+      try{
+        await fetch("/api/attachments",{method:"POST",headers:{"X-CSRF-Token":_csrfToken},body:fd});
+        const a=await api(`/api/attachments?task_id=${t.id}`);setAttachments(a);
+      }catch(e){alert(e.message);}
+      setUploading(false);
+    }
+    async function deleteAttachment(id){
+      if(!confirm("Delete attachment?"))return;
+      await api(`/api/attachments/${id}`,{method:"DELETE"});
+      setAttachments(prev=>prev.filter(a=>a.id!==id));
+    }
+    const sectionBtn=(id,label)=><button onClick={()=>setActiveSection(id)} style={{padding:"5px 12px",borderRadius:6,border:"none",background:activeSection===id?"#1e2d3d":"transparent",color:activeSection===id?"#e2e8f0":"#64748b",fontSize:12,cursor:"pointer"}}>{label}</button>;
 
     return(<div style={{position:"fixed",inset:0,background:"#0008",zIndex:100,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setSelectedTask(null)}>
-      <div style={{background:"#111827",border:"1px solid #1e2d3d",borderRadius:16,width:520,padding:28,maxHeight:"80vh",overflow:"auto"}} onClick={e=>e.stopPropagation()}>
-        <div style={{display:"flex",justifyContent:"space-between",marginBottom:18}}>
-          <div>
-            <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>{t.category_name}</div>
+      <div style={{background:"#111827",border:"1px solid #1e2d3d",borderRadius:16,width:580,padding:28,maxHeight:"88vh",overflow:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:11,color:"#4f8ef7",fontFamily:"'DM Mono',monospace",marginBottom:4}}>{t.category_name}
+              {t.recurrence&&t.recurrence!=="none"&&<span style={{marginLeft:8,color:"#64748b"}}>↻ {t.recurrence}</span>}
+              {isBlocked&&<span style={{marginLeft:8,color:"#f87171",fontWeight:700}}>⛔ Blocked</span>}
+            </div>
             {editMode&&isAdmin
               ?<input className="form-input" defaultValue={t.name} onChange={e=>setEditData(p=>({...p,name:e.target.value}))} style={{fontSize:15,fontWeight:700,width:"100%"}}/>
               :<div style={{fontSize:16,fontWeight:700,color:"#f1f5f9"}}>{t.name}</div>}
@@ -561,55 +627,112 @@ function CloseApp(){
           </div>
         </div>
 
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:18}}>
-          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
-            <div className="form-label">Assigned To</div>
-            {editMode&&isAdmin
-              ?<select className="form-select" defaultValue={t.assignee_id} onChange={e=>setEditData(p=>({...p,assignee_id:parseInt(e.target.value)}))}>
-                {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
-              </select>
-              :<div style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><Avatar user={assignee}/>{assignee?.name}</div>}
-          </div>
-          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
-            <div className="form-label">Reviewer</div>
-            {editMode&&isAdmin
-              ?<select className="form-select" defaultValue={t.reviewer_id} onChange={e=>setEditData(p=>({...p,reviewer_id:parseInt(e.target.value)}))}>
-                {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
-              </select>
-              :<div style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><Avatar user={reviewer}/>{reviewer?.name}</div>}
-          </div>
-          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
-            <div className="form-label">Due Date</div>
-            {editMode&&isAdmin
-              ?<input type="date" className="form-input" defaultValue={t.due_date||""} onChange={e=>setEditData(p=>({...p,due_date:e.target.value}))}/>
-              :<span style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>{fmtDate(t.due_date)}</span>}
-          </div>
-          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
-            <div className="form-label">Category</div>
-            {editMode&&isAdmin
-              ?<select className="form-select" defaultValue={t.category_id} onChange={e=>setEditData(p=>({...p,category_id:parseInt(e.target.value)}))}>
-                {cats.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              :<span style={{fontSize:13}}>{t.category_name}</span>}
-          </div>
-          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Status</div><Badge status={t.status}/></div>
-          <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Review</div><Badge status={t.review_status} type="review"/></div>
+        <div style={{display:"flex",gap:4,marginBottom:16,background:"#0d1117",borderRadius:8,padding:3}}>
+          {sectionBtn("details","Details")}{sectionBtn("deps","Dependencies")}{sectionBtn("files","Attachments")}{sectionBtn("history","History")}
         </div>
 
-        <div style={{marginBottom:14}}>
-          <div className="form-label">Notes</div>
-          <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Add notes or comments…" disabled={!canEdit}
-            style={{width:"100%",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:80,fontFamily:"'DM Sans',sans-serif",opacity:canEdit?1:.6}}/>
-        </div>
+        {activeSection==="details"&&<>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+              <div className="form-label">Assigned To</div>
+              {editMode&&isAdmin
+                ?<select className="form-select" defaultValue={t.assignee_id} onChange={e=>setEditData(p=>({...p,assignee_id:parseInt(e.target.value)}))}>
+                  {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+                :<div style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><Avatar user={assignee}/>{assignee?.name}</div>}
+            </div>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+              <div className="form-label">Reviewer</div>
+              {editMode&&isAdmin
+                ?<select className="form-select" defaultValue={t.reviewer_id} onChange={e=>setEditData(p=>({...p,reviewer_id:parseInt(e.target.value)}))}>
+                  {users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+                :<div style={{display:"flex",alignItems:"center",gap:8,fontSize:13}}><Avatar user={reviewer}/>{reviewer?.name}</div>}
+            </div>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+              <div className="form-label">Due Date</div>
+              {editMode&&isAdmin
+                ?<input type="date" className="form-input" defaultValue={t.due_date||""} onChange={e=>setEditData(p=>({...p,due_date:e.target.value}))}/>
+                :<span style={{fontFamily:"'DM Mono',monospace",fontSize:13}}>{fmtDate(t.due_date)}</span>}
+            </div>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}>
+              <div className="form-label">Category</div>
+              {editMode&&isAdmin
+                ?<select className="form-select" defaultValue={t.category_id} onChange={e=>setEditData(p=>({...p,category_id:parseInt(e.target.value)}))}>
+                  {cats.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                :<span style={{fontSize:13}}>{t.category_name}</span>}
+            </div>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Status</div><Badge status={t.status}/>{t.submitted_at&&<div style={{fontSize:10,color:"#64748b",marginTop:3,fontFamily:"'DM Mono',monospace"}}>Submitted {new Date(t.submitted_at).toLocaleDateString()}</div>}</div>
+            <div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px"}}><div className="form-label">Review</div><Badge status={t.review_status} type="review"/>{t.approved_at&&<div style={{fontSize:10,color:"#64748b",marginTop:3,fontFamily:"'DM Mono',monospace"}}>Approved {new Date(t.approved_at).toLocaleDateString()}</div>}</div>
+            {editMode&&isAdmin&&<div style={{background:"#0d1117",borderRadius:8,padding:"10px 12px",gridColumn:"1/-1"}}>
+              <div className="form-label">Recurrence</div>
+              <select className="form-select" defaultValue={t.recurrence||"none"} onChange={e=>setEditData(p=>({...p,recurrence:e.target.value}))}>
+                <option value="none">None (one-time)</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="yearly">Yearly</option>
+              </select>
+            </div>}
+          </div>
+          <div style={{marginBottom:14}}>
+            <div className="form-label">Notes</div>
+            <textarea value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Add notes or comments…" disabled={!canEdit}
+              style={{width:"100%",background:"#0d1117",border:"1px solid #1e2d3d",borderRadius:8,color:"#e2e8f0",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:72,fontFamily:"'DM Sans',sans-serif",opacity:canEdit?1:.6}}/>
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}}>
+            {editMode&&isAdmin&&<><button onClick={()=>{setEditMode(false);setEditData({});}} className="btn btn-ghost">Cancel</button><button onClick={saveEdit} className="btn btn-primary">Save Changes</button></>}
+            {!editMode&&canEdit&&<>
+              <button onClick={()=>patchTask(t.id,{notes}).then(()=>setSelectedTask(null))} className="btn btn-ghost">Save Note</button>
+              {(isAssignee||isAdmin)&&t.status==="in_progress"&&<button onClick={()=>patchTask(t.id,{status:"submitted",notes}).then(()=>setSelectedTask(null))} style={{padding:"8px 14px",borderRadius:8,border:"1px solid #f7c94840",background:"#f7c94818",color:"#f7c948",fontSize:13,fontWeight:600,cursor:"pointer"}}>Submit for Review</button>}
+              {(isAssignee||isAdmin)&&(t.status==="open"||t.status==="submitted")&&!t.submitted_at&&<button onClick={()=>patchTask(t.id,{status:"in_progress",notes})} className="btn btn-ghost">Mark In Progress</button>}
+              {(isAssignee||isAdmin)&&t.status!=="complete"&&t.review_status==="approved"&&<button onClick={()=>patchTask(t.id,{status:"complete",notes}).then(()=>setSelectedTask(null))} className="btn btn-success">Mark Complete</button>}
+              {(isAssignee||isAdmin)&&t.status!=="complete"&&t.review_status!=="approved"&&<button onClick={()=>patchTask(t.id,{status:"complete",notes}).then(()=>setSelectedTask(null))} className="btn btn-success">Mark Complete</button>}
+              {(isAdmin||isReviewer)&&t.status==="submitted"&&t.review_status!=="approved"&&<button onClick={()=>patchTask(t.id,{review_status:"needs_revision"}).then(()=>setSelectedTask(null))} className="btn btn-danger" style={{fontSize:13}}>Request Revision</button>}
+              {(isAdmin||isReviewer)&&(t.status==="submitted"||t.status==="complete")&&<button onClick={()=>patchTask(t.id,{review_status:"approved",notes}).then(()=>setSelectedTask(null))} className="btn btn-primary">Approve ✓</button>}
+            </>}
+          </div>
+        </>}
 
-        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-          {editMode&&isAdmin&&<><button onClick={()=>{setEditMode(false);setEditData({});}} className="btn btn-ghost">Cancel</button><button onClick={saveEdit} className="btn btn-primary">Save Changes</button></>}
-          {!editMode&&canEdit&&<>
-            <button onClick={()=>patchTask(t.id,{notes}).then(()=>setSelectedTask(null))} className="btn btn-ghost">Save Note</button>
-            <button onClick={()=>patchTask(t.id,{status:"complete",notes}).then(()=>setSelectedTask(null))} className="btn btn-success">Mark Complete</button>
-            {(isAdmin||t.reviewer_id===currentUser.id)&&<button onClick={()=>patchTask(t.id,{review_status:"approved",notes}).then(()=>setSelectedTask(null))} className="btn btn-primary">Approve ✓</button>}
-          </>}
-        </div>
+        {activeSection==="deps"&&<div>
+          <div style={{fontSize:12,color:"#64748b",marginBottom:12}}>This task is blocked until the following tasks are complete:</div>
+          {deps.length===0&&<div style={{fontSize:13,color:"#475569",padding:"12px 0"}}>No dependencies. This task can start immediately.</div>}
+          {deps.map(d=><div key={d.id} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 0",borderBottom:"1px solid #1a2535"}}>
+            <span style={{fontSize:13,flex:1}}>{d.name}</span>
+            <span style={{fontSize:11,color:d.status==="complete"?"#4fd9a0":"#f87171",fontFamily:"'DM Mono',monospace"}}>{d.status}</span>
+            {isAdmin&&<button onClick={()=>removeDep(d.id)} style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",fontSize:12}}>✕</button>}
+          </div>)}
+          {isAdmin&&<div style={{marginTop:14}}>
+            <div className="form-label">Add Dependency (task must complete first)</div>
+            <select className="form-select" defaultValue="" onChange={e=>{addDep(e.target.value);e.target.value="";}}>
+              <option value="">Select task…</option>
+              {tasks.filter(tk=>tk.id!==t.id&&!deps.find(d=>d.id===tk.id)).map(tk=><option key={tk.id} value={tk.id}>{tk.name}</option>)}
+            </select>
+          </div>}
+        </div>}
+
+        {activeSection==="files"&&<div>
+          {attachments.length===0&&<div style={{fontSize:13,color:"#475569",padding:"12px 0"}}>No attachments yet.</div>}
+          {attachments.map(a=><div key={a.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:"1px solid #1a2535"}}>
+            <span style={{fontSize:13,flex:1,fontFamily:"'DM Mono',monospace",fontSize:12}}>{a.filename}</span>
+            <span style={{fontSize:11,color:"#64748b"}}>{a.uploaded_by_name}</span>
+            <a href={`/api/attachments/${a.id}/download`} style={{fontSize:11,color:"#4f8ef7",textDecoration:"none"}} target="_blank">↓ Download</a>
+            {isAdmin&&<button onClick={()=>deleteAttachment(a.id)} style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",fontSize:12}}>✕</button>}
+          </div>)}
+          {canEdit&&<div style={{marginTop:14}}>
+            <input ref={fileRef} type="file" style={{display:"none"}} onChange={e=>uploadFile(e.target.files[0])}/>
+            <button onClick={()=>fileRef.current?.click()} disabled={uploading} className="btn btn-ghost" style={{fontSize:12}}>{uploading?"Uploading…":"+ Attach File"}</button>
+            <span style={{fontSize:11,color:"#475569",marginLeft:10}}>Max 5 MB</span>
+          </div>}
+        </div>}
+
+        {activeSection==="history"&&<div>
+          {activity.length===0&&<div style={{fontSize:13,color:"#475569",padding:"12px 0"}}>No activity yet.</div>}
+          {activity.map(a=><div key={a.id} style={{padding:"7px 0",borderBottom:"1px solid #1a2535",fontSize:12}}>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <span style={{fontWeight:600,color:"#94a3b8"}}>{a.user_name||"System"}</span>
+              <span style={{color:"#475569",fontFamily:"'DM Mono',monospace",fontSize:11}}>{new Date(a.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})}</span>
+            </div>
+            <div style={{color:"#64748b",marginTop:2}}>{a.action.replace(/_/g," ")}{a.old_value&&a.new_value?`: ${a.old_value} → ${a.new_value}`:a.new_value?`: ${a.new_value}`:""}</div>
+          </div>)}
+        </div>}
       </div>
     </div>);
   }
@@ -670,7 +793,7 @@ function CloseApp(){
     const [qbStatus,setQbStatus]=useState(null);
     useEffect(()=>{api("/api/qb/status").then(s=>setQbStatus(s)).catch(()=>{});},[]);
 
-    const stabs=["users","categories","tasks","quickbooks","groups"];
+    const stabs=["users","categories","tasks","quickbooks","groups","rollforward","templates"];
 
     // Report Groups state (loaded lazily when groups tab opens)
     const [groupRtype,setGroupRtype]=useState("pl");
@@ -894,6 +1017,125 @@ function CloseApp(){
         ))}
       </div>}
 
+      {/* ROLL FORWARD */}
+      {settingsTab==="rollforward"&&(()=>{
+        const [rfSrc,setRfSrc]=useState("");
+        const [rfDst,setRfDst]=useState("");
+        const [rfMsg,setRfMsg]=useState(null);
+        async function doRollforward(){
+          if(!rfSrc||!rfDst){alert("Select source and target periods.");return;}
+          if(rfSrc===rfDst){alert("Source and target must be different periods.");return;}
+          if(!confirm("Copy all tasks from the source period into the target period? Existing tasks in the target will not be removed."))return;
+          try{
+            const r=await api(`/api/periods/${rfSrc}/rollforward`,{method:"POST",body:JSON.stringify({target_period_id:parseInt(rfDst)})});
+            setRfMsg({ok:true,text:`Copied ${r.copied} task${r.copied===1?"":"s"} into the target period.`});
+            await loadAll();
+          }catch(e){setRfMsg({ok:false,text:e.message});}
+        }
+        return <div style={S.card}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:4}}>Roll Forward Tasks</div>
+          <div style={{fontSize:12,color:"#475569",marginBottom:20}}>Copy all tasks from a prior period into a new period to seed the close checklist.</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+            <div><div className="form-label">Source Period (copy from)</div>
+              <select className="form-select" value={rfSrc} onChange={e=>setRfSrc(e.target.value)}>
+                <option value="">Select…</option>{allPeriods.filter(p=>(p.period_type||"month")==="month").sort((a,b)=>b.start_date.localeCompare(a.start_date)).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+              </select></div>
+            <div><div className="form-label">Target Period (copy into)</div>
+              <select className="form-select" value={rfDst} onChange={e=>setRfDst(e.target.value)}>
+                <option value="">Select…</option>{allPeriods.filter(p=>(p.period_type||"month")==="month").sort((a,b)=>b.start_date.localeCompare(a.start_date)).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+              </select></div>
+          </div>
+          {rfMsg&&<div style={{marginBottom:12,padding:"10px 14px",borderRadius:8,fontSize:12,background:rfMsg.ok?"#4fd9a018":"#f8717118",border:`1px solid ${rfMsg.ok?"#4fd9a040":"#f8717140"}`,color:rfMsg.ok?"#4fd9a0":"#f87171"}}>{rfMsg.text}</div>}
+          <button className="btn btn-primary" onClick={doRollforward}>↻ Roll Forward</button>
+        </div>;
+      })()}
+
+      {/* TEMPLATES */}
+      {settingsTab==="templates"&&(()=>{
+        const [tmpls,setTmpls]=useState([]);
+        const [selTmpl,setSelTmpl]=useState(null);
+        const [tmplTasks,setTmplTasks]=useState([]);
+        const [newTmpl,setNewTmpl]=useState({name:"",period_type:"monthly",description:""});
+        const [newTT,setNewTT]=useState({title:"",category_id:"",assignee_id:"",reviewer_id:"",day_target:""});
+        const [applyPeriod,setApplyPeriod]=useState("");
+        const [tmplMsg,setTmplMsg]=useState(null);
+        useEffect(()=>{api("/api/templates").then(setTmpls).catch(()=>{});},[]);
+        useEffect(()=>{if(selTmpl)api(`/api/templates/${selTmpl.id}/tasks`).then(setTmplTasks).catch(()=>{});},[selTmpl?.id]);
+        async function addTmpl(){
+          if(!newTmpl.name.trim()){alert("Name required.");return;}
+          try{const r=await api("/api/templates",{method:"POST",body:JSON.stringify(newTmpl)});const list=await api("/api/templates");setTmpls(list);setNewTmpl({name:"",period_type:"monthly",description:""});}
+          catch(e){alert(e.message);}
+        }
+        async function deleteTmpl(id){
+          if(!confirm("Delete template?"))return;
+          try{await api(`/api/templates/${id}`,{method:"DELETE"});setTmpls(prev=>prev.filter(t=>t.id!==id));if(selTmpl?.id===id)setSelTmpl(null);}
+          catch(e){alert(e.message);}
+        }
+        async function addTT(){
+          if(!newTT.title.trim()||!selTmpl){alert("Title required.");return;}
+          try{await api(`/api/templates/${selTmpl.id}/tasks`,{method:"POST",body:JSON.stringify({...newTT,category_id:newTT.category_id?parseInt(newTT.category_id):null,assignee_id:newTT.assignee_id?parseInt(newTT.assignee_id):null,reviewer_id:newTT.reviewer_id?parseInt(newTT.reviewer_id):null,day_target:newTT.day_target?parseInt(newTT.day_target):null})});const tt=await api(`/api/templates/${selTmpl.id}/tasks`);setTmplTasks(tt);setNewTT({title:"",category_id:"",assignee_id:"",reviewer_id:"",day_target:""});}
+          catch(e){alert(e.message);}
+        }
+        async function removeTT(ttid){
+          await api(`/api/templates/${selTmpl.id}/tasks/${ttid}`,{method:"DELETE"});setTmplTasks(prev=>prev.filter(t=>t.id!==ttid));
+        }
+        async function applyTmpl(){
+          if(!selTmpl||!applyPeriod){alert("Select a template and target period.");return;}
+          try{const r=await api(`/api/templates/${selTmpl.id}/apply`,{method:"POST",body:JSON.stringify({period_id:parseInt(applyPeriod)})});setTmplMsg({ok:true,text:`Created ${r.created} task${r.created===1?"":"s"}.`});await loadAll();}
+          catch(e){setTmplMsg({ok:false,text:e.message});}
+        }
+        return <div style={{display:"grid",gridTemplateColumns:"260px 1fr",gap:16}}>
+          <div style={S.card}>
+            <div style={{fontSize:12,fontWeight:600,color:"#94a3b8",marginBottom:12}}>Templates</div>
+            {tmpls.map(t=><div key={t.id} onClick={()=>setSelTmpl(t)} style={{padding:"8px 10px",borderRadius:8,cursor:"pointer",background:selTmpl?.id===t.id?"#1e2d3d":"transparent",marginBottom:4,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:13,color:"#e2e8f0"}}>{t.name}</span>
+              <button onClick={e=>{e.stopPropagation();deleteTmpl(t.id);}} style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",fontSize:12}}>✕</button>
+            </div>)}
+            <div style={{marginTop:12,borderTop:"1px solid #1e2d3d",paddingTop:12}}>
+              <input className="form-input" placeholder="Template name" value={newTmpl.name} onChange={e=>setNewTmpl(p=>({...p,name:e.target.value}))} style={{marginBottom:6}}/>
+              <select className="form-select" value={newTmpl.period_type} onChange={e=>setNewTmpl(p=>({...p,period_type:e.target.value}))} style={{marginBottom:6}}>
+                <option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="yearly">Yearly</option>
+              </select>
+              <button className="btn btn-primary" style={{width:"100%",fontSize:12}} onClick={addTmpl}>+ New Template</button>
+            </div>
+          </div>
+          <div style={S.card}>
+            {!selTmpl&&<div style={{color:"#475569",fontSize:13}}>Select a template to manage its tasks.</div>}
+            {selTmpl&&<>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                <div style={{fontSize:13,fontWeight:600,color:"#94a3b8"}}>{selTmpl.name} — Tasks</div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                  <select className="form-select" value={applyPeriod} onChange={e=>setApplyPeriod(e.target.value)} style={{fontSize:12,padding:"5px 8px",minWidth:130}}>
+                    <option value="">Apply to period…</option>{allPeriods.filter(p=>(p.period_type||"month")==="month").sort((a,b)=>b.start_date.localeCompare(a.start_date)).map(p=><option key={p.id} value={p.id}>{p.label}</option>)}
+                  </select>
+                  <button className="btn btn-primary" style={{fontSize:12,padding:"5px 12px"}} onClick={applyTmpl}>Apply</button>
+                </div>
+              </div>
+              {tmplMsg&&<div style={{marginBottom:12,padding:"8px 12px",borderRadius:7,fontSize:12,background:tmplMsg.ok?"#4fd9a018":"#f8717118",color:tmplMsg.ok?"#4fd9a0":"#f87171"}}>{tmplMsg.text}</div>}
+              {tmplTasks.map(tt=><div key={tt.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:"1px solid #1a2535",fontSize:12}}>
+                <span style={{flex:1,color:"#e2e8f0"}}>{tt.title}</span>
+                {tt.day_target&&<span style={{color:"#64748b",fontFamily:"'DM Mono',monospace"}}>Day {tt.day_target}</span>}
+                <button onClick={()=>removeTT(tt.id)} style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",fontSize:12}}>✕</button>
+              </div>)}
+              <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                <input className="form-input" placeholder="Task title" value={newTT.title} onChange={e=>setNewTT(p=>({...p,title:e.target.value}))} style={{gridColumn:"1/-1"}}/>
+                <select className="form-select" value={newTT.category_id} onChange={e=>setNewTT(p=>({...p,category_id:e.target.value}))}>
+                  <option value="">Category…</option>{cats.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <input className="form-input" type="number" placeholder="Target day #" value={newTT.day_target} onChange={e=>setNewTT(p=>({...p,day_target:e.target.value}))}/>
+                <select className="form-select" value={newTT.assignee_id} onChange={e=>setNewTT(p=>({...p,assignee_id:e.target.value}))}>
+                  <option value="">Assignee…</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+                <select className="form-select" value={newTT.reviewer_id} onChange={e=>setNewTT(p=>({...p,reviewer_id:e.target.value}))}>
+                  <option value="">Reviewer…</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+                <button className="btn btn-primary" style={{gridColumn:"1/-1",fontSize:12}} onClick={addTT}>+ Add Task to Template</button>
+              </div>
+            </>}
+          </div>
+        </div>;
+      })()}
+
       {showAddTask&&<Modal title="Add Task" onClose={()=>setShowAddTask(false)}>
         <div className="form-group"><label className="form-label">Task Name</label><input className="form-input" value={newTask.name} onChange={e=>setNewTask(p=>({...p,name:e.target.value}))}/></div>
         <div className="form-group"><label className="form-label">Category</label>
@@ -918,6 +1160,267 @@ function CloseApp(){
           <button className="btn btn-primary" onClick={addTask}>Add Task</button>
         </div>
       </Modal>}
+    </div>);
+  }
+
+  // ── Open Items / Issues ─────────────────────────────────────────────────────
+  function OpenItems(){
+    const [items,setItems]=useState([]);
+    const [showNew,setShowNew]=useState(false);
+    const [newItem,setNewItem]=useState({title:"",description:"",priority:"medium",assigned_to:""});
+    const [busy,setBusy]=useState(false);
+
+    const load=useCallback(async()=>{
+      if(!period?.id)return;
+      const r=await api(`/api/open_items?period_id=${period.id}`).catch(()=>[]);
+      setItems(Array.isArray(r)?r:[]);
+      setOpenIssuesCount((Array.isArray(r)?r:[]).filter(x=>x.status==="open").length);
+    },[period?.id]);
+    useEffect(()=>{load();},[load]);
+
+    async function createItem(){
+      if(!newItem.title.trim()){alert("Title required.");return;}
+      setBusy(true);
+      try{await api("/api/open_items",{method:"POST",body:JSON.stringify({...newItem,period_id:period.id,assigned_to:newItem.assigned_to?parseInt(newItem.assigned_to):null})});
+        setShowNew(false);setNewItem({title:"",description:"",priority:"medium",assigned_to:""});await load();}
+      catch(e){alert(e.message);}
+      setBusy(false);
+    }
+    async function resolveItem(id){
+      await api(`/api/open_items/${id}`,{method:"PATCH",body:JSON.stringify({status:"resolved"})}).catch(()=>{});await load();
+    }
+    async function reopenItem(id){
+      await api(`/api/open_items/${id}`,{method:"PATCH",body:JSON.stringify({status:"open"})}).catch(()=>{});await load();
+    }
+    async function deleteItem(id){
+      if(!confirm("Delete this issue?"))return;
+      await api(`/api/open_items/${id}`,{method:"DELETE"}).catch(()=>{});await load();
+    }
+    const PC={high:"#f87171",medium:"#f7c948",low:"#64748b"};
+    const open=items.filter(x=>x.status==="open");
+    const resolved=items.filter(x=>x.status!=="open");
+    return(<div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div/>
+        <button className="btn btn-primary" style={{fontSize:12}} onClick={()=>setShowNew(true)}>+ New Issue</button>
+      </div>
+      {[["Open",open],["Resolved",resolved]].map(([label,list])=>list.length>0&&(
+        <div key={label} style={{...S.card,marginBottom:14}}>
+          <div style={{fontSize:12,fontWeight:700,color:label==="Open"?"#f87171":"#4fd9a0",fontFamily:"'DM Mono',monospace",letterSpacing:.5,textTransform:"uppercase",marginBottom:10}}>{label} ({list.length})</div>
+          {list.map(item=><div key={item.id} style={{padding:"10px 0",borderBottom:"1px solid #1a2535",display:"flex",gap:12,alignItems:"flex-start"}}>
+            <div style={{flex:1}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                <span style={{fontSize:10,padding:"2px 7px",borderRadius:4,background:PC[item.priority]+"18",color:PC[item.priority],border:`1px solid ${PC[item.priority]}40`,fontFamily:"'DM Mono',monospace",fontWeight:700,textTransform:"uppercase"}}>{item.priority}</span>
+                <span style={{fontSize:13,fontWeight:500,color:"#e2e8f0"}}>{item.title}</span>
+              </div>
+              {item.description&&<div style={{fontSize:12,color:"#64748b",marginBottom:4}}>{item.description}</div>}
+              <div style={{fontSize:11,color:"#475569",fontFamily:"'DM Mono',monospace"}}>
+                {item.assigned_to_name&&`Assigned to ${item.assigned_to_name} · `}
+                {new Date(item.created_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                {item.resolved_at&&` · Resolved ${new Date(item.resolved_at).toLocaleDateString("en-US",{month:"short",day:"numeric"})}`}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6,flexShrink:0}}>
+              {item.status==="open"
+                ?<button onClick={()=>resolveItem(item.id)} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #4fd9a040",background:"#4fd9a018",color:"#4fd9a0",fontSize:11,cursor:"pointer"}}>Resolve</button>
+                :<button onClick={()=>reopenItem(item.id)} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #1e2d3d",background:"transparent",color:"#64748b",fontSize:11,cursor:"pointer"}}>Reopen</button>}
+              {isAdmin&&<button onClick={()=>deleteItem(item.id)} style={{padding:"4px 8px",borderRadius:6,border:"1px solid #f8717140",background:"#f8717118",color:"#f87171",fontSize:11,cursor:"pointer"}}>✕</button>}
+            </div>
+          </div>)}
+        </div>
+      ))}
+      {items.length===0&&<div style={{...S.card,textAlign:"center",color:"#475569",fontSize:13}}>No issues logged for {period?.label}. 🎉</div>}
+      {showNew&&<Modal title="New Issue" onClose={()=>setShowNew(false)}>
+        <div className="form-group"><label className="form-label">Title</label><input className="form-input" value={newItem.title} onChange={e=>setNewItem(p=>({...p,title:e.target.value}))}/></div>
+        <div className="form-group"><label className="form-label">Description</label><textarea className="form-input" value={newItem.description} onChange={e=>setNewItem(p=>({...p,description:e.target.value}))} style={{minHeight:60,resize:"vertical"}}/></div>
+        <div className="form-group"><label className="form-label">Priority</label>
+          <select className="form-select" value={newItem.priority} onChange={e=>setNewItem(p=>({...p,priority:e.target.value}))}>
+            <option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option>
+          </select></div>
+        <div className="form-group"><label className="form-label">Assign To</label>
+          <select className="form-select" value={newItem.assigned_to} onChange={e=>setNewItem(p=>({...p,assigned_to:e.target.value}))}>
+            <option value="">Unassigned</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+          </select></div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowNew(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={createItem} disabled={busy}>Create Issue</button>
+        </div>
+      </Modal>}
+    </div>);
+  }
+
+  // ── Journal Entries ─────────────────────────────────────────────────────────
+  function JournalEntries(){
+    const [jes,setJes]=useState([]);
+    const [showNew,setShowNew]=useState(false);
+    const [newJE,setNewJE]=useState({je_number:"",description:"",debit_account:"",credit_account:"",amount:"",notes:"",reviewer_id:""});
+    const [busy,setBusy]=useState(false);
+
+    const load=useCallback(async()=>{
+      if(!period?.id)return;
+      const r=await api(`/api/journal_entries?period_id=${period.id}`).catch(()=>[]);
+      setJes(Array.isArray(r)?r:[]);
+    },[period?.id]);
+    useEffect(()=>{load();},[load]);
+
+    async function createJE(){
+      if(!newJE.description.trim()){alert("Description required.");return;}
+      setBusy(true);
+      try{await api("/api/journal_entries",{method:"POST",body:JSON.stringify({...newJE,period_id:period.id,amount:newJE.amount?parseFloat(newJE.amount):null,reviewer_id:newJE.reviewer_id?parseInt(newJE.reviewer_id):null})});
+        setShowNew(false);setNewJE({je_number:"",description:"",debit_account:"",credit_account:"",amount:"",notes:"",reviewer_id:""});await load();}
+      catch(e){alert(e.message);}
+      setBusy(false);
+    }
+    async function updateJEStatus(id,status){
+      await api(`/api/journal_entries/${id}`,{method:"PATCH",body:JSON.stringify({status})}).catch(e=>alert(e.message));await load();
+    }
+    async function deleteJE(id){
+      if(!confirm("Delete this journal entry?"))return;
+      await api(`/api/journal_entries/${id}`,{method:"DELETE"}).catch(()=>{});await load();
+    }
+    const JES={draft:{label:"Draft",color:"#64748b"},submitted:{label:"Submitted",color:"#f7c948"},approved:{label:"Approved",color:"#4fd9a0"},needs_revision:{label:"Needs Revision",color:"#f87171"}};
+    return(<div>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:16}}>
+        <div/>
+        <button className="btn btn-primary" style={{fontSize:12}} onClick={()=>setShowNew(true)}>+ New J/E</button>
+      </div>
+      <div style={S.card}>
+        {jes.length===0&&<div style={{textAlign:"center",color:"#475569",fontSize:13,padding:20}}>No journal entries for {period?.label}.</div>}
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          {jes.length>0&&<thead><tr>{["J/E #","Description","Debit","Credit","Amount","Preparer","Reviewer","Status",""].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>}
+          <tbody>{jes.map(je=>{
+            const st=JES[je.status]||JES.draft;
+            return(<tr key={je.id}>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,color:"#64748b"}}>{je.je_number||"—"}</td>
+              <td style={{...S.td,fontWeight:500,maxWidth:180}}><div style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{je.description}</div></td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{je.debit_account||"—"}</td>
+              <td style={{...S.td,fontSize:12,color:"#94a3b8"}}>{je.credit_account||"—"}</td>
+              <td style={{...S.td,fontFamily:"'DM Mono',monospace",fontSize:12,textAlign:"right"}}>{je.amount!=null?fmt(je.amount):"—"}</td>
+              <td style={S.td}><Avatar user={{name:je.preparer_name,initials:(je.preparer_name||"?").split(" ").map(w=>w[0]).join(""),color:"#4f8ef7"}} size={24}/></td>
+              <td style={S.td}>{je.reviewer_name?<Avatar user={{name:je.reviewer_name,initials:(je.reviewer_name||"?").split(" ").map(w=>w[0]).join(""),color:"#64748b"}} size={24}/>:<span style={{color:"#475569",fontSize:12}}>—</span>}</td>
+              <td style={S.td}><span style={{fontSize:11,padding:"2px 8px",borderRadius:10,background:st.color+"18",color:st.color,border:`1px solid ${st.color}40`,fontFamily:"'DM Mono',monospace",fontWeight:600}}>{st.label}</span></td>
+              <td style={{...S.td,whiteSpace:"nowrap"}}>
+                {je.status==="draft"&&<button onClick={()=>updateJEStatus(je.id,"submitted")} style={{padding:"3px 8px",fontSize:11,borderRadius:6,border:"1px solid #f7c94840",background:"#f7c94818",color:"#f7c948",cursor:"pointer",marginRight:4}}>Submit</button>}
+                {(isAdmin||je.reviewer_id===currentUser?.id)&&je.status==="submitted"&&<button onClick={()=>updateJEStatus(je.id,"approved")} style={{padding:"3px 8px",fontSize:11,borderRadius:6,border:"1px solid #4fd9a040",background:"#4fd9a018",color:"#4fd9a0",cursor:"pointer",marginRight:4}}>Approve</button>}
+                {(isAdmin||je.reviewer_id===currentUser?.id)&&je.status==="submitted"&&<button onClick={()=>updateJEStatus(je.id,"needs_revision")} style={{padding:"3px 8px",fontSize:11,borderRadius:6,border:"1px solid #f8717140",background:"#f8717118",color:"#f87171",cursor:"pointer",marginRight:4}}>Revise</button>}
+                {isAdmin&&<button onClick={()=>deleteJE(je.id)} style={{padding:"3px 8px",fontSize:11,borderRadius:6,border:"1px solid #f8717140",background:"transparent",color:"#f87171",cursor:"pointer"}}>✕</button>}
+              </td>
+            </tr>);
+          })}</tbody>
+        </table>
+      </div>
+      {showNew&&<Modal title="New Journal Entry" onClose={()=>setShowNew(false)}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+          <div className="form-group" style={{gridColumn:"1/-1"}}><label className="form-label">Description *</label><input className="form-input" value={newJE.description} onChange={e=>setNewJE(p=>({...p,description:e.target.value}))}/></div>
+          <div className="form-group"><label className="form-label">J/E Number</label><input className="form-input" placeholder="e.g. JE-001" value={newJE.je_number} onChange={e=>setNewJE(p=>({...p,je_number:e.target.value}))}/></div>
+          <div className="form-group"><label className="form-label">Amount</label><input className="form-input" type="number" step="0.01" value={newJE.amount} onChange={e=>setNewJE(p=>({...p,amount:e.target.value}))}/></div>
+          <div className="form-group"><label className="form-label">Debit Account</label><input className="form-input" value={newJE.debit_account} onChange={e=>setNewJE(p=>({...p,debit_account:e.target.value}))}/></div>
+          <div className="form-group"><label className="form-label">Credit Account</label><input className="form-input" value={newJE.credit_account} onChange={e=>setNewJE(p=>({...p,credit_account:e.target.value}))}/></div>
+          <div className="form-group" style={{gridColumn:"1/-1"}}><label className="form-label">Reviewer</label>
+            <select className="form-select" value={newJE.reviewer_id} onChange={e=>setNewJE(p=>({...p,reviewer_id:e.target.value}))}>
+              <option value="">None</option>{users.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+            </select></div>
+          <div className="form-group" style={{gridColumn:"1/-1"}}><label className="form-label">Notes</label><textarea className="form-input" value={newJE.notes} onChange={e=>setNewJE(p=>({...p,notes:e.target.value}))} style={{minHeight:50,resize:"vertical"}}/></div>
+        </div>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:8}}>
+          <button className="btn btn-ghost" onClick={()=>setShowNew(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={createJE} disabled={busy}>Create J/E</button>
+        </div>
+      </Modal>}
+    </div>);
+  }
+
+  // ── Close Calendar ──────────────────────────────────────────────────────────
+  function CloseCalendar(){
+    const [ttc,setTtc]=useState([]);
+    useEffect(()=>{api("/api/analytics/time_to_close").then(setTtc).catch(()=>{});},[]);
+
+    const calPeriod=period;
+    const calTasks=tasks;
+
+    // Build calendar grid for the active period's month
+    function buildGrid(){
+      if(!calPeriod?.start_date)return{weeks:[],year:0,month:0};
+      const start=new Date(calPeriod.start_date+"T00:00:00");
+      const year=start.getFullYear(),month=start.getMonth();
+      const firstDay=new Date(year,month,1).getDay();
+      const daysInMonth=new Date(year,month+1,0).getDate();
+      const cells=[];
+      for(let i=0;i<firstDay;i++)cells.push(null);
+      for(let d=1;d<=daysInMonth;d++)cells.push(d);
+      while(cells.length%7!==0)cells.push(null);
+      const weeks=[];
+      for(let i=0;i<cells.length;i+=7)weeks.push(cells.slice(i,i+7));
+      return{weeks,year,month};
+    }
+    const {weeks,year,month}=buildGrid();
+    const today=new Date();today.setHours(0,0,0,0);
+    const monthNames=["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const dayNames=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+
+    function tasksOnDay(d){
+      if(!d)return[];
+      const iso=`${year}-${String(month+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+      return calTasks.filter(t=>t.due_date===iso);
+    }
+    function isInPeriod(d){
+      if(!d||!calPeriod)return false;
+      const iso=`${year}-${String(month+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+      return iso>=calPeriod.start_date&&iso<=calPeriod.end_date;
+    }
+    function isToday(d){
+      if(!d)return false;
+      return today.getFullYear()===year&&today.getMonth()===month&&today.getDate()===d;
+    }
+
+    const maxDays=ttc.length?Math.max(...ttc.map(r=>r.days_to_close||0),1):1;
+    return(<div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:20}}>
+        <div style={S.card}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:12}}>{monthNames[month]} {year}</div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{dayNames.map(d=><th key={d} style={{fontSize:10,color:"#475569",fontFamily:"'DM Mono',monospace",padding:"4px 2px",textAlign:"center",fontWeight:500}}>{d}</th>)}</tr></thead>
+            <tbody>{weeks.map((week,wi)=><tr key={wi}>{week.map((d,di)=>{
+              const dayTasks=tasksOnDay(d);
+              const inPeriod=isInPeriod(d);
+              const isTod=isToday(d);
+              return<td key={di} style={{padding:"3px 2px",verticalAlign:"top",background:inPeriod?"#1a2535":"transparent",borderRadius:4}}>
+                {d!=null&&<div style={{minHeight:52}}>
+                  <div style={{fontSize:11,fontWeight:isTod?700:400,color:isTod?"#4f8ef7":"#94a3b8",fontFamily:"'DM Mono',monospace",textAlign:"center",marginBottom:2,width:22,height:22,borderRadius:11,background:isTod?"#4f8ef720":"transparent",margin:"0 auto 2px",lineHeight:"22px"}}>{d}</div>
+                  {dayTasks.slice(0,2).map(t=><div key={t.id} title={t.name} onClick={()=>setSelectedTask(t)} style={{fontSize:9,padding:"1px 4px",borderRadius:3,marginBottom:1,background:(SC[t.status]?.color||"#64748b")+"22",color:SC[t.status]?.color||"#64748b",cursor:"pointer",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.name}</div>)}
+                  {dayTasks.length>2&&<div style={{fontSize:9,color:"#64748b",textAlign:"center"}}>+{dayTasks.length-2}</div>}
+                </div>}
+              </td>;
+            })}</tr>)}</tbody>
+          </table>
+          <div style={{marginTop:10,display:"flex",gap:12,fontSize:11,color:"#64748b"}}>
+            <span style={{background:"#1a2535",borderRadius:3,padding:"2px 6px"}}>Period range</span>
+            {Object.entries(SC).map(([k,v])=><span key={k} style={{color:v.color}}>● {v.label}</span>)}
+          </div>
+        </div>
+        <div style={S.card}>
+          <div style={{fontSize:13,fontWeight:600,color:"#94a3b8",marginBottom:12}}>Close History — Days After Period End</div>
+          {ttc.length===0&&<div style={{color:"#475569",fontSize:13}}>No closed periods yet. Data will appear here after you close a period.</div>}
+          {ttc.map((r,i)=>{
+            const prev=i>0?ttc[i-1]:null;
+            const faster=prev&&r.days_to_close!=null&&prev.days_to_close!=null&&r.days_to_close<prev.days_to_close;
+            const slower=prev&&r.days_to_close!=null&&prev.days_to_close!=null&&r.days_to_close>prev.days_to_close;
+            const barW=r.days_to_close!=null?Math.round(r.days_to_close/maxDays*100):0;
+            const barColor=faster?"#4fd9a0":slower?"#f87171":"#4f8ef7";
+            return<div key={r.id} style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                <span style={{fontSize:12,color:"#e2e8f0"}}>{r.label}</span>
+                <span style={{fontSize:12,fontFamily:"'DM Mono',monospace",color:barColor}}>
+                  {r.days_to_close!=null?`${r.days_to_close}d`:"—"}
+                  {faster&&<span style={{marginLeft:6,fontSize:10}}>▼ faster</span>}
+                  {slower&&<span style={{marginLeft:6,fontSize:10}}>▲ slower</span>}
+                </span>
+              </div>
+              <div style={{height:5,background:"#1e2d3d",borderRadius:3}}><div style={{height:"100%",width:barW+"%",background:barColor,borderRadius:3}}/></div>
+            </div>;
+          })}
+        </div>
+      </div>
     </div>);
   }
 
@@ -1254,6 +1757,9 @@ function CloseApp(){
     {id:"dashboard",label:"Dashboard",icon:"⬡"},
     {id:"checklist",label:"Close Checklist",icon:"☑"},
     {id:"recons",label:"Reconciliations",icon:"⇌"},
+    {id:"issues",label:"Issues",icon:"⚠",badge:openIssuesCount||null},
+    {id:"je",label:"Journal Entries",icon:"📒"},
+    {id:"calendar",label:"Calendar",icon:"📅"},
     {id:"reports",label:"Reports",icon:"◨"},
     ...(isAdmin?[{id:"settings",label:"Settings",icon:"⚙"}]:[]),
   ];
@@ -1286,7 +1792,11 @@ function CloseApp(){
         {isAdmin&&period&&!period.is_closed&&<button onClick={closeActivePeriod} title="Mark this period closed and advance to the next unclosed month"
           style={{marginTop:8,width:"100%",padding:"5px 8px",background:"#4fd9a018",border:"1px solid #4fd9a040",color:"#4fd9a0",borderRadius:6,fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>✓ Close This Period</button>}
       </div>
-      {navItems.map(n=><button key={n.id} style={S.navBtn(tab===n.id)} onClick={()=>setTab(n.id)}><span style={{fontSize:15}}>{n.icon}</span>{n.label}</button>)}
+      {navItems.map(n=><button key={n.id} style={S.navBtn(tab===n.id)} onClick={()=>setTab(n.id)}>
+        <span style={{fontSize:15}}>{n.icon}</span>
+        <span style={{flex:1,textAlign:"left"}}>{n.label}</span>
+        {n.badge?<span style={{fontSize:10,background:"#f87171",color:"#fff",borderRadius:10,padding:"1px 6px",fontFamily:"'DM Mono',monospace",fontWeight:700}}>{n.badge}</span>:null}
+      </button>)}
       <div style={{marginTop:"auto",padding:"16px 20px",borderTop:"1px solid #1e2d3d"}}>
         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
           <Avatar user={currentUser} size={28}/>
@@ -1306,6 +1816,9 @@ function CloseApp(){
             {tab==="dashboard"&&`${period?.label} · ${dash?.tasks_complete||0}/${dash?.tasks_total||0} tasks complete`}
             {tab==="checklist"&&`${filteredTasks.length} tasks · Click any row to open detail`}
             {tab==="recons"&&`${dash?.recon_done||0}/${dash?.recon_total||0} accounts reconciled`}
+            {tab==="issues"&&`${openIssuesCount} open issue${openIssuesCount===1?"":"s"} · ${period?.label}`}
+            {tab==="je"&&`Journal entries for ${period?.label}`}
+            {tab==="calendar"&&`Close calendar · ${period?.label}`}
             {tab==="reports"&&"Financial reports pulled live from QuickBooks"}
             {tab==="settings"&&"Admin only — manage team, categories, and tasks"}
           </div>
@@ -1314,6 +1827,9 @@ function CloseApp(){
       {tab==="dashboard"&&<ErrorBoundary label="Dashboard"><Dashboard/></ErrorBoundary>}
       {tab==="checklist"&&<ErrorBoundary label="Checklist"><Checklist/></ErrorBoundary>}
       {tab==="recons"&&<ErrorBoundary label="Reconciliations"><Reconciliations/></ErrorBoundary>}
+      {tab==="issues"&&<ErrorBoundary label="Issues"><OpenItems/></ErrorBoundary>}
+      {tab==="je"&&<ErrorBoundary label="Journal Entries"><JournalEntries/></ErrorBoundary>}
+      {tab==="calendar"&&<ErrorBoundary label="Calendar"><CloseCalendar/></ErrorBoundary>}
       {tab==="reports"&&<ErrorBoundary label="Reports"><Reports/></ErrorBoundary>}
       {tab==="settings"&&isAdmin&&<ErrorBoundary label="Settings"><Settings/></ErrorBoundary>}
     </div>
